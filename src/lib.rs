@@ -24,6 +24,7 @@
 pub mod compaction;
 pub mod diff;
 pub mod file;
+pub mod fs;
 pub mod git;
 pub mod image;
 pub mod security;
