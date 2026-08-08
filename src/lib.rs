@@ -14,11 +14,16 @@
 //! | `lib/git-types.ts` | `git::types` | ✅ |
 //! | `lib/git-status.ts` | `git::status` | ✅ |
 //! | `lib/file-paths.ts` | `file::paths` | ✅ |
+//! | `lib/file-types.ts` | `file::types` | ✅ |
 //! | `lib/tool-presets.ts` | `tools` | ✅ |
+//! | `lib/image-attachments.ts` | `image` | ✅ |
+//! | `lib/patch.ts` | `diff` | ✅ |
 //! | `lib/compaction-summary.ts` | `compaction` | 🟡 退化(body-only,regex 待补) |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod compaction;
+pub mod diff;
 pub mod file;
 pub mod git;
+pub mod image;
 pub mod tools;
