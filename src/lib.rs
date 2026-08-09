@@ -28,5 +28,6 @@ pub mod fs;
 pub mod git;
 pub mod image;
 pub mod security;
+pub mod session;
 pub mod tools;
 pub mod ui;
