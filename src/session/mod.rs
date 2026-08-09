@@ -1,11 +1,16 @@
 //! session 模块 — 对齐 agegr/pi-web `lib/session-path.ts` + `lib/session-reader.ts`
 //! + `lib/session-timing.ts` + `lib/session-title.ts`。
 
+pub mod entries;
 pub mod path;
 pub mod reader;
 pub mod timing;
 pub mod title;
 
+pub use entries::{
+    SdkContext, SessionContext, base64_image_info, build_session_context,
+    entry_to_ui_message, omit_tool_result_base64_images, parse_entry_timestamp,
+};
 pub use path::session_path_key;
 pub use reader::{
     read_session_header, list_session_files, SessionHeader,

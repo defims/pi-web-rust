@@ -35,6 +35,7 @@
 //! | `lib/session-title.ts` | `session::title` | ✅ |
 //! | `lib/streaming-message.ts` + `lib/normalize.ts` | `ui::streaming_message` | ✅ |
 //! | `lib/session-file-references.ts` | `security::session_references` | ✅ |
+//! | `lib/session-reader.ts`(纯计算部分) | `session::entries` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;
