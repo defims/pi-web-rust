@@ -31,6 +31,7 @@
 //! | `lib/skill-lock.ts` | `skills::skill_lock` | ✅ |
 //! | `lib/skills-service.ts` | `skills::skills_service` | ✅ |
 //! | `lib/npx.ts` | `skills::npx` | ✅ |
+//! | `lib/skill-updates.ts` | `skills::skill_updates` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;
