@@ -36,6 +36,7 @@
 //! | `lib/streaming-message.ts` + `lib/normalize.ts` | `ui::streaming_message` | ✅ |
 //! | `lib/session-file-references.ts` | `security::session_references` | ✅ |
 //! | `lib/session-reader.ts`(纯计算部分) | `session::entries` | ✅ |
+//! | `lib/rpc-manager.ts`(纯逻辑部分) | `session::rpc` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;

@@ -4,6 +4,7 @@
 pub mod entries;
 pub mod path;
 pub mod reader;
+pub mod rpc;
 pub mod timing;
 pub mod title;
 
@@ -12,6 +13,11 @@ pub use entries::{
     entry_to_ui_message, omit_tool_result_base64_images, parse_entry_timestamp,
 };
 pub use path::session_path_key;
+pub use rpc::{
+    CODING_TOOL_NAMES, IDLE_RESET_EVENT_TYPES, RUNNING_STATE_EVENT_TYPES,
+    StartingSessionGuard, StartingSessionTracker, is_idle_reset_event, is_running_state_event,
+    normalize_rpc_cwd, with_extension_tools,
+};
 pub use reader::{
     read_session_header, list_session_files, SessionHeader,
     invalidate_path_cache, resolve_session_path, cache_session_path,
