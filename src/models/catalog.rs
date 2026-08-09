@@ -219,7 +219,7 @@ fn url_hostname(value: &str) -> Option<String> {
     let scheme_end = value.find("://")?;
     let rest = &value[scheme_end + 3..];
     let authority_end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if authority.is_empty() {
@@ -284,6 +284,7 @@ fn valid_price(entry: &ModelCatalogEntry) -> bool {
 }
 
 /// 对齐 `modeValue`(带最低占比 0.6,平局判空)。
+#[allow(clippy::unnecessary_sort_by)] // 比较项为 tuple 嵌套字段,sort_by_key 需引入借用语义
 fn mode_value<T, F>(values: &[T], total: usize, key_for: F) -> Option<T>
 where
     T: Clone,
@@ -312,6 +313,7 @@ where
 }
 
 /// 对齐 `modeNumber`(无占比门槛,仅平局判空)。
+#[allow(clippy::unnecessary_sort_by)] // 比较项为 tuple 嵌套字段
 fn mode_number(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -382,6 +384,7 @@ fn price_from_entry(
 }
 
 /// 对齐 `consensusPrice`。按 (input, output) 分组,组内 cache 取众数。
+#[allow(clippy::unnecessary_sort_by)] // 比较项为 Vec 长度,sort_by_key 需克隆 Vec
 fn consensus_price(entries: &[ModelCatalogEntry]) -> ModelCatalogPriceRecommendation {
     let priced: Vec<&ModelCatalogEntry> = entries.iter().filter(|e| valid_price(e)).collect();
     if priced.is_empty() {

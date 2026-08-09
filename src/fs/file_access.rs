@@ -11,8 +11,11 @@ use std::sync::Mutex;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use super::allowed_roots::{get_additional_allowed_roots, normalize_slashes, allow_file_root};
+use super::allowed_roots::{get_additional_allowed_roots, normalize_slashes};
 use super::path_security::is_existing_path_within_roots;
+
+#[cfg(test)]
+use super::allowed_roots::allow_file_root;
 
 const ALLOWED_ROOTS_TTL: Duration = Duration::from_secs(5);
 

@@ -3,7 +3,7 @@
 //! cwd 选择器目录浏览。async + std::thread(运行时无关)。
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// 对齐 `BrowsableDirectory`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +21,7 @@ pub fn should_show_windows_drive_picker(directory: Option<&str>) -> bool {
 pub fn get_browse_start_directory(directory: Option<&str>) -> String {
     directory
         .map(String::from)
-        .unwrap_or_else(|| dirs_home())
+        .unwrap_or_else(dirs_home)
 }
 
 /// 对齐 `normalizeDirectory`。展开 ~ 和 ~/。
@@ -56,7 +56,7 @@ pub async fn resolve_directory(directory: &str) -> std::io::Result<String> {
         let _ = tx.send(result);
     });
     rx.await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "thread panicked"))?
+        .map_err(|_| std::io::Error::other("thread panicked"))?
 }
 
 /// 对齐 `listDirectories`。列出目录下的子目录(含符号链接解析后是目录的)。
@@ -94,7 +94,7 @@ pub async fn list_directories(directory: &str) -> std::io::Result<Vec<BrowsableD
         let _ = tx.send(result);
     });
     rx.await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "thread panicked"))?
+        .map_err(|_| std::io::Error::other("thread panicked"))?
 }
 
 fn dirs_home() -> String {

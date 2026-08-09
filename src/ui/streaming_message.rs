@@ -139,7 +139,7 @@ fn update_content_block(
     update: impl FnOnce(Option<&Value>) -> Option<Value>,
 ) -> Option<StreamingState> {
     let message = state.streaming_message.as_ref()?;
-    let Some(index) = content_index else { return None; };
+    let index = content_index?;
     let index = index as usize;
     let content = message.get("content")?.as_array()?;
     if index > content.len() {

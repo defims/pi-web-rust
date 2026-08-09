@@ -210,7 +210,7 @@ pub async fn list_worktrees(cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
             let mut current_branch: Option<String> = None;
             let mut prunable = false;
 
-            let mut flush = |path: &mut Option<String>,
+            let flush = |path: &mut Option<String>,
                              branch: &mut Option<String>,
                              prunable: &mut bool,
                              worktrees: &mut Vec<WorktreeInfo>| {

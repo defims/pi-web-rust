@@ -82,7 +82,7 @@ pub async fn inspect_upload_targets(
         let _ = tx.send(result);
     });
     rx.await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "thread panicked"))
+        .map_err(|_| std::io::Error::other("thread panicked"))
 }
 
 #[cfg(test)]

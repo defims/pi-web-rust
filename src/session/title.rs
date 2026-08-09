@@ -93,7 +93,7 @@ pub fn parse_generated_session_title(raw: &str) -> Result<String, String> {
 
     // 只取第一行(\r?\n)
     value = value
-        .split(|c| c == '\n' || c == '\r')
+        .split(['\n', '\r'])
         .next()
         .unwrap_or("")
         .to_string();
@@ -128,9 +128,7 @@ fn strip_fenced_block(value: &str) -> Option<String> {
     let inner = &trimmed[3..trimmed.len() - 3];
     // (?:json|text)? 可选语言标识(大小写不敏感)
     let inner = inner.trim_start();
-    let inner = if inner.len() >= 4 && inner[..4].eq_ignore_ascii_case("json") {
-        inner[4..].to_string()
-    } else if inner.len() >= 4 && inner[..4].eq_ignore_ascii_case("text") {
+    let inner = if inner.len() >= 4 && (inner[..4].eq_ignore_ascii_case("json") || inner[..4].eq_ignore_ascii_case("text")) {
         inner[4..].to_string()
     } else {
         inner.to_string()
@@ -487,7 +485,7 @@ mod tests {
         let result = parse_generated_session_title(long).unwrap();
         assert_eq!(result.chars().count(), MAX_TITLE_LENGTH);
         // emoji 按码点截断,不拆 UTF-8 字节
-        let emoji_title = "a".repeat(70) + &"🔤".repeat(6);
+        let emoji_title = format!("{}{}", "a".repeat(70), "🔤".repeat(6));
         let result = parse_generated_session_title(&emoji_title).unwrap();
         assert!(result.chars().count() <= MAX_TITLE_LENGTH);
     }

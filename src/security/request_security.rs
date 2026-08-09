@@ -308,6 +308,9 @@ pub fn should_check_api_request_origin(origin: Option<&str>, sec_fetch_site: Opt
 }
 
 /// 对齐 `isApiRequestAllowed`。Host 校验 + 会话导出豁免 + Origin 校验。
+///
+/// 参数对应 TS `Request` 对象的字段(8 个),不拆 struct 以保持与上游签名一一对应。
+#[allow(clippy::too_many_arguments)]
 pub fn is_api_request_allowed(
     method: &str,
     host_header: Option<&str>,

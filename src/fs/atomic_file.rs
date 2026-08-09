@@ -4,7 +4,7 @@
 //! async + std::thread(运行时无关)。
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 对齐 `writePrivateFileAtomicSync`。原子写入,mode 0600(Unix 私有权限)。
 ///
@@ -18,7 +18,7 @@ pub async fn write_private_file_atomic(path: &Path, contents: &str) -> io::Resul
         let _ = tx.send(result);
     });
     rx.await
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "thread panicked"))?
+        .map_err(|_| io::Error::other("thread panicked"))?
 }
 
 /// 同步版(供非 async 调用方直接用)。

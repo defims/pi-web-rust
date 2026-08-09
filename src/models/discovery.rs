@@ -22,16 +22,16 @@ fn model_from_value(value: &Value) -> Option<DiscoveredModel> {
         return if id.is_empty() { None } else { Some(DiscoveredModel { id, name: None }) };
     }
     let obj = value.as_object()?;
-    let raw_id = clean_string(&obj.get("id").unwrap_or(&Value::Null))
-        .or_else(|| clean_string(&obj.get("model").unwrap_or(&Value::Null)))
-        .or_else(|| clean_string(&obj.get("name").unwrap_or(&Value::Null)))?;
+    let raw_id = clean_string(obj.get("id").unwrap_or(&Value::Null))
+        .or_else(|| clean_string(obj.get("model").unwrap_or(&Value::Null)))
+        .or_else(|| clean_string(obj.get("name").unwrap_or(&Value::Null)))?;
     let id = raw_id.strip_prefix("models/").unwrap_or(&raw_id).to_string();
     if id.is_empty() { return None; }
-    let name = clean_string(&obj.get("display_name").unwrap_or(&Value::Null))
-        .or_else(|| clean_string(&obj.get("displayName").unwrap_or(&Value::Null)))
+    let name = clean_string(obj.get("display_name").unwrap_or(&Value::Null))
+        .or_else(|| clean_string(obj.get("displayName").unwrap_or(&Value::Null)))
         .or_else(|| {
             if obj.contains_key("id") || obj.contains_key("model") {
-                clean_string(&obj.get("name").unwrap_or(&Value::Null))
+                clean_string(obj.get("name").unwrap_or(&Value::Null))
             } else {
                 None
             }

@@ -4,7 +4,7 @@ pub const VISIBLE_PAGE_SIZE: usize = 50;
 
 /// 对齐 `getVisibleRenderWindow`。
 pub fn get_visible_render_window(total_count: usize, visible_count: usize) -> (usize, bool) {
-    let clamped = visible_count.min(total_count.max(0));
+    let clamped = visible_count.min(total_count);
     let start_index = (total_count as isize - clamped as isize).max(0) as usize;
     (start_index, start_index > 0)
 }

@@ -8,10 +8,12 @@ use std::process::Command;
 
 use super::status::{parse_git_porcelain_v1, classify_git_status, GitPorcelainEntry};
 use super::types::{
-    GitFileStatus, GitFileStatusKind, GitStatusCode, GitStatusResponse, GitFileDiffResponse,
+    GitFileStatus, GitFileStatusKind, GitStatusResponse, GitFileDiffResponse,
 };
 use crate::file::types::TEXT_PREVIEW_MAX_BYTES;
 
+/// git 子进程超时(对齐 moho-mate)。当前 git 调用经注入回调,常量留给宿主接线参考。
+#[allow(dead_code)]
 const GIT_TIMEOUT_SECS: u64 = 10;
 const GIT_STATUS_MAX_BUFFER: usize = 8 * 1024 * 1024;
 
@@ -27,15 +29,13 @@ fn git_exec(cwd: &str, args: &[&str], max_buffer: usize) -> std::io::Result<Stri
         .env("LC_ALL", "C")
         .output()?;
     if !output.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("git {} failed: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&output.stderr)),
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if stdout.len() > max_buffer {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "git output exceeds max buffer",
         ));
     }
@@ -133,11 +133,8 @@ fn count_untracked_text_lines(file_path: &str) -> u64 {
     let Ok(content) = std::fs::read(path) else { return 0; };
     if content.contains(&0u8) || content.is_empty() { return 0; }
     let text = String::from_utf8_lossy(&content);
-    if text.ends_with('\n') {
-        text.lines().count() as u64
-    } else {
-        text.lines().count() as u64
-    }
+    // lines().count() 不区分尾部换行存在与否(对齐 TS lineCounter 的双分支等价)
+    text.lines().count() as u64
 }
 
 /// 对齐 `getGitStatus`。完整 git status 响应。
@@ -197,7 +194,7 @@ pub async fn get_git_status(cwd: &str) -> GitStatusResponse {
 /// 对齐 `createAddedFilePatch`。
 fn create_added_file_patch(git_path: &str, content: &str) -> String {
     let has_trailing = content.ends_with('\n');
-    let mut lines: Vec<&str> = content.lines().collect();
+    let lines: Vec<&str> = content.lines().collect();
     if has_trailing && content.ends_with('\n') && !content.is_empty() {
         // lines() 已经不包含最后的空行
     }

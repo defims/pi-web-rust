@@ -156,12 +156,13 @@ pub fn select_initial_model_scope(
     let requested = requested_ref.and_then(|ref_| {
         scope.visible.iter().find(|model| model.matches(&ref_.provider, &ref_.model_id))
     });
-    if requested_ref.is_some() && requested.is_none() {
-        let ref_ = requested_ref.unwrap();
-        return Err(ModelScopeError(format!(
-            "Model is not available in the enabled scope: {}/{}",
-            ref_.provider, ref_.model_id
-        )));
+    if let Some(ref_) = requested_ref {
+        if requested.is_none() {
+            return Err(ModelScopeError(format!(
+                "Model is not available in the enabled scope: {}/{}",
+                ref_.provider, ref_.model_id
+            )));
+        }
     }
 
     let requested_scoped = match requested {

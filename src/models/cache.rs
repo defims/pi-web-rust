@@ -69,6 +69,7 @@ pub struct ModelsCacheState {
     inner: Mutex<CacheStateInner>,
 }
 
+#[derive(Default)]
 struct CacheStateInner {
     /// 插入序保持的条目列表(逐出按最先插入)。
     entries: Vec<(String, CacheEntry)>,
@@ -80,15 +81,6 @@ struct CacheStateInner {
 /// Shared future 要求内部 future `Send + Sync`(futures 0.3 的 `Shared<F>` 约束)。
 type BoxFuture = std::pin::Pin<Box<dyn Future<Output = ModelsData> + Send + Sync>>;
 
-impl Default for CacheStateInner {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            in_flight: HashMap::new(),
-            generation: 0,
-        }
-    }
-}
 
 impl ModelsCacheState {
     pub fn new() -> Self {

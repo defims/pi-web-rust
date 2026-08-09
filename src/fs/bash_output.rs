@@ -57,7 +57,7 @@ pub async fn read_utf8_file_within_limit(
         let _ = tx.send(result);
     });
     rx.await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "thread panicked"))?
+        .map_err(|_| std::io::Error::other("thread panicked"))?
 }
 
 /// 对齐返回联合类型。

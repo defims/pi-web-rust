@@ -109,7 +109,7 @@ fn parse_iso8601_millis(value: &str) -> Option<i64> {
     let utc_hour = hour as i32 - utc_hour;
     let utc_minute = minute as i32 - utc_minute;
 
-    let days = days_from_civil(year as i64, month as u32, day as u32)?;
+    let days = days_from_civil(year as i64, month, day)?;
     days.checked_mul(86_400_000)?
         .checked_add((utc_hour as i64 * 3600 + utc_minute as i64 * 60 + second as i64) * 1000)?
         .checked_add(millis as i64)

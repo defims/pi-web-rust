@@ -62,7 +62,7 @@ pub fn parse_unified_patch(text: &str) -> Option<Vec<SplitDiffFile>> {
         r#type: SplitDiffCellType::Empty,
     };
 
-    let mut flush_changes = |files: &mut Vec<SplitDiffFile>,
+    let flush_changes = |files: &mut Vec<SplitDiffFile>,
                              current_idx: &mut Option<usize>,
                              removed: &mut Vec<PendingChangeLine>,
                              added: &mut Vec<PendingChangeLine>| {
@@ -214,7 +214,7 @@ fn parse_hunk_header(line: &str) -> Option<HunkHeader> {
     let line = line.strip_prefix("@@ ")?;
     let rest = line.strip_prefix('-')?;
     let (old_start_s, rest) = rest.split_once(' ')?;
-    let old_start: i64 = old_start_s.parse().ok()?;
+    let _old_start: i64 = old_start_s.parse().ok()?;
     // rest = "+123,45 @@" 或 "+123 @@"
     let rest = rest.strip_prefix('+')?;
     let parts: Vec<&str> = rest.splitn(2, " @@").collect();
@@ -224,7 +224,7 @@ fn parse_hunk_header(line: &str) -> Option<HunkHeader> {
     let new_count: i64 = new_count_s.parse().unwrap_or(1);
 
     // old_count: 从 "@@ -123,45" 的 45,无则 1
-    let (old_count_s, _) = old_start_s.split_once(',').unwrap_or((old_start_s, ""));
+    let (_old_count_s, _) = old_start_s.split_once(',').unwrap_or((old_start_s, ""));
     // 重新解析 old_start,old_count(old_start_s 可能含逗号)
     let (os, oc) = old_start_s.split_once(',').unwrap_or((old_start_s, "1"));
     let old_start: i64 = os.parse().ok()?;

@@ -200,9 +200,7 @@ pub async fn check_global_skill(
     let folder = skill_folder(install.skill_path.as_deref().unwrap_or(""));
     let raw = match io.fetch_json(&url, github_token).await {
         Ok(raw) => raw,
-        Err(SkillUpdateIoError::Http(HttpError(status)))
-            if matches!(status, 401 | 403 | 429) =>
-        {
+        Err(SkillUpdateIoError::Http(HttpError(401 | 403 | 429))) => {
             // 回退 git rev-parse(私有仓库 / 限流)
             let hash = io.resolve_git_tree_hash(install).await.map_err(SkillUpdateIoError::Transport)?;
             return Ok(result(

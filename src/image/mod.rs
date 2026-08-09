@@ -19,7 +19,7 @@ fn is_base64_data_char(code: u8) -> bool {
 
 /// 对齐 `getBase64DecodedByteLength`。返回解码后字节数;非法 base64 返回 None。
 pub fn get_base64_decoded_byte_length(data: &str) -> Option<usize> {
-    if data.is_empty() || data.len() % 4 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(4) {
         return None;
     }
     let padding = if data.ends_with("==") {

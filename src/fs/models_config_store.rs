@@ -31,7 +31,7 @@ pub async fn write_models_config(
     models_path: &Path,
 ) -> std::io::Result<()> {
     let content = serde_json::to_string_pretty(data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     if let Some(parent) = models_path.parent() {
         std::fs::create_dir_all(parent)?;
     }

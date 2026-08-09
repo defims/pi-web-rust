@@ -101,7 +101,7 @@ pub fn read_skill_lock(path: &str) -> BTreeMap<String, SkillLockEntry> {
 /// 非 `..`、不以 `../` 开头、非绝对路径。
 pub fn is_within(path: &str, root: &str) -> bool {
     let rel = path_relative(&path_resolve(root), &path_resolve(path));
-    rel != "" && rel != ".." && !rel.starts_with("../") && !is_absolute(&rel)
+    !rel.is_empty() && rel != ".." && !rel.starts_with("../") && !is_absolute(&rel)
 }
 
 /// 对齐 `findLockEntry`:精确名优先,否则大小写不敏感回退。
@@ -226,7 +226,7 @@ fn is_word_dot_dash(value: &str) -> bool {
 
 /// 对齐 `annotateSkillsWithInstallInfo`。
 pub fn annotate_skills_with_install_info(
-    skills: &mut Vec<SkillInfo>,
+    skills: &mut [SkillInfo],
     cwd: &str,
     agent_dir: &str,
     global_lock_path: &str,

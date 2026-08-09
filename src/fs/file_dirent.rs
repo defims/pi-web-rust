@@ -20,10 +20,7 @@ pub fn resolve_dirent_is_directory(
     if dirent_is_file {
         return Some(false);
     }
-    match stat_is_directory(full_path) {
-        Ok(is_dir) => Some(is_dir),
-        Err(_) => None,
-    }
+    stat_is_directory(full_path).ok()
 }
 
 fn stat_is_directory(path: &Path) -> io::Result<bool> {
