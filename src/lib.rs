@@ -26,6 +26,8 @@
 //! | `lib/model-discovery-auth.ts` | `models::discovery_auth` | ✅ |
 //! | `lib/bounded-form-data.ts` | `http::bounded_form_data` | ✅ |
 //! | `lib/startup-preferences.ts` | `settings::startup_preferences` | ✅ |
+//! | `lib/provider-credential-store.ts` | `models::credential_store` | ✅ |
+//! | `lib/http-dispatcher.ts` | `http::dispatcher` | 🟡 纯逻辑(undici 传输层待宿主接线) |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;

@@ -1,9 +1,10 @@
 //! models 模块 — 对齐 agegr/pi-web `lib/model-discovery.ts` + `lib/provider-listing.ts`
 //! + `lib/model-catalog.ts` + `lib/model-scope.ts` + `lib/models-cache.ts`
-//! + `lib/model-discovery-auth.ts`。
+//! + `lib/model-discovery-auth.ts` + `lib/provider-credential-store.ts`。
 
 pub mod cache;
 pub mod catalog;
+pub mod credential_store;
 pub mod discovery;
 pub mod discovery_auth;
 pub mod provider_listing;
@@ -17,6 +18,10 @@ pub use catalog::{
     ModelCatalogCost, ModelCatalogEntry, ModelCatalogMatchMethod, ModelCatalogPreset,
     ModelCatalogPriceRecommendation, ModelCatalogRecommendation, UnreliableReason,
     flatten_models_dev_catalog, recommend_model_catalog_preset, search_model_catalog,
+};
+pub use credential_store::{
+    CredentialRemovalResult, CredentialStoreError, remove_stored_credential_if_type,
+    store_provider_credential,
 };
 pub use discovery::{DiscoveredModel, parse_discovered_models, build_models_list_url};
 pub use discovery_auth::{
