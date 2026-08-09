@@ -1,9 +1,11 @@
 //! models 模块 — 对齐 agegr/pi-web `lib/model-discovery.ts` + `lib/provider-listing.ts`
-//! + `lib/model-catalog.ts` + `lib/model-scope.ts` + `lib/models-cache.ts`。
+//! + `lib/model-catalog.ts` + `lib/model-scope.ts` + `lib/models-cache.ts`
+//! + `lib/model-discovery-auth.ts`。
 
 pub mod cache;
 pub mod catalog;
 pub mod discovery;
+pub mod discovery_auth;
 pub mod provider_listing;
 pub mod scope;
 
@@ -17,6 +19,11 @@ pub use catalog::{
     flatten_models_dev_catalog, recommend_model_catalog_preset, search_model_catalog,
 };
 pub use discovery::{DiscoveredModel, parse_discovered_models, build_models_list_url};
+pub use discovery_auth::{
+    DISCOVERY_MODEL_ID, ModelDiscoveryAuth, ModelDiscoveryEngine, ResolvedAuth,
+    build_discovery_models_document, discovery_temp_prefix, resolve_model_discovery_auth,
+    resolve_model_discovery_auth_blocking, string_record,
+};
 pub use scope::{
     InitialModelScopeOptions, InitialModelScopeResult, Model, ModelScopeError, ModelScopeResult,
     ScopedModel, resolve_visible_models, select_initial_model_scope,

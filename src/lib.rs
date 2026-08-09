@@ -23,6 +23,9 @@
 //! | `lib/model-catalog.ts` | `models::catalog` | ✅ |
 //! | `lib/model-scope.ts` | `models::scope` | ✅ |
 //! | `lib/models-cache.ts` | `models::cache` | ✅ |
+//! | `lib/model-discovery-auth.ts` | `models::discovery_auth` | ✅ |
+//! | `lib/bounded-form-data.ts` | `http::bounded_form_data` | ✅ |
+//! | `lib/startup-preferences.ts` | `settings::startup_preferences` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;
@@ -31,9 +34,11 @@ pub mod diff;
 pub mod file;
 pub mod fs;
 pub mod git;
+pub mod http;
 pub mod image;
 pub mod models;
 pub mod security;
 pub mod session;
+pub mod settings;
 pub mod tools;
 pub mod ui;
