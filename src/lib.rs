@@ -33,6 +33,7 @@
 //! | `lib/npx.ts` | `skills::npx` | ✅ |
 //! | `lib/skill-updates.ts` | `skills::skill_updates` | ✅ |
 //! | `lib/session-title.ts` | `session::title` | ✅ |
+//! | `lib/streaming-message.ts` + `lib/normalize.ts` | `ui::streaming_message` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;
