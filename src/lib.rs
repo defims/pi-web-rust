@@ -21,6 +21,8 @@
 //! | `lib/compaction-summary.ts` | `compaction` | 🟡 退化(body-only,regex 待补) |
 //! | `lib/request-security.ts` | `security::request_security` | ✅ |
 //! | `lib/model-catalog.ts` | `models::catalog` | ✅ |
+//! | `lib/model-scope.ts` | `models::scope` | ✅ |
+//! | `lib/models-cache.ts` | `models::cache` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;

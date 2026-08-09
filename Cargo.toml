@@ -20,7 +20,7 @@ futures = "0.3"
 
 [dev-dependencies]
 # 仅测试用 async runtime
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 # 排除 moho-mate workspace(submodule 独立编译)
 [workspace]
