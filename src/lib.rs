@@ -32,6 +32,7 @@
 //! | `lib/skills-service.ts` | `skills::skills_service` | ✅ |
 //! | `lib/npx.ts` | `skills::npx` | ✅ |
 //! | `lib/skill-updates.ts` | `skills::skill_updates` | ✅ |
+//! | `lib/session-title.ts` | `session::title` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;
