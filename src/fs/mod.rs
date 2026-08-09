@@ -8,6 +8,7 @@ pub mod allowed_roots;
 pub mod atomic_file;
 pub mod directory_browser;
 pub mod file_access;
+pub mod file_upload;
 pub mod path_security;
 
 pub use path_security::{is_path_within_roots, is_existing_path_within_roots};
@@ -20,4 +21,8 @@ pub use directory_browser::{
 pub use file_access::{
     is_windows_absolute_path, get_allowed_file_roots, is_file_path_allowed,
     is_existing_file_path_allowed, invalidate_allowed_roots_cache,
+};
+pub use file_upload::{
+    UploadConflictStrategy, UploadTargetInspection,
+    parse_upload_conflict_strategy, validate_upload_file_names, inspect_upload_targets,
 };
