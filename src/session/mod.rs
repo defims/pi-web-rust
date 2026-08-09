@@ -19,7 +19,8 @@ pub use rpc::{
     normalize_rpc_cwd, with_extension_tools,
 };
 pub use reader::{
-    read_session_header, list_session_files, SessionHeader,
+    WebSessionInfo, list_all_sessions, list_session_entries, read_session_header,
+    list_session_files, SessionHeader,
     invalidate_path_cache, resolve_session_path, cache_session_path,
 };
 pub use timing::{TimingEntry, compute_session_total_active_ms};

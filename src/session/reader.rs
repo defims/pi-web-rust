@@ -135,6 +135,110 @@ pub fn list_session_files(sessions_dir: &str) -> Vec<PathBuf> {
     files
 }
 
+/// 对齐 pi-web `SessionInfo`(Web UI 消费形状,camelCase serde)。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSessionInfo {
+    pub path: String,
+    pub id: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub created: String,
+    pub modified: String,
+    pub message_count: u64,
+    pub first_message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+}
+
+/// 对齐 TS `loadAllSessions()`。调用 pi_agent_rust 的 `SessionIndex::list_sessions`
+/// 获取 SessionMeta 列表,派生 WebSessionInfo(projectRoot / worktreeBranch /
+/// parentSessionId),更新 path 缓存。
+///
+/// `sessions_root` 对齐 TS `getAgentDir() + "sessions"`;
+/// `resolve_project` 注入 `git::worktree::resolve_project`(按 cwd 派生 projectRoot,
+/// 已有 60s 缓存)。
+pub fn list_all_sessions(
+    sessions_root: &str,
+    resolve_project: impl Fn(&str) -> crate::git::worktree::ProjectInfo,
+) -> Vec<WebSessionInfo> {
+    let index = pi::sdk::SessionIndex::for_sessions_root(std::path::Path::new(sessions_root));
+    let metas = match index.list_sessions(None) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+
+    // path → id 映射(对齐 TS pathToId)
+    let mut path_to_id: HashMap<String, String> = HashMap::new();
+    for m in &metas {
+        path_to_id.insert(super::path::session_path_key(&m.path), m.id.clone());
+    }
+
+    // 按 unique cwd 派生 projectRoot(对齐 TS projectByCwd)
+    let mut project_by_cwd: HashMap<String, crate::git::worktree::ProjectInfo> = HashMap::new();
+
+    metas
+        .iter()
+        .map(|m| {
+            cache_session_path(&m.id, &m.path);
+
+            let project = if m.cwd.is_empty() {
+                None
+            } else {
+                Some(
+                    project_by_cwd
+                        .entry(m.cwd.clone())
+                        .or_insert_with(|| resolve_project(&m.cwd))
+                        .clone(),
+                )
+            };
+
+            let parent_session_id = m
+                .parent_session_path
+                .as_ref()
+                .and_then(|p| path_to_id.get(&super::path::session_path_key(p)).cloned());
+
+            let worktree_branch = project
+                .as_ref()
+                .filter(|p| p.is_worktree)
+                .and_then(|p| p.branch.clone());
+
+            WebSessionInfo {
+                path: m.path.clone(),
+                id: m.id.clone(),
+                cwd: m.cwd.clone(),
+                name: m.name.clone(),
+                created: m.timestamp.clone(),
+                modified: format_millis_iso(m.modified_ms),
+                message_count: m.message_count,
+                first_message: m.first_message.clone(),
+                parent_session_id,
+                project_root: project
+                    .as_ref()
+                    .map(|p| p.project_root.clone())
+                    .or_else(|| if m.cwd.is_empty() { None } else { Some(m.cwd.clone()) }),
+                worktree_branch,
+            }
+        })
+        .collect()
+}
+
+/// epoch ms → ISO 8601 字符串(对齐 TS `new Date(ms).toISOString()`)。
+fn format_millis_iso(ms: i64) -> String {
+    if ms <= 0 {
+        return "1970-01-01T00:00:00.000Z".to_string();
+    }
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+}
+
 /// 有界读取文件第一行(对齐 openSync + readSync 循环)。
 fn read_first_line(file_path: &str, max_bytes: usize) -> Option<String> {
     let mut file = std::fs::File::open(file_path).ok()?;
