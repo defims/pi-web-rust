@@ -37,6 +37,9 @@
 //! | `lib/session-file-references.ts` | `security::session_references` | ✅ |
 //! | `lib/session-reader.ts`(纯计算部分) | `session::entries` | ✅ |
 //! | `lib/rpc-manager.ts`(纯逻辑部分) | `session::rpc` | ✅ |
+//! | `lib/file-fuzzy.ts` | `file::fuzzy` | ✅ |
+//! | `lib/file-dirent.ts` | `fs::file_dirent` | ✅ |
+//! | `lib/provider-listing-runtime.ts` | `models::provider_listing_runtime` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;

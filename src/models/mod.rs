@@ -1,6 +1,7 @@
 //! models 模块 — 对齐 agegr/pi-web `lib/model-discovery.ts` + `lib/provider-listing.ts`
 //! + `lib/model-catalog.ts` + `lib/model-scope.ts` + `lib/models-cache.ts`
-//! + `lib/model-discovery-auth.ts` + `lib/provider-credential-store.ts`。
+//! + `lib/model-discovery-auth.ts` + `lib/provider-credential-store.ts`
+//! + `lib/provider-listing-runtime.ts`。
 
 pub mod cache;
 pub mod catalog;
@@ -8,6 +9,7 @@ pub mod credential_store;
 pub mod discovery;
 pub mod discovery_auth;
 pub mod provider_listing;
+pub mod provider_listing_runtime;
 pub mod scope;
 
 pub use cache::{
@@ -36,4 +38,7 @@ pub use scope::{
 pub use provider_listing::{
     ProviderListingInput, ProviderAuthStatus, ApiKeyProviderListing, OAuthProviderListing,
     build_api_key_provider_list, build_oauth_provider_list,
+};
+pub use provider_listing_runtime::{
+    AuthStatus, ProviderAuthDecl, ProviderRuntime, collect_provider_listing_inputs,
 };

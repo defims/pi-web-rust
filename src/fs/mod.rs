@@ -1,7 +1,7 @@
 //! fs 模块 — 路径安全 + 文件系统操作 + 文件访问控制。
 //!
 //! 对齐 `lib/path-security.ts` + `lib/allowed-roots.ts` + `lib/atomic-file.ts`
-//! + `lib/directory-browser.ts` + `lib/file-access.ts`。
+//! + `lib/directory-browser.ts` + `lib/file-access.ts` + `lib/file-dirent.ts`。
 //! IO 函数用 async fn + std::thread(运行时无关),不绑定 tokio。
 
 pub mod allowed_roots;
@@ -9,6 +9,7 @@ pub mod atomic_file;
 pub mod bash_output;
 pub mod directory_browser;
 pub mod file_access;
+pub mod file_dirent;
 pub mod file_upload;
 pub mod models_config_store;
 pub mod path_security;
@@ -28,3 +29,4 @@ pub use file_upload::{
     UploadConflictStrategy, UploadTargetInspection,
     parse_upload_conflict_strategy, validate_upload_file_names, inspect_upload_targets,
 };
+pub use file_dirent::resolve_dirent_is_directory;
