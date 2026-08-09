@@ -21,6 +21,7 @@
 //! | `lib/compaction-summary.ts` | `compaction` | 🟡 退化(body-only,regex 待补) |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
+pub mod auth;
 pub mod compaction;
 pub mod diff;
 pub mod file;

@@ -6,9 +6,11 @@
 
 pub mod allowed_roots;
 pub mod atomic_file;
+pub mod bash_output;
 pub mod directory_browser;
 pub mod file_access;
 pub mod file_upload;
+pub mod models_config_store;
 pub mod path_security;
 
 pub use path_security::{is_path_within_roots, is_existing_path_within_roots};
