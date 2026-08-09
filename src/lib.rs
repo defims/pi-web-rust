@@ -27,6 +27,7 @@ pub mod file;
 pub mod fs;
 pub mod git;
 pub mod image;
+pub mod models;
 pub mod security;
 pub mod session;
 pub mod tools;
