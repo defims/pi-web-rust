@@ -1,10 +1,17 @@
-//! security 模块 — 路径安全 + 信任 + 会话引用判定。
+//! security 模块 — 路径安全 + 信任 + 会话引用判定 + 请求防护。
 //!
-//! 对齐 `lib/session-file-references-core.ts` + `lib/project-trust.ts`。
+//! 对齐 `lib/session-file-references-core.ts` + `lib/project-trust.ts`
+//! + `lib/request-security.ts`。
 
 pub mod project_trust;
+pub mod request_security;
 
 pub use project_trust::{ProjectTrustStatus, get_project_trust_status, trust_project};
+pub use request_security::{
+    canonical_origin, get_request_origin, has_json_content_type, hostname_from_authority,
+    is_api_request_allowed, is_api_request_host_allowed, is_api_request_host_allowed_with,
+    is_api_request_origin_allowed, is_ip,
+};
 
 /// 对齐 `isValidSessionId`。UUID v4 格式校验。
 pub fn is_valid_session_id(session_id: Option<&str>) -> bool {

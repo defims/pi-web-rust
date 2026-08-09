@@ -19,6 +19,7 @@
 //! | `lib/image-attachments.ts` | `image` | ✅ |
 //! | `lib/patch.ts` | `diff` | ✅ |
 //! | `lib/compaction-summary.ts` | `compaction` | 🟡 退化(body-only,regex 待补) |
+//! | `lib/request-security.ts` | `security::request_security` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;
