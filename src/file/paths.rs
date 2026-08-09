@@ -71,7 +71,7 @@ pub fn join_file_path(parent: &str, child: &str) -> String {
 }
 
 /// encodeURIComponent 等价(Rust 没有 builtin,手写 RFC 3986 unreserved 之外的转义)。
-fn url_encode_component(s: &str) -> String {
+pub(crate) fn url_encode_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')') {

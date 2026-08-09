@@ -28,6 +28,9 @@
 //! | `lib/startup-preferences.ts` | `settings::startup_preferences` | ✅ |
 //! | `lib/provider-credential-store.ts` | `models::credential_store` | ✅ |
 //! | `lib/http-dispatcher.ts` | `http::dispatcher` | 🟡 纯逻辑(undici 传输层待宿主接线) |
+//! | `lib/skill-lock.ts` | `skills::skill_lock` | ✅ |
+//! | `lib/skills-service.ts` | `skills::skills_service` | ✅ |
+//! | `lib/npx.ts` | `skills::npx` | ✅ |
 //! | (其余 lib/ 文件) | — | ❌ 待改写 |
 
 pub mod auth;
@@ -42,5 +45,6 @@ pub mod models;
 pub mod security;
 pub mod session;
 pub mod settings;
+pub mod skills;
 pub mod tools;
 pub mod ui;
