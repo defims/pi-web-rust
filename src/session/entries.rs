@@ -398,13 +398,16 @@ pub fn build_session_context_from_json(
             }
             pi_entries.push(entry);
         } else {
-            // 无法解析的 entry 占位(保持 index 对齐)
             entry_ids.push(String::new());
         }
     }
 
     // 2. 调引擎 build_session_context
-    let snapshot = pi::sdk::build_session_context(&pi_entries, leaf_id, &by_id);
+    // leaf_id=None 时用最后一条 entry 的 id(对齐 TS buildSessionContext 的回退)
+    let effective_leaf_id = leaf_id.or_else(|| {
+        pi_entries.last().and_then(|e| e.base().id.as_deref())
+    });
+    let snapshot = pi::sdk::build_session_context(&pi_entries, effective_leaf_id, &by_id);
 
     // 3. Message → UI Value
     let messages: Vec<Value> = snapshot
