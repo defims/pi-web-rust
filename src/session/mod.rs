@@ -10,7 +10,8 @@ pub mod title;
 
 pub use entries::{
     SdkContext, SessionContext, base64_image_info, build_session_context,
-    entry_to_ui_message, omit_tool_result_base64_images, parse_entry_timestamp,
+    build_session_context_from_json, entry_to_ui_message, omit_tool_result_base64_images,
+    parse_entry_timestamp,
 };
 pub use path::session_path_key;
 pub use rpc::{

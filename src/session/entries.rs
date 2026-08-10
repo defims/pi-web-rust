@@ -9,6 +9,8 @@
 //! - `entry_to_ui_message`:message / compaction / branch_summary / custom_message
 //!   分支转换
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use crate::image::get_base64_decoded_byte_length;
@@ -366,6 +368,106 @@ pub fn build_session_context(
 pub struct SdkContext {
     pub thinking_level: Option<String>,
     pub model: Option<Value>,
+}
+
+/// 引擎接线:直接调 `pi::sdk::build_session_context`。
+///
+/// 把 JSON entries 反序列化为 `pi::SessionEntry`,构建 entry_index,
+/// 调引擎的 build_session_context(含 compaction 截断 + thinking/model 提取),
+/// 然后把返回的 `Message` 列表转回 UI 形状(Value)。
+///
+/// `defer_thinking` / `defer_tool_result_images` 对应原 options。
+pub fn build_session_context_from_json(
+    entries: &[Value],
+    leaf_id: Option<&str>,
+    defer_thinking: bool,
+    defer_tool_result_images: bool,
+) -> SessionContext {
+    // 1. 反序列化为 pi::SessionEntry
+    let mut pi_entries: Vec<pi::session::SessionEntry> = Vec::with_capacity(entries.len());
+    let mut entry_ids: Vec<String> = Vec::with_capacity(entries.len());
+    let mut by_id: std::collections::HashMap<String, usize> = HashMap::new();
+
+    for (idx, raw) in entries.iter().enumerate() {
+        if let Ok(entry) = serde_json::from_value::<pi::session::SessionEntry>(raw.clone()) {
+            if let Some(id) = entry.base().id.as_ref() {
+                by_id.insert(id.clone(), idx);
+                entry_ids.push(id.clone());
+            } else {
+                entry_ids.push(String::new());
+            }
+            pi_entries.push(entry);
+        } else {
+            // 无法解析的 entry 占位(保持 index 对齐)
+            entry_ids.push(String::new());
+        }
+    }
+
+    // 2. 调引擎 build_session_context
+    let snapshot = pi::sdk::build_session_context(&pi_entries, leaf_id, &by_id);
+
+    // 3. Message → UI Value
+    let messages: Vec<Value> = snapshot
+        .messages
+        .iter()
+        .map(|msg| {
+            let mut value = serde_json::to_value(msg).unwrap_or(Value::Null);
+            // 应用 defer 选项
+            if defer_thinking || defer_tool_result_images {
+                value = apply_defer_options(value, defer_thinking, defer_tool_result_images);
+            }
+            value
+        })
+        .collect();
+
+    // 4. 派生 entry_ids(引擎选中的 path 上的 entry id)
+    // build_session_context 内部走了 path,但 SessionContextSnapshot 不返回 path;
+    // 暂用全部 entry_ids(对齐 TS buildContextEntries 返回全部的简化场景)
+    let context_entry_ids: Vec<String> = pi_entries
+        .iter()
+        .filter_map(|e| e.base().id.clone())
+        .collect();
+
+    SessionContext {
+        messages,
+        entry_ids: context_entry_ids,
+        thinking_level: snapshot.thinking_level,
+        model: snapshot.model.map(|(provider, id)| {
+            serde_json::json!({ "provider": provider, "id": id })
+        }),
+    }
+}
+
+/// 对 defer_thinking / defer_tool_result_images 的后处理。
+fn apply_defer_options(mut message: Value, defer_thinking: bool, defer_tool_result_images: bool) -> Value {
+    if defer_tool_result_images && message.get("role").and_then(|r| r.as_str()) == Some("toolResult") {
+        message = omit_tool_result_base64_images(&message);
+    }
+    if defer_thinking && message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+        if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
+            let deferred: Vec<Value> = content
+                .iter()
+                .map(|block| {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("thinking") {
+                        let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                        if !text.trim().is_empty() {
+                            let mut b = block.clone();
+                            if let Value::Object(map) = &mut b {
+                                map.insert("thinking".to_string(), Value::String(String::new()));
+                                map.insert("deferred".to_string(), Value::Bool(true));
+                            }
+                            return b;
+                        }
+                    }
+                    block.clone()
+                })
+                .collect();
+            if let Value::Object(map) = &mut message {
+                map.insert("content".to_string(), Value::Array(deferred));
+            }
+        }
+    }
+    message
 }
 
 /// 对齐 `SessionContext` 返回形状。

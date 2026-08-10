@@ -1,8 +1,8 @@
 //! 对齐 `lib/session-reader.ts`。
 //!
 //! JSONL 会话文件读取(有界,64KB header) + 路径缓存层。
-//! SessionManager.listAll/buildSessionContext 依赖 TS SDK(pi_agent_rust
-//! 的 in_process 等价),标 TODO 待引擎层补齐。
+//! SessionManager.listAll 经 `pi::sdk::SessionIndex` 接线;
+//! buildSessionContext 经 `pi::sdk::build_session_context` 接线(见 entries.rs)。
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -104,9 +104,8 @@ pub fn read_session_header(file_path: &str) -> Option<SessionHeader> {
         .filter(|h| h.r#type == "session")
 }
 
-/// 对齐 `getSessionEntries` 的低层部分:读 jsonl 文件的全部行。
-/// TODO: 上层 buildSessionContext 依赖 TS SDK(pi_agent_rust Session),
-/// 待引擎层补齐后实现 entry 解析 + 上下文构建。
+/// 对齐 `getSessionEntries`:读 jsonl 文件的全部行(header 之后)。
+/// 上下文构建用 `session::build_session_context_from_json`(经 pi::sdk::build_session_context)。
 pub fn list_session_entries(file_path: &str) -> Vec<serde_json::Value> {
     let Ok(content) = std::fs::read_to_string(file_path) else {
         return vec![];
@@ -119,9 +118,8 @@ pub fn list_session_entries(file_path: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// 列出会话目录下的所有 .jsonl 文件(对齐 SessionManager.listAll 的文件扫描部分)。
-/// TODO: SessionInfo 形状(firstMessage/messageCount/parentSessionId 等)需要读
-/// header + 首条 entry,待上层实现。
+/// 列出会话目录下的所有 .jsonl 文件。
+/// SessionInfo 派生(含 firstMessage/messageCount/parentSessionId)用 `list_all_sessions`(经 pi::sdk::SessionIndex)。
 pub fn list_session_files(sessions_dir: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(sessions_dir) else {
         return vec![];
