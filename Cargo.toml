@@ -28,5 +28,4 @@ regex = "1"
 # 仅测试用 async runtime
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 
-# 排除 moho-mate workspace(submodule 独立编译)
-[workspace]
+# pi-web-rust 作为 moho-mate 的 path dependency(与 pi-agent-rust 一致,无 [workspace])
