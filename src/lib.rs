@@ -18,7 +18,7 @@
 //! | `lib/tool-presets.ts` | `tools` | ✅ |
 //! | `lib/image-attachments.ts` | `image` | ✅ |
 //! | `lib/patch.ts` | `diff` | ✅ |
-//! | `lib/compaction-summary.ts` | `compaction` | 🟡 退化(body-only,regex 待补) |
+//! | `lib/compaction-summary.ts` | `compaction` | ✅ |
 //! | `lib/request-security.ts` | `security::request_security` | ✅ |
 //! | `lib/model-catalog.ts` | `models::catalog` | ✅ |
 //! | `lib/model-scope.ts` | `models::scope` | ✅ |

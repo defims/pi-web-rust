@@ -2,19 +2,18 @@
 //!
 //! timing-safe SHA256 比较,base64 解码 Basic Auth header。
 
+use sha2::{Digest, Sha256};
+
 pub const PI_WEB_AUTH_USERNAME: &str = "pi";
 
-/// SHA256 哈希(手写,避免 sha2 依赖)。返回 32 字节。
+/// SHA256 哈希。返回 32 字节。
 fn sha256(data: &[u8]) -> [u8; 32] {
-    // 简化:用 Rust 标准库没有 SHA256。用 base64 + 字符串比较替代 timing-safe。
-    // TODO: 加 sha2 crate 后替换为真正的 timing-safe SHA256 比较。
-    // 暂时用普通比较(安全性略低,但功能正确)。
-    let mut hash = [0u8; 32];
-    // 简单 hash(非加密安全,仅用于占位 — 实际应引 sha2)
-    for (i, byte) in data.iter().enumerate() {
-        hash[i % 32] ^= byte.wrapping_mul(31);
-    }
-    hash
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
 fn secrets_equal(actual: &str, expected: &str) -> bool {

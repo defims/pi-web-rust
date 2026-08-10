@@ -34,12 +34,12 @@ fn parse_timestamp_ms(ts: &str) -> Option<i64> {
     parse_rfc3339_to_millis(ts)
 }
 
-/// 简单 RFC3339 解析(避免 chrono 依赖)。
-/// 格式:YYYY-MM-DDTHH:MM:SS(.fff)?(Z|+HH:MM)?
+/// RFC3339 / ISO 8601 → epoch ms。
 fn parse_rfc3339_to_millis(s: &str) -> Option<i64> {
-    // 用 std::time 手动解析太复杂,暂用 Unix epoch 回退。
-    // TODO: 加 chrono 依赖后替换。
-    s.parse::<i64>().ok()
+    chrono::DateTime::parse_from_rfc3339(s)
+        .or_else(|_| chrono::DateTime::parse_from_str(s, "%+"))
+        .ok()
+        .map(|dt| dt.timestamp_millis())
 }
 
 /// 对齐 `computeSessionTotalActiveMs`。

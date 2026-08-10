@@ -19,6 +19,10 @@ serde_json = "1"
 futures = "0.3"
 # 时间格式化(ISO 8601,对齐 TS new Date().toISOString())
 chrono = "0.4"
+# SHA256(timing-safe 密码比较,对齐 lib/web-auth.ts)
+sha2 = "0.10"
+# 正则(compaction 摘要解析,对齐 lib/compaction-summary.ts)
+regex = "1"
 
 [dev-dependencies]
 # 仅测试用 async runtime
