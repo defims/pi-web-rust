@@ -167,6 +167,8 @@ pub fn list_all_sessions(
     resolve_project: impl Fn(&str) -> crate::git::worktree::ProjectInfo,
 ) -> Vec<WebSessionInfo> {
     let index = pi::sdk::SessionIndex::for_sessions_root(std::path::Path::new(sessions_root));
+    // 索引可能过期(新会话未入库)→ 增量刷新(对齐 TS SessionManager.listAll 的全扫描语义)。
+    let _ = index.refresh_incremental();
     let metas = match index.list_sessions(None) {
         Ok(m) => m,
         Err(_) => return Vec::new(),
