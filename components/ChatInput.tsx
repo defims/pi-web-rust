@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useRef, useState, useCallback, useEffect, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
+import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { SkillsResponse } from "@/lib/api-types";
 import type { TextContent, UserMessage } from "@/lib/types";
@@ -25,6 +25,7 @@ import {
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useI18n } from "@/hooks/useI18n";
+import type { ToolPreset } from "@/lib/tool-presets";
 
 export interface AttachedImage {
   data: string;   // base64, no prefix
@@ -59,8 +60,8 @@ interface Props {
   isCompacting?: boolean;
   compactError?: string | null;
   compactResult?: CompactResultInfo | null;
-  toolPreset?: "none" | "default" | "full";
-  onToolPresetChange?: (preset: "none" | "default" | "full") => void;
+  toolPreset?: ToolPreset;
+  onToolPresetChange?: (preset: ToolPreset) => void;
   thinkingLevel?: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   onThinkingLevelChange?: (level: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") => void;
   availableThinkingLevels?: string[] | null;
@@ -91,11 +92,35 @@ export interface ChatInputHandle {
   restoreSubmission: (text: string, images?: ChatDraftImage[], targetDraftKey?: string) => void;
 }
 
-const TOOL_PRESETS = ["off", "default", "full"] as const;
-const TOOL_PRESET_MAP: Record<"off" | "default" | "full", "none" | "default" | "full"> = { off: "none", default: "default", full: "full" };
+const TOOL_PRESETS = ["off", "read-only", "default", "full"] as const;
+type ToolPresetLabel = typeof TOOL_PRESETS[number];
+const TOOL_PRESET_MAP: Record<ToolPresetLabel, ToolPreset> = {
+  off: "none",
+  "read-only": "read-only",
+  default: "default",
+  full: "full",
+};
 const COMPOSITION_END_ENTER_GRACE_MS = 100;
 const MODEL_FILTER_THRESHOLD = 8;
 const MODEL_OPTION_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const ANCHORED_MENU_GAP = 8;
+
+export function getUpwardMenuMaxHeight(menuBottom: number, visibleTop: number, gap = ANCHORED_MENU_GAP): number {
+  return Math.max(0, Math.floor(menuBottom - visibleTop - gap));
+}
+
+function getVisibleTopBoundary(element: HTMLElement): number {
+  let visibleTop = window.visualViewport?.offsetTop ?? 0;
+
+  for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+    const overflowY = window.getComputedStyle(parent).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll" || overflowY === "hidden" || overflowY === "clip") {
+      visibleTop = Math.max(visibleTop, parent.getBoundingClientRect().top + parent.clientTop);
+    }
+  }
+
+  return visibleTop;
+}
 
 function compareModelOptions(a: ModelOption, b: ModelOption): number {
   return MODEL_OPTION_COLLATOR.compare(a.name || a.modelId, b.name || b.modelId)
@@ -385,6 +410,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const bashExcluded = bashMode && trimmedValue.startsWith("!!");
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
+  const [slashMenuMaxHeight, setSlashMenuMaxHeight] = useState<number | null>(null);
   const [atQuery, setAtQuery] = useState<AtQueryMatch | null>(null);
   const [atMenuOpen, setAtMenuOpen] = useState(false);
   const [atActiveIndex, setAtActiveIndex] = useState(0);
@@ -412,6 +438,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const isComposingRef = useRef(false);
   const lastCompositionEndAtRef = useRef(0);
   const slashCommandsRequestedRef = useRef(false);
+  const slashMenuRef = useRef<HTMLDivElement>(null);
   const slashItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const atItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const historyItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -606,7 +633,6 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }));
 
   const processImageFiles = useCallback(async (files: File[]) => {
-    if (isStreaming) return;
     const remaining = Math.max(
       0,
       MAX_ATTACHED_IMAGES - attachedImagesRef.current.length - pendingImageCountRef.current,
@@ -643,7 +669,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     } finally {
       pendingImageCountRef.current -= imageFiles.length;
     }
-  }, [isStreaming]);
+  }, []);
 
   const removeImage = useCallback((index: number) => {
     setAttachedImages((prev) => {
@@ -769,7 +795,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     ? t(slashQuery ? "chat.match" : "chat.command")
     : t(slashQuery ? "chat.matches" : "chat.commands", { count: filteredSlashCommands.length });
   const hasInputText = Boolean(value.trim());
-  const canQueueStreamingMessage = hasInputText && attachedImages.length === 0;
+  const canQueueStreamingMessage = hasInputText || attachedImages.length > 0;
 
   // ── @ file autocomplete ──────────────────────────────────────────────────
   // Recomputed from the text before the caret on every change/caret move.
@@ -956,7 +982,6 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const sendQueued = useCallback((mode: "steer" | "followup") => {
     const msg = value.trim();
     if (!msg && !attachedImages.length) return;
-    if (attachedImages.length) return;
     onAudioUnlock?.();
     const streamingBehavior = mode === "steer" ? "steer" : "followUp";
     if (msg.startsWith("/") && onPromptWithStreamingBehavior) {
@@ -1018,13 +1043,14 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
       const nativeEvent = e.nativeEvent;
+      const sendShortcut = e.key === "Enter" && !e.shiftKey && (!isMobile || e.ctrlKey || e.metaKey);
       const recentlyComposed = Date.now() - lastCompositionEndAtRef.current < COMPOSITION_END_ENTER_GRACE_MS;
       const isComposing =
         isComposingRef.current ||
         nativeEvent.isComposing ||
         nativeEvent.keyCode === 229;
 
-      if (e.key === "Enter" && !e.shiftKey && (isComposing || recentlyComposed)) {
+      if (sendShortcut && (isComposing || recentlyComposed)) {
         if (recentlyComposed) e.preventDefault();
         return;
       }
@@ -1045,7 +1071,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           setHistoryMenuOpen(false);
           return;
         }
-        if ((e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) && inputHistory[historyActiveIndex]) {
+        if ((e.key === "Tab" || sendShortcut) && inputHistory[historyActiveIndex]) {
           e.preventDefault();
           applyHistoryInput(inputHistory[historyActiveIndex]);
           return;
@@ -1078,7 +1104,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           setSlashMenuOpen(false);
           return;
         }
-        if ((e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) && displayedSlashCommands[slashActiveIndex]) {
+        if ((e.key === "Tab" || sendShortcut) && displayedSlashCommands[slashActiveIndex]) {
           e.preventDefault();
           applySlashCommand(displayedSlashCommands[slashActiveIndex]);
           return;
@@ -1103,7 +1129,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           setAtMenuOpen(false);
           return;
         }
-        if ((e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) && atMatches[atActiveIndex]) {
+        if ((e.key === "Tab" || sendShortcut) && atMatches[atActiveIndex]) {
           e.preventDefault();
           applyAtCompletion(atMatches[atActiveIndex]);
           return;
@@ -1126,7 +1152,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         return;
       }
 
-      if (e.key === "Enter" && !e.shiftKey) {
+      if (sendShortcut) {
         e.preventDefault();
         if (isStreaming && (onSteer || onFollowUp)) {
           // Default Enter sends as steer if available, else followup
@@ -1136,7 +1162,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         }
       }
     },
-    [isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value]
+    [isMobile, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value]
   );
 
   const handleInput = useCallback(() => {
@@ -1213,6 +1239,50 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     if (!slashMenuOpen) return;
     slashItemRefs.current[slashActiveIndex]?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [slashActiveIndex, slashMenuOpen]);
+
+  useLayoutEffect(() => {
+    if (!slashMenuOpen || slashQuery === null) {
+      setSlashMenuMaxHeight(null);
+      return;
+    }
+
+    const menu = slashMenuRef.current;
+    if (!menu) return;
+
+    let frameId: number | null = null;
+    const update = () => {
+      frameId = null;
+      const nextHeight = getUpwardMenuMaxHeight(
+        menu.getBoundingClientRect().bottom,
+        getVisibleTopBoundary(menu),
+      );
+      setSlashMenuMaxHeight((current) => current === nextHeight ? current : nextHeight);
+    };
+    const scheduleUpdate = () => {
+      if (frameId !== null) cancelAnimationFrame(frameId);
+      frameId = requestAnimationFrame(update);
+    };
+
+    update();
+    const anchorObserver = typeof ResizeObserver === "undefined" || !menu.parentElement
+      ? null
+      : new ResizeObserver(scheduleUpdate);
+    if (menu.parentElement) anchorObserver?.observe(menu.parentElement);
+    const viewport = window.visualViewport;
+    viewport?.addEventListener("resize", scheduleUpdate);
+    viewport?.addEventListener("scroll", scheduleUpdate);
+    window.addEventListener("resize", scheduleUpdate);
+    window.addEventListener("scroll", scheduleUpdate, true);
+
+    return () => {
+      anchorObserver?.disconnect();
+      viewport?.removeEventListener("resize", scheduleUpdate);
+      viewport?.removeEventListener("scroll", scheduleUpdate);
+      window.removeEventListener("resize", scheduleUpdate);
+      window.removeEventListener("scroll", scheduleUpdate, true);
+      if (frameId !== null) cancelAnimationFrame(frameId);
+    };
+  }, [slashMenuOpen, slashQuery]);
 
   // Build model options: prefer modelList (has provider info), fallback to modelNames
   const modelOptions: ModelOption[] = (() => {
@@ -1302,7 +1372,6 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         type="file"
         accept="image/*"
         multiple
-        disabled={isStreaming}
         style={{ display: "none" }}
         onChange={(e) => {
           const files = Array.from(e.target.files ?? []);
@@ -1550,6 +1619,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           )}
           {slashMenuOpen && slashQuery !== null && (
             <div
+              ref={slashMenuRef}
               style={{
                 position: "absolute",
                 left: 0,
@@ -1561,7 +1631,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 borderRadius: 8,
                 boxShadow: "0 -6px 20px rgba(0,0,0,0.12)",
                 overflow: "hidden",
-                maxHeight: "min(56vh, 460px)",
+                boxSizing: "border-box",
+                display: "flex",
+                flexDirection: "column",
+                maxHeight: slashMenuMaxHeight === null
+                  ? "min(72.8vh, 598px)"
+                  : `min(72.8vh, 598px, ${slashMenuMaxHeight}px)`,
               }}
             >
               <div
@@ -1574,12 +1649,13 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   gap: 8,
                   fontSize: 11,
                   color: "var(--text-dim)",
+                  flexShrink: 0,
                 }}
               >
                  <span>{slashCommandsLoading ? t("chat.loadingCommands") : t("chat.slashCommands", { label: slashCommandCountLabel })}</span>
                  <span style={{ fontFamily: "var(--font-mono)" }}>{t("chat.tabEnter")}</span>
               </div>
-              <div style={{ maxHeight: "calc(min(56vh, 460px) - 34px)", overflowY: "auto", padding: 10 }}>
+              <div style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto", padding: 10 }}>
                 {!slashCommandsLoading && filteredSlashCommands.length === 0 ? (
                   <div style={{ padding: "2px 2px 4px", fontSize: 12, color: "var(--text-dim)" }}>
                      {t("chat.noCommands")}
@@ -1861,7 +1937,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 <button
                   onClick={() => sendQueued("steer")}
                   disabled={!canQueueStreamingMessage}
-                  title={attachedImages.length ? "Image attachments cannot be queued while the agent is running" : "Interrupt the current run and inject this message now"}
+                  title="Interrupt the current run and inject this message now"
                   style={{
                     display: "flex", alignItems: "center", gap: 5,
                     padding: "7px 12px",
@@ -1884,7 +1960,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 <button
                   onClick={() => sendQueued("followup")}
                   disabled={!canQueueStreamingMessage}
-                  title={attachedImages.length ? "Image attachments cannot be queued while the agent is running" : "Queue this message after the agent finishes"}
+                  title="Queue this message after the agent finishes"
                   style={{
                     display: "flex", alignItems: "center", gap: 5,
                     padding: "7px 12px",
@@ -1956,7 +2032,6 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           <div style={{ flex: isMobile ? "1 1 auto" : "0 0 auto", minWidth: 0, display: "flex", alignItems: "center", gap: 2 }}>
             <button
               onClick={() => fileInputRef.current?.click()}
-              disabled={isStreaming}
              title={t("chat.attachImage")}
               style={{
                 flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
@@ -1964,12 +2039,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 background: "none", border: "none",
                 borderRadius: 9,
                 color: attachedImages.length ? "var(--accent)" : "var(--text-muted)",
-                cursor: isStreaming ? "not-allowed" : "pointer",
-                opacity: isStreaming ? 0.5 : 1,
+                cursor: "pointer",
+                opacity: 1,
                 transition: "background 0.12s, color 0.12s",
               }}
               onMouseEnter={(e) => {
-                if (isStreaming) return;
                 e.currentTarget.style.background = "var(--bg-hover)";
                 e.currentTarget.style.color = attachedImages.length ? "var(--accent)" : "var(--text)";
               }}
@@ -2269,7 +2343,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 </button>
                 {thinkingDropdownOpen && (
                   <div style={{
-                    position: "absolute", bottom: "calc(100% + 6px)", right: 0,
+                    position: "absolute", bottom: "calc(100% + 6px)",
+                    ...(isMobile ? { left: 0 } : { right: 0 }),
                     zIndex: 100, background: "var(--bg)", border: "1px solid var(--border)",
                     borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
                     overflow: "hidden", minWidth: 180,
@@ -2354,7 +2429,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 </button>
                 {toolDropdownOpen && (
                   <div style={{
-                    position: "absolute", bottom: "calc(100% + 6px)", right: 0,
+                    position: "absolute",
+                    bottom: "calc(100% + 6px)",
+                    right: isMobile ? undefined : 0,
+                    left: isMobile ? 0 : undefined,
                     zIndex: 100, background: "var(--bg)", border: "1px solid var(--border)",
                     borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
                     overflow: "hidden", minWidth: 120,
@@ -2362,7 +2440,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     {TOOL_PRESETS.map((lvl) => {
                       const preset = TOOL_PRESET_MAP[lvl];
                       const isActive = (toolPreset ?? "default") === preset;
-                       const desc = lvl === "off" ? t("chat.noTools") : lvl === "default" ? t("chat.builtInTools", { count: 4 }) : t("chat.allBuiltInTools");
+                      let desc: string;
+                      if (lvl === "off") desc = t("chat.noTools");
+                      else if (lvl === "read-only") desc = t("chat.readOnlyTools", { count: 4 });
+                      else if (lvl === "default") desc = t("chat.builtInTools", { count: 4 });
+                      else desc = t("chat.allBuiltInTools");
                       return (
                         <button
                           key={lvl}
