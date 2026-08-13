@@ -23,11 +23,13 @@ static TRAILING_FILE_SECTIONS_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// 对齐 `FILE_SECTION_RE`:Rust regex 不支持反向引用 \1,拆为两个 pattern。
-static READ_FILES_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<read-files>\s*([\s\S]*?)\s*</read-files>").expect("valid read-files regex"));
+static READ_FILES_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<read-files>\s*([\s\S]*?)\s*</read-files>").expect("valid read-files regex")
+});
 
 static MODIFIED_FILES_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<modified-files>\s*([\s\S]*?)\s*</modified-files>").expect("valid modified-files regex")
+    Regex::new(r"<modified-files>\s*([\s\S]*?)\s*</modified-files>")
+        .expect("valid modified-files regex")
 });
 
 /// 对齐 `parseCompactionSummary`。解析压缩摘要文本,提取 read-files/modified-files 标签。

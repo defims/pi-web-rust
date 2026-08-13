@@ -130,8 +130,11 @@ pub fn resolve_model_discovery_auth_blocking(
     let models_path = temp_dir.path().join("models.json");
 
     let document = build_discovery_models_document(provider_name, provider);
-    fs::write(&models_path, serde_json::to_string_pretty(&document).unwrap_or_default())
-        .map_err(|e| format!("failed to write models.json: {e}"))?;
+    fs::write(
+        &models_path,
+        serde_json::to_string_pretty(&document).unwrap_or_default(),
+    )
+    .map_err(|e| format!("failed to write models.json: {e}"))?;
 
     // 对齐 `modelRuntime.getError()` → throw
     if let Some(error) = engine.load_error() {
@@ -165,7 +168,8 @@ pub async fn resolve_model_discovery_auth(
     let provider = provider.clone();
     let (tx, rx) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
-        let result = resolve_model_discovery_auth_blocking(&provider_name, &provider, engine.as_ref());
+        let result =
+            resolve_model_discovery_auth_blocking(&provider_name, &provider, engine.as_ref());
         let _ = tx.send(result);
     });
     rx.await
@@ -194,19 +198,30 @@ mod tests {
         fn get_auth(&self, _provider: &str, _model_id: &str) -> Option<ResolvedAuth> {
             self.auth.clone()
         }
-        fn compatibility_headers(&self, _provider: &str, _model_id: &str) -> HashMap<String, String> {
+        fn compatibility_headers(
+            &self,
+            _provider: &str,
+            _model_id: &str,
+        ) -> HashMap<String, String> {
             self.compat_headers.clone()
         }
     }
 
     #[test]
     fn document_shape() {
-        let doc = build_discovery_models_document("openai", &json!({"api": "https://api.openai.com"}));
+        let doc =
+            build_discovery_models_document("openai", &json!({"api": "https://api.openai.com"}));
         assert_eq!(doc["providers"]["openai"]["api"], "https://api.openai.com");
-        assert_eq!(doc["providers"]["openai"]["models"][0]["id"], DISCOVERY_MODEL_ID);
+        assert_eq!(
+            doc["providers"]["openai"]["models"][0]["id"],
+            DISCOVERY_MODEL_ID
+        );
         // 非对象 provider 也被包裹成对象
         let doc2 = build_discovery_models_document("x", &json!(null));
-        assert_eq!(doc2["providers"]["x"]["models"][0]["id"], DISCOVERY_MODEL_ID);
+        assert_eq!(
+            doc2["providers"]["x"]["models"][0]["id"],
+            DISCOVERY_MODEL_ID
+        );
     }
 
     #[test]
@@ -232,7 +247,10 @@ mod tests {
         };
         let result = resolve_model_discovery_auth_blocking("openai", &json!({}), &engine).unwrap();
         assert_eq!(result.api_key.as_deref(), Some("sk-123"));
-        assert_eq!(result.headers.get("x-api-key").map(|s| s.as_str()), Some("sk-123"));
+        assert_eq!(
+            result.headers.get("x-api-key").map(|s| s.as_str()),
+            Some("sk-123")
+        );
     }
 
     #[test]
@@ -245,7 +263,10 @@ mod tests {
         };
         let result = resolve_model_discovery_auth_blocking("openai", &json!({}), &engine).unwrap();
         assert_eq!(result.api_key, None);
-        assert_eq!(result.headers.get("authorization").map(|s| s.as_str()), Some("Bearer t"));
+        assert_eq!(
+            result.headers.get("authorization").map(|s| s.as_str()),
+            Some("Bearer t")
+        );
     }
 
     #[test]
@@ -286,7 +307,11 @@ mod tests {
             .map(|entries| {
                 entries
                     .flatten()
-                    .filter(|e| e.file_name().to_string_lossy().starts_with(&discovery_temp_prefix()))
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with(&discovery_temp_prefix())
+                    })
                     .map(|e| e.file_name().to_string_lossy().to_string())
                     .collect()
             })

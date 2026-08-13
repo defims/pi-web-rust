@@ -105,15 +105,40 @@ mod tests {
     #[test]
     fn classify_all_statuses() {
         let cases = [
-            ("M", " ", GitFileStatusKind::Modified, GitStatusCode::Modified),
+            (
+                "M",
+                " ",
+                GitFileStatusKind::Modified,
+                GitStatusCode::Modified,
+            ),
             ("A", " ", GitFileStatusKind::Added, GitStatusCode::Added),
             ("D", " ", GitFileStatusKind::Deleted, GitStatusCode::Deleted),
             ("R", " ", GitFileStatusKind::Renamed, GitStatusCode::Renamed),
             ("C", " ", GitFileStatusKind::Renamed, GitStatusCode::Renamed),
-            ("?", "?", GitFileStatusKind::Untracked, GitStatusCode::Untracked),
-            ("U", "U", GitFileStatusKind::Conflict, GitStatusCode::Conflict),
-            ("A", "U", GitFileStatusKind::Conflict, GitStatusCode::Conflict),
-            ("D", "D", GitFileStatusKind::Conflict, GitStatusCode::Conflict),
+            (
+                "?",
+                "?",
+                GitFileStatusKind::Untracked,
+                GitStatusCode::Untracked,
+            ),
+            (
+                "U",
+                "U",
+                GitFileStatusKind::Conflict,
+                GitStatusCode::Conflict,
+            ),
+            (
+                "A",
+                "U",
+                GitFileStatusKind::Conflict,
+                GitStatusCode::Conflict,
+            ),
+            (
+                "D",
+                "D",
+                GitFileStatusKind::Conflict,
+                GitStatusCode::Conflict,
+            ),
         ];
         for (idx, wt, expected_status, expected_code) in cases {
             let entry = GitPorcelainEntry {

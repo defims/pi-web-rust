@@ -34,13 +34,20 @@ pub fn validate_upload_file_names(file_names: &[String]) -> Option<String> {
     let mut seen = std::collections::HashSet::new();
     for name in file_names {
         if name.is_empty() || name == "." || name == ".." || name.contains('\0') {
-            return Some(format!("Invalid file name: {}", if name.is_empty() { "(empty)" } else { name }));
+            return Some(format!(
+                "Invalid file name: {}",
+                if name.is_empty() { "(empty)" } else { name }
+            ));
         }
         if name.contains('/') || name.contains('\\') {
             return Some(format!("File names must not contain a path: {name}"));
         }
         // basename 检查:文件名不能含路径分隔符(已查,再确认 basename == name)
-        if Path::new(name).file_name().map(|f| f != name.as_str()).unwrap_or(true) {
+        if Path::new(name)
+            .file_name()
+            .map(|f| f != name.as_str())
+            .unwrap_or(true)
+        {
             return Some(format!("File names must not contain a path: {name}"));
         }
         if !seen.insert(name.clone()) {
@@ -70,19 +77,28 @@ pub async fn inspect_upload_targets(
         let mut result = UploadTargetInspection::default();
         for name in &file_names {
             let dest = Path::new(&dir).join(name);
-            let Ok(meta) = std::fs::symlink_metadata(&dest) else {
-                continue; // ENOENT → 不冲突
-            };
-            result.conflicts.push(name.clone());
-            // 符号链接或非普通文件不能覆盖
-            if meta.is_symlink() || !meta.is_file() {
-                result.non_replaceable.push(name.clone());
+            // 对齐 TS `fs.lstatSync` try/catch:仅 NotFound(ENOENT)视为不冲突;
+            // 其他错误(EACCES 等)向上抛出,而非静默跳过。
+            match std::fs::symlink_metadata(&dest) {
+                Ok(meta) => {
+                    result.conflicts.push(name.clone());
+                    // 符号链接或非普通文件不能覆盖
+                    if meta.is_symlink() || !meta.is_file() {
+                        result.non_replaceable.push(name.clone());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
             }
         }
-        let _ = tx.send(result);
+        let _ = tx.send(Ok(result));
     });
     rx.await
         .map_err(|_| std::io::Error::other("thread panicked"))
+        .and_then(|r| r)
 }
 
 #[cfg(test)]
@@ -91,9 +107,18 @@ mod tests {
 
     #[test]
     fn parse_strategy() {
-        assert_eq!(parse_upload_conflict_strategy(Some("error")), Some(UploadConflictStrategy::Error));
-        assert_eq!(parse_upload_conflict_strategy(Some("overwrite")), Some(UploadConflictStrategy::Overwrite));
-        assert_eq!(parse_upload_conflict_strategy(None), Some(UploadConflictStrategy::Error));
+        assert_eq!(
+            parse_upload_conflict_strategy(Some("error")),
+            Some(UploadConflictStrategy::Error)
+        );
+        assert_eq!(
+            parse_upload_conflict_strategy(Some("overwrite")),
+            Some(UploadConflictStrategy::Overwrite)
+        );
+        assert_eq!(
+            parse_upload_conflict_strategy(None),
+            Some(UploadConflictStrategy::Error)
+        );
         assert_eq!(parse_upload_conflict_strategy(Some("invalid")), None);
     }
 
@@ -103,7 +128,8 @@ mod tests {
         assert!(validate_upload_file_names(&["a.rs".into(), "b.rs".into()]).is_none());
         assert!(validate_upload_file_names(&["../evil".into()]).is_some());
         assert!(validate_upload_file_names(&["a/b".into()]).is_some());
-        assert!(validate_upload_file_names(&["a.rs".into(), "a.rs".into()]).is_some()); // duplicate
+        assert!(validate_upload_file_names(&["a.rs".into(), "a.rs".into()]).is_some());
+        // duplicate
     }
 
     #[tokio::test]

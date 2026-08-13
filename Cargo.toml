@@ -23,6 +23,10 @@ chrono = "0.4"
 sha2 = "0.10"
 # 正则(compaction 摘要解析,对齐 lib/compaction-summary.ts)
 regex = "1"
+# UUID v4(原子写入临时文件名,对齐 TS crypto.randomUUID())
+uuid = { version = "1", features = ["v4"] }
+# unix 常量(O_NOFOLLOW,对齐 lib/bash-output.ts 的 openRegularFileNoFollow)
+libc = "0.2"
 
 [dev-dependencies]
 # 仅测试用 async runtime

@@ -33,8 +33,14 @@ mod tests {
 
     #[test]
     fn dirent_knows_directly() {
-        assert_eq!(resolve_dirent_is_directory(true, false, Path::new("/x")), Some(true));
-        assert_eq!(resolve_dirent_is_directory(false, true, Path::new("/x")), Some(false));
+        assert_eq!(
+            resolve_dirent_is_directory(true, false, Path::new("/x")),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_dirent_is_directory(false, true, Path::new("/x")),
+            Some(false)
+        );
     }
 
     #[test]
@@ -46,7 +52,10 @@ mod tests {
         // 真实文件 → stat 判定 false
         let file = dir.join("f.txt");
         std::fs::write(&file, "x").unwrap();
-        assert_eq!(resolve_dirent_is_directory(false, false, &file), Some(false));
+        assert_eq!(
+            resolve_dirent_is_directory(false, false, &file),
+            Some(false)
+        );
         // 不存在 → null
         assert_eq!(
             resolve_dirent_is_directory(false, false, &dir.join("missing")),

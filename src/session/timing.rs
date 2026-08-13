@@ -89,10 +89,34 @@ mod tests {
     #[test]
     fn with_epoch_timestamps() {
         let entries = vec![
-            TimingEntry { entry_type: "message".into(), timestamp: "1000".into(), message: Some(TimingMessage { role: Some("user".into()) }) },
-            TimingEntry { entry_type: "message".into(), timestamp: "3000".into(), message: Some(TimingMessage { role: Some("assistant".into()) }) },
-            TimingEntry { entry_type: "message".into(), timestamp: "8000".into(), message: Some(TimingMessage { role: Some("user".into()) }) },
-            TimingEntry { entry_type: "message".into(), timestamp: "9000".into(), message: Some(TimingMessage { role: Some("assistant".into()) }) },
+            TimingEntry {
+                entry_type: "message".into(),
+                timestamp: "1000".into(),
+                message: Some(TimingMessage {
+                    role: Some("user".into()),
+                }),
+            },
+            TimingEntry {
+                entry_type: "message".into(),
+                timestamp: "3000".into(),
+                message: Some(TimingMessage {
+                    role: Some("assistant".into()),
+                }),
+            },
+            TimingEntry {
+                entry_type: "message".into(),
+                timestamp: "8000".into(),
+                message: Some(TimingMessage {
+                    role: Some("user".into()),
+                }),
+            },
+            TimingEntry {
+                entry_type: "message".into(),
+                timestamp: "9000".into(),
+                message: Some(TimingMessage {
+                    role: Some("assistant".into()),
+                }),
+            },
         ];
         // 3000-1000 = 2000, 9000-8000 = 1000 → total 3000
         assert_eq!(compute_session_total_active_ms(&entries), 3000);

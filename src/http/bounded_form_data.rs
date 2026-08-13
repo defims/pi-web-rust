@@ -48,7 +48,10 @@ pub fn check_declared_content_length(
 ///
 /// `collect_body_within_limit` 同步版:消费 chunk 迭代器并统计总字节。
 /// 返回累计的完整 body(供调用方做 multipart 解析)。
-pub fn collect_body_within_limit<I>(chunks: I, max_bytes: u64) -> Result<Vec<u8>, RequestBodyTooLarge>
+pub fn collect_body_within_limit<I>(
+    chunks: I,
+    max_bytes: u64,
+) -> Result<Vec<u8>, RequestBodyTooLarge>
 where
     I: IntoIterator<Item = Vec<u8>>,
 {
@@ -147,14 +150,20 @@ mod tests {
         assert_eq!(declared_content_length(None), None);
         // 超出 JS safe integer 视为无效
         assert_eq!(declared_content_length(Some("9007199254740992")), None);
-        assert_eq!(declared_content_length(Some("9007199254740991")), Some(9_007_199_254_740_991));
+        assert_eq!(
+            declared_content_length(Some("9007199254740991")),
+            Some(9_007_199_254_740_991)
+        );
     }
 
     #[test]
     fn declared_check() {
         assert_eq!(check_declared_content_length(Some("500"), 1000), Ok(()));
         assert_eq!(check_declared_content_length(Some("1000"), 1000), Ok(()));
-        assert_eq!(check_declared_content_length(Some("1001"), 1000), Err(RequestBodyTooLarge));
+        assert_eq!(
+            check_declared_content_length(Some("1001"), 1000),
+            Err(RequestBodyTooLarge)
+        );
         // 无效声明 → 不拦截(交由流式预算处理)
         assert_eq!(check_declared_content_length(None, 1000), Ok(()));
         assert_eq!(check_declared_content_length(Some("abc"), 1000), Ok(()));
@@ -176,29 +185,49 @@ mod tests {
             consumed += 1;
             vec![b'x'; 10]
         });
-        assert_eq!(collect_body_within_limit(chunks, 25), Err(RequestBodyTooLarge));
+        assert_eq!(
+            collect_body_within_limit(chunks, 25),
+            Err(RequestBodyTooLarge)
+        );
         assert_eq!(consumed, 3); // 同步版仍消费剩余项(无取消语义)
     }
 
     #[tokio::test]
     async fn async_collect_within_limit() {
-        let stream = iter(vec![Ok::<_, std::io::Error>(b"hello ".to_vec()), Ok(b"world".to_vec())]);
-        let body = parse_form_data_within_limit(Some("11"), stream, 100).await.unwrap();
+        let stream = iter(vec![
+            Ok::<_, std::io::Error>(b"hello ".to_vec()),
+            Ok(b"world".to_vec()),
+        ]);
+        let body = parse_form_data_within_limit(Some("11"), stream, 100)
+            .await
+            .unwrap();
         assert_eq!(body, b"hello world");
 
         // 声明长度超限 → 直接抛错(不读流)
         let stream = iter(vec![Ok::<_, std::io::Error>(b"x".to_vec())]);
-        let err = parse_form_data_within_limit(Some("200"), stream, 100).await.unwrap_err();
+        let err = parse_form_data_within_limit(Some("200"), stream, 100)
+            .await
+            .unwrap_err();
         assert!(matches!(err, BodyLimitError::TooLarge(_)));
 
         // 流式超限(声明缺失)→ 抛错
-        let stream = iter(vec![Ok::<_, std::io::Error>(b"x".to_vec()), Ok(vec![b'y'; 200])]);
-        let err = parse_form_data_within_limit(None, stream, 100).await.unwrap_err();
+        let stream = iter(vec![
+            Ok::<_, std::io::Error>(b"x".to_vec()),
+            Ok(vec![b'y'; 200]),
+        ]);
+        let err = parse_form_data_within_limit(None, stream, 100)
+            .await
+            .unwrap_err();
         assert!(matches!(err, BodyLimitError::TooLarge(_)));
 
         // 读取错误透传
-        let stream = iter(vec![Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))]);
-        let err = parse_form_data_within_limit(Some("1"), stream, 100).await.unwrap_err();
+        let stream = iter(vec![Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "boom",
+        ))]);
+        let err = parse_form_data_within_limit(Some("1"), stream, 100)
+            .await
+            .unwrap_err();
         assert!(matches!(err, BodyLimitError::Read(_)));
     }
 }

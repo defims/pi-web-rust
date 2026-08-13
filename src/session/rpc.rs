@@ -49,7 +49,11 @@ pub fn with_extension_tools(tool_names: &[String], extension_tool_names: &[Strin
 
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for name in tool_names.iter().map(|s| s.as_str()).chain(extension.iter().copied()) {
+    for name in tool_names
+        .iter()
+        .map(|s| s.as_str())
+        .chain(extension.iter().copied())
+    {
         if seen.insert(name) {
             out.push(name.to_string());
         }
@@ -171,14 +175,21 @@ mod tests {
     #[test]
     fn extension_tools_merge() {
         let tools = vec!["bash".to_string(), "custom_a".to_string()];
-        let extensions = vec!["custom_a".to_string(), "custom_b".to_string(), "bash".to_string()];
+        let extensions = vec![
+            "custom_a".to_string(),
+            "custom_b".to_string(),
+            "bash".to_string(),
+        ];
         let out = with_extension_tools(&tools, &extensions);
         assert_eq!(out, vec!["bash", "custom_a", "custom_b"]);
     }
 
     #[test]
     fn extension_tools_empty_short_circuit() {
-        assert_eq!(with_extension_tools(&[], &["x".to_string()]), Vec::<String>::new());
+        assert_eq!(
+            with_extension_tools(&[], &["x".to_string()]),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

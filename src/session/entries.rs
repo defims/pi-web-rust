@@ -154,26 +154,33 @@ pub fn base64_image_info(block: &Value) -> Option<(usize, Option<String>)> {
         return None;
     }
 
-    let (data, mime): (String, Option<String>) = if let Some(data) = block.get("data").and_then(|d| d.as_str()) {
-        (data.to_string(), block.get("mimeType").and_then(|m| m.as_str()).map(|s| s.to_string()))
-    } else if let Some(source) = block.get("source").filter(|s| s.is_object()) {
-        if source.get("type").and_then(|t| t.as_str()) == Some("base64") {
-            if let Some(data) = source.get("data").and_then(|d| d.as_str()) {
-                let mime = source
-                    .get("media_type")
+    let (data, mime): (String, Option<String>) =
+        if let Some(data) = block.get("data").and_then(|d| d.as_str()) {
+            (
+                data.to_string(),
+                block
+                    .get("mimeType")
                     .and_then(|m| m.as_str())
-                    .or_else(|| source.get("mediaType").and_then(|m| m.as_str()))
-                    .map(|s| s.to_string());
-                (data.to_string(), mime)
+                    .map(|s| s.to_string()),
+            )
+        } else if let Some(source) = block.get("source").filter(|s| s.is_object()) {
+            if source.get("type").and_then(|t| t.as_str()) == Some("base64") {
+                if let Some(data) = source.get("data").and_then(|d| d.as_str()) {
+                    let mime = source
+                        .get("media_type")
+                        .and_then(|m| m.as_str())
+                        .or_else(|| source.get("mediaType").and_then(|m| m.as_str()))
+                        .map(|s| s.to_string());
+                    (data.to_string(), mime)
+                } else {
+                    return None;
+                }
             } else {
                 return None;
             }
         } else {
             return None;
-        }
-    } else {
-        return None;
-    };
+        };
 
     let bytes = get_base64_decoded_byte_length(&data)?;
     Some((bytes, mime))
@@ -272,7 +279,10 @@ pub fn entry_to_ui_message(
     defer_tool_result_images: bool,
 ) -> Option<Value> {
     let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    let timestamp = entry.get("timestamp").and_then(|t| t.as_str()).and_then(parse_entry_timestamp);
+    let timestamp = entry
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(parse_entry_timestamp);
     match entry_type {
         "message" => {
             let raw_message = entry.get("message")?;
@@ -291,25 +301,38 @@ pub fn entry_to_ui_message(
             Some(defer_thinking_blocks(message))
         }
         "compaction" => {
-            let summary = entry.get("summary").and_then(|s| s.as_str())?;
+            // 对齐 TS:总是产出(不因缺 summary 而丢条)。content = entry.summary,
+            // 缺失(undefined)→ 省略该字段;null/字符串 → 含。
             let mut details = serde_json::Map::new();
-            if let Some(tokens_before) = entry.get("tokensBefore").and_then(|v| v.as_u64()) {
-                details.insert("tokensBefore".to_string(), Value::from(tokens_before));
+            if let Some(tokens_before) = entry.get("tokensBefore") {
+                details.insert("tokensBefore".to_string(), tokens_before.clone());
             }
-            if let Some(first_kept) = entry.get("firstKeptEntryId").and_then(|v| v.as_str()) {
-                details.insert("firstKeptEntryId".to_string(), Value::String(first_kept.to_string()));
+            if let Some(first_kept) = entry.get("firstKeptEntryId") {
+                details.insert("firstKeptEntryId".to_string(), first_kept.clone());
             }
-            Some(serde_json::json!({
-                "role": "custom",
-                "customType": "compaction",
-                "content": summary,
-                "display": true,
-                "details": Value::Object(details),
-                "timestamp": timestamp,
-            }))
+            let mut obj = serde_json::Map::new();
+            obj.insert("role".to_string(), Value::String("custom".to_string()));
+            obj.insert(
+                "customType".to_string(),
+                Value::String("compaction".to_string()),
+            );
+            if let Some(summary) = entry.get("summary") {
+                obj.insert("content".to_string(), summary.clone());
+            }
+            obj.insert("display".to_string(), Value::Bool(true));
+            obj.insert("details".to_string(), Value::Object(details));
+            obj.insert("timestamp".to_string(), serde_json::json!(timestamp));
+            Some(Value::Object(obj))
         }
         "branch_summary" => {
-            let summary = entry.get("summary").and_then(|s| s.as_str())?;
+            // 对齐 TS `if (!entry.summary) return null`:缺失或空串 → null。
+            let Some(summary) = entry
+                .get("summary")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+            else {
+                return None;
+            };
             Some(serde_json::json!({
                 "role": "user",
                 "content": format!("*The conversation briefly explored another branch and returned with this summary:*\n\n{summary}"),
@@ -317,18 +340,24 @@ pub fn entry_to_ui_message(
             }))
         }
         "custom_message" => {
-            let custom_type = entry.get("customType").and_then(|t| t.as_str())?;
-            let content = entry.get("content").cloned().unwrap_or(Value::Null);
-            let display = entry.get("display").and_then(|d| d.as_bool()).unwrap_or(false);
-            let details = entry.get("details").cloned();
-            Some(serde_json::json!({
-                "role": "custom",
-                "customType": custom_type,
-                "content": content,
-                "display": display,
-                "details": details,
-                "timestamp": timestamp,
-            }))
+            // 对齐 TS:customType/content/display/details 各自「存在则含(含 null/false),
+            // 缺失则省略」;不因缺字段而丢弃整条。
+            let mut obj = serde_json::Map::new();
+            obj.insert("role".to_string(), Value::String("custom".to_string()));
+            if let Some(ct) = entry.get("customType") {
+                obj.insert("customType".to_string(), ct.clone());
+            }
+            if let Some(c) = entry.get("content") {
+                obj.insert("content".to_string(), c.clone());
+            }
+            if let Some(d) = entry.get("display") {
+                obj.insert("display".to_string(), d.clone());
+            }
+            if let Some(det) = entry.get("details") {
+                obj.insert("details".to_string(), det.clone());
+            }
+            obj.insert("timestamp".to_string(), serde_json::json!(timestamp));
+            Some(Value::Object(obj))
         }
         _ => None,
     }
@@ -349,8 +378,15 @@ pub fn build_session_context(
     let mut messages: Vec<Value> = Vec::new();
     let mut entry_ids: Vec<String> = Vec::new();
     for entry in context_entries {
-        if let Some(message) = entry_to_ui_message(entry, defer_thinking, defer_tool_result_images) {
-            entry_ids.push(entry.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string());
+        if let Some(message) = entry_to_ui_message(entry, defer_thinking, defer_tool_result_images)
+        {
+            entry_ids.push(
+                entry
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
             messages.push(message);
         }
     }
@@ -404,9 +440,8 @@ pub fn build_session_context_from_json(
 
     // 2. 调引擎 build_session_context
     // leaf_id=None 时用最后一条 entry 的 id(对齐 TS buildSessionContext 的回退)
-    let effective_leaf_id = leaf_id.or_else(|| {
-        pi_entries.last().and_then(|e| e.base().id.as_deref())
-    });
+    let effective_leaf_id =
+        leaf_id.or_else(|| pi_entries.last().and_then(|e| e.base().id.as_deref()));
     let snapshot = pi::sdk::build_session_context(&pi_entries, effective_leaf_id, &by_id);
 
     // 3. Message → UI Value
@@ -435,15 +470,21 @@ pub fn build_session_context_from_json(
         messages,
         entry_ids: context_entry_ids,
         thinking_level: snapshot.thinking_level,
-        model: snapshot.model.map(|(provider, id)| {
-            serde_json::json!({ "provider": provider, "id": id })
-        }),
+        model: snapshot
+            .model
+            .map(|(provider, id)| serde_json::json!({ "provider": provider, "id": id })),
     }
 }
 
 /// 对 defer_thinking / defer_tool_result_images 的后处理。
-fn apply_defer_options(mut message: Value, defer_thinking: bool, defer_tool_result_images: bool) -> Value {
-    if defer_tool_result_images && message.get("role").and_then(|r| r.as_str()) == Some("toolResult") {
+fn apply_defer_options(
+    mut message: Value,
+    defer_thinking: bool,
+    defer_tool_result_images: bool,
+) -> Value {
+    if defer_tool_result_images
+        && message.get("role").and_then(|r| r.as_str()) == Some("toolResult")
+    {
         message = omit_tool_result_base64_images(&message);
     }
     if defer_thinking && message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
@@ -492,13 +533,31 @@ mod tests {
 
     #[test]
     fn timestamp_iso_utc() {
-        assert_eq!(parse_entry_timestamp("2024-01-01T00:00:00Z"), Some(1704067200000));
-        assert_eq!(parse_entry_timestamp("2024-01-01T00:00:00.000Z"), Some(1704067200000));
-        assert_eq!(parse_entry_timestamp("2024-01-01T00:00:00.123Z"), Some(1704067200123));
+        assert_eq!(
+            parse_entry_timestamp("2024-01-01T00:00:00Z"),
+            Some(1704067200000)
+        );
+        assert_eq!(
+            parse_entry_timestamp("2024-01-01T00:00:00.000Z"),
+            Some(1704067200000)
+        );
+        assert_eq!(
+            parse_entry_timestamp("2024-01-01T00:00:00.123Z"),
+            Some(1704067200123)
+        );
         assert_eq!(parse_entry_timestamp("2024-01-01"), Some(1704067200000));
-        assert_eq!(parse_entry_timestamp("2024-01-01T00:00:00+08:00"), Some(1704038400000));
-        assert_eq!(parse_entry_timestamp("2024-01-01T08:00:00+0800"), Some(1704067200000));
-        assert_eq!(parse_entry_timestamp("2024-01-01T00:00:00"), Some(1704067200000));
+        assert_eq!(
+            parse_entry_timestamp("2024-01-01T00:00:00+08:00"),
+            Some(1704038400000)
+        );
+        assert_eq!(
+            parse_entry_timestamp("2024-01-01T08:00:00+0800"),
+            Some(1704067200000)
+        );
+        assert_eq!(
+            parse_entry_timestamp("2024-01-01T00:00:00"),
+            Some(1704067200000)
+        );
         assert_eq!(parse_entry_timestamp("not-a-date"), None);
         assert_eq!(parse_entry_timestamp(""), None);
         assert_eq!(parse_entry_timestamp("1714608000000"), None);
@@ -511,15 +570,27 @@ mod tests {
     fn base64_image_detection() {
         // "aGVsbG8=" = "hello"(5 字节)
         let block = json!({ "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" });
-        assert_eq!(base64_image_info(&block), Some((5, Some("image/png".to_string()))));
+        assert_eq!(
+            base64_image_info(&block),
+            Some((5, Some("image/png".to_string())))
+        );
         // source 形状(media_type)
         let block = json!({ "type": "image", "source": { "type": "base64", "data": "aGVsbG8=", "media_type": "image/jpeg" } });
-        assert_eq!(base64_image_info(&block), Some((5, Some("image/jpeg".to_string()))));
+        assert_eq!(
+            base64_image_info(&block),
+            Some((5, Some("image/jpeg".to_string())))
+        );
         // 非图片 / url source → None
         assert_eq!(base64_image_info(&json!({ "type": "text" })), None);
-        assert_eq!(base64_image_info(&json!({ "type": "image", "source": { "type": "url", "url": "x" } })), None);
+        assert_eq!(
+            base64_image_info(&json!({ "type": "image", "source": { "type": "url", "url": "x" } })),
+            None
+        );
         // 非法 base64 → None
-        assert_eq!(base64_image_info(&json!({ "type": "image", "data": "not!!base64" })), None);
+        assert_eq!(
+            base64_image_info(&json!({ "type": "image", "data": "not!!base64" })),
+            None
+        );
     }
 
     #[test]
@@ -569,7 +640,8 @@ mod tests {
         assert_eq!(blocks[0]["thinking"], "");
         assert_eq!(blocks[0]["deferred"], true);
         // 非 assistant 消息不受 defer 影响
-        let user_entry = json!({ "type": "message", "message": { "role": "user", "content": "hi" } });
+        let user_entry =
+            json!({ "type": "message", "message": { "role": "user", "content": "hi" } });
         let out = entry_to_ui_message(&user_entry, true, false).unwrap();
         assert_eq!(out["role"], "user");
     }
@@ -639,13 +711,7 @@ mod tests {
             thinking_level: Some("high".to_string()),
             model: Some(json!({ "id": "m1" })),
         };
-        let ctx = build_session_context(
-            &entries,
-            sdk,
-            &entries[..1],
-            true,
-            true,
-        );
+        let ctx = build_session_context(&entries, sdk, &entries[..1], true, true);
         assert_eq!(ctx.messages.len(), 1);
         assert_eq!(ctx.entry_ids, vec!["a".to_string()]);
         assert_eq!(ctx.thinking_level.as_deref(), Some("high"));

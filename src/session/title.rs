@@ -10,8 +10,16 @@
 //!
 //! 消息用 `serde_json::Value` 承载(引擎中立),由宿主与 pi_agent_rust 互转。
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::LazyLock;
+
+/// 对齐 TS `/^(?:session\s+title|title|标题)\s*[:：-]\s*/i` 的标签前缀部分。
+/// `session\s+title` 接受任意空白(空格/制表/换行),非字面单空格。
+static TITLE_LABEL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:session\s+title|title|标题)").expect("valid title label regex")
+});
 
 /// 对齐 `TITLE_TIMEOUT_MS`。
 pub const TITLE_TIMEOUT_MS: u64 = 90_000;
@@ -19,7 +27,8 @@ pub const TITLE_TIMEOUT_MS: u64 = 90_000;
 pub const MAX_TITLE_LENGTH: usize = 80;
 
 /// 对齐 `TITLE_PROMPT`。
-pub const TITLE_PROMPT: &str = "Create a concise title for this session based on the conversation above.
+pub const TITLE_PROMPT: &str =
+    "Create a concise title for this session based on the conversation above.
 
 Requirements:
 - Match the primary language used by the user.
@@ -64,10 +73,7 @@ pub fn strip_wrapping_quotes(value: &str) -> String {
     for (start, end) in PAIRS {
         let start_len = start.len_utf8();
         let end_len = end.len_utf8();
-        if value.starts_with(start)
-            && value.ends_with(end)
-            && value.chars().count() > 2
-        {
+        if value.starts_with(start) && value.ends_with(end) && value.chars().count() > 2 {
             return value[start_len..value.len() - end_len].trim().to_string();
         }
     }
@@ -92,16 +98,15 @@ pub fn parse_generated_session_title(raw: &str) -> Result<String, String> {
     }
 
     // 只取第一行(\r?\n)
-    value = value
-        .split(['\n', '\r'])
-        .next()
-        .unwrap_or("")
-        .to_string();
+    value = value.split(['\n', '\r']).next().unwrap_or("").to_string();
 
     // 标签剥离:^/^(?:session\s+title|title|标题)\s*[:：-]\s*/i
     value = strip_title_label(&value);
 
-    value = strip_wrapping_quotes(&value).split_whitespace().collect::<Vec<_>>().join(" ");
+    value = strip_wrapping_quotes(&value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
 
     // 尾部 。.! 剥离
     let trimmed_end = value.trim_end_matches(['。', '.', '!']);
@@ -114,7 +119,12 @@ pub fn parse_generated_session_title(raw: &str) -> Result<String, String> {
 
     // 按码点截断到 MAX_TITLE_LENGTH(Array.from + slice)
     if value.chars().count() > MAX_TITLE_LENGTH {
-        value = value.chars().take(MAX_TITLE_LENGTH).collect::<String>().trim().to_string();
+        value = value
+            .chars()
+            .take(MAX_TITLE_LENGTH)
+            .collect::<String>()
+            .trim()
+            .to_string();
     }
     Ok(value)
 }
@@ -128,7 +138,12 @@ fn strip_fenced_block(value: &str) -> Option<String> {
     let inner = &trimmed[3..trimmed.len() - 3];
     // (?:json|text)? 可选语言标识(大小写不敏感)
     let inner = inner.trim_start();
-    let inner = if inner.len() >= 4 && (inner[..4].eq_ignore_ascii_case("json") || inner[..4].eq_ignore_ascii_case("text")) {
+    // (?:json|text)? 可选语言标识(大小写不敏感)。`is_char_boundary(4)` 守卫 CJK:
+    // 内层首字符为多字节时第 4 字节落在码点中间,直接切片会 panic。
+    let inner = if inner.len() >= 4
+        && inner.is_char_boundary(4)
+        && (inner[..4].eq_ignore_ascii_case("json") || inner[..4].eq_ignore_ascii_case("text"))
+    {
         inner[4..].to_string()
     } else {
         inner.to_string()
@@ -142,34 +157,20 @@ fn strip_fenced_block(value: &str) -> Option<String> {
 
 /// `/^(?:session\s+title|title|标题)\s*[:：-]\s*/i` 对齐。
 fn strip_title_label(value: &str) -> String {
-    let lower = value.to_lowercase();
-    // 在原串上按标签字节长度切片(不能用小写副本切片,否则剩余部分被小写化)
-    let label_len: Option<usize> = if lower.starts_with("session title") {
-        Some("session title".len())
-    } else if lower.starts_with("title") {
-        Some("title".len())
-    } else if value.starts_with('标') {
-        // "标题" 前缀(CJK 无大小写)
-        let chars: Vec<char> = value.chars().collect();
-        if chars.len() >= 2 && chars[0] == '标' && chars[1] == '题' {
-            Some(chars[0].len_utf8() + chars[1].len_utf8())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let Some(label_len) = label_len else {
+    // 用正则匹配标签前缀(`session\s+title` 接受任意空白,大小写不敏感)。
+    let Some(m) = TITLE_LABEL_RE.find(value) else {
         return value.to_string();
     };
-    // \s*[:：-]\s*  —— 分隔符可为 : ： 或 -(字面量)
-    let rest = &value[label_len..];
+    // 正则字节偏移必在字符边界上,可安全切片。
+    let rest = &value[m.end()..];
     let rest_trimmed = rest.trim_start_matches(|c: char| c.is_whitespace());
     let Some(first) = rest_trimmed.chars().next() else {
         return value.to_string();
     };
+    // 分隔符可为 : ： 或 -(字面量)
     if first == ':' || first == '：' || first == '-' {
-        let after = rest_trimmed[first.len_utf8()..].trim_start_matches(|c: char| c.is_whitespace());
+        let after =
+            rest_trimmed[first.len_utf8()..].trim_start_matches(|c: char| c.is_whitespace());
         after.to_string()
     } else {
         value.to_string()
@@ -233,12 +234,16 @@ pub fn sanitize_title_messages(messages: &[Value]) -> Vec<Value> {
                 }
 
                 let mut kept_ids = std::collections::HashSet::new();
-                let content = message.get("content").cloned().unwrap_or(Value::Array(Vec::new()));
+                let content = message
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new()));
                 let filtered: Vec<Value> = match content {
                     Value::Array(blocks) => blocks
                         .into_iter()
                         .filter(|block| {
-                            let is_tool_call = block.get("type").and_then(|t| t.as_str()) == Some("toolCall");
+                            let is_tool_call =
+                                block.get("type").and_then(|t| t.as_str()) == Some("toolCall");
                             if !is_tool_call {
                                 return true;
                             }
@@ -314,8 +319,10 @@ pub async fn generate_session_title<R: SessionTitleRunner + ?Sized>(
         return Err("The session has no user messages to name".to_string());
     }
 
-    let continues_from_trailing_user =
-        sanitized.last().map(|m| message_role(m) == Some("user")).unwrap_or(false);
+    let continues_from_trailing_user = sanitized
+        .last()
+        .map(|m| message_role(m) == Some("user"))
+        .unwrap_or(false);
     let final_messages = if continues_from_trailing_user {
         append_title_request_to_trailing_user(&sanitized)
     } else {
@@ -372,13 +379,16 @@ pub fn assistant_result_from_messages(
             continue;
         }
 
-        let usage = message.get("usage").and_then(|u| u.as_object()).map(|u| Usage {
-            input: u.get("input").and_then(|v| v.as_u64()).unwrap_or(0),
-            output: u.get("output").and_then(|v| v.as_u64()).unwrap_or(0),
-            cache_read: u.get("cacheRead").and_then(|v| v.as_u64()).unwrap_or(0),
-            cache_write: u.get("cacheWrite").and_then(|v| v.as_u64()).unwrap_or(0),
-            total: u.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        });
+        let usage = message
+            .get("usage")
+            .and_then(|u| u.as_object())
+            .map(|u| Usage {
+                input: u.get("input").and_then(|v| v.as_u64()).unwrap_or(0),
+                output: u.get("output").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_read: u.get("cacheRead").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_write: u.get("cacheWrite").and_then(|v| v.as_u64()).unwrap_or(0),
+                total: u.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            });
 
         return Ok(GeneratedSessionTitle {
             title: parse_generated_session_title(&text)?,
@@ -395,19 +405,57 @@ mod tests {
 
     #[test]
     fn parse_plain_and_trim() {
-        assert_eq!(parse_generated_session_title("  My session title  ").unwrap(), "My session title");
-        assert_eq!(parse_generated_session_title("  spaced   out   words  ").unwrap(), "spaced out words");
+        assert_eq!(
+            parse_generated_session_title("  My session title  ").unwrap(),
+            "My session title"
+        );
+        assert_eq!(
+            parse_generated_session_title("  spaced   out   words  ").unwrap(),
+            "spaced out words"
+        );
     }
 
     #[test]
     fn parse_fenced_blocks() {
-        assert_eq!(parse_generated_session_title("```text\nFenced title\n```").unwrap(), "Fenced title");
+        assert_eq!(
+            parse_generated_session_title("```text\nFenced title\n```").unwrap(),
+            "Fenced title"
+        );
         assert_eq!(
             parse_generated_session_title("```json\n{\"title\": \"JSON Title\"}\n```").unwrap(),
             "JSON Title"
         );
-        assert_eq!(parse_generated_session_title("```\nPlain fence\n```").unwrap(), "Plain fence");
-        assert_eq!(parse_generated_session_title("```TEXT\nUpper lang\n```").unwrap(), "Upper lang");
+        assert_eq!(
+            parse_generated_session_title("```\nPlain fence\n```").unwrap(),
+            "Plain fence"
+        );
+        assert_eq!(
+            parse_generated_session_title("```TEXT\nUpper lang\n```").unwrap(),
+            "Upper lang"
+        );
+    }
+
+    #[test]
+    fn parse_fenced_cjk_no_panic() {
+        // 回归:strip_fenced_block 的 inner[..4] 在 CJK 内容(第 4 字节落在码点中间)上
+        // 曾 panic。必须返回标题而非崩溃。
+        assert_eq!(
+            parse_generated_session_title("```json\n中文标题\n```").unwrap(),
+            "中文标题"
+        );
+        assert_eq!(
+            parse_generated_session_title("```\n中文\n```").unwrap(),
+            "中文"
+        );
+    }
+
+    #[test]
+    fn strip_label_accepts_variable_whitespace() {
+        // 对齐 TS `session\s+title`:制表符/多空格也算同一标签。
+        assert_eq!(
+            parse_generated_session_title("Session\tTitle: 标签制表").unwrap(),
+            "标签制表"
+        );
     }
 
     #[test]
@@ -422,33 +470,72 @@ mod tests {
             "{\"title\": 42}"
         );
         // 非法 JSON → 回落为纯文本(含字母 → 通过校验)
-        assert_eq!(parse_generated_session_title("{broken}").unwrap(), "{broken}");
+        assert_eq!(
+            parse_generated_session_title("{broken}").unwrap(),
+            "{broken}"
+        );
     }
 
     #[test]
     fn parse_label_strip() {
-        assert_eq!(parse_generated_session_title("Title: Prefixed").unwrap(), "Prefixed");
-        assert_eq!(parse_generated_session_title("title: Lower").unwrap(), "Lower");
-        assert_eq!(parse_generated_session_title("session title: With Prefix").unwrap(), "With Prefix");
-        assert_eq!(parse_generated_session_title("标题：中文标题").unwrap(), "中文标题");
+        assert_eq!(
+            parse_generated_session_title("Title: Prefixed").unwrap(),
+            "Prefixed"
+        );
+        assert_eq!(
+            parse_generated_session_title("title: Lower").unwrap(),
+            "Lower"
+        );
+        assert_eq!(
+            parse_generated_session_title("session title: With Prefix").unwrap(),
+            "With Prefix"
+        );
+        assert_eq!(
+            parse_generated_session_title("标题：中文标题").unwrap(),
+            "中文标题"
+        );
         assert_eq!(parse_generated_session_title("标题: 中文").unwrap(), "中文");
         // '-' 也是合法分隔符(探针确认)
-        assert_eq!(parse_generated_session_title("Session title - dash").unwrap(), "dash");
+        assert_eq!(
+            parse_generated_session_title("Session title - dash").unwrap(),
+            "dash"
+        );
     }
 
     #[test]
     fn parse_first_line_only() {
-        assert_eq!(parse_generated_session_title("Line one\nLine two").unwrap(), "Line one");
-        assert_eq!(parse_generated_session_title("Line one\r\nLine two").unwrap(), "Line one");
+        assert_eq!(
+            parse_generated_session_title("Line one\nLine two").unwrap(),
+            "Line one"
+        );
+        assert_eq!(
+            parse_generated_session_title("Line one\r\nLine two").unwrap(),
+            "Line one"
+        );
     }
 
     #[test]
     fn parse_quote_strip() {
-        assert_eq!(parse_generated_session_title("\"Quoted title\"").unwrap(), "Quoted title");
-        assert_eq!(parse_generated_session_title("'Single quoted'").unwrap(), "Single quoted");
-        assert_eq!(parse_generated_session_title("`Backticked`").unwrap(), "Backticked");
-        assert_eq!(parse_generated_session_title("\u{201c}Curly\u{201d}").unwrap(), "Curly");
-        assert_eq!(parse_generated_session_title("\u{300c}Bracketed\u{300d}").unwrap(), "Bracketed");
+        assert_eq!(
+            parse_generated_session_title("\"Quoted title\"").unwrap(),
+            "Quoted title"
+        );
+        assert_eq!(
+            parse_generated_session_title("'Single quoted'").unwrap(),
+            "Single quoted"
+        );
+        assert_eq!(
+            parse_generated_session_title("`Backticked`").unwrap(),
+            "Backticked"
+        );
+        assert_eq!(
+            parse_generated_session_title("\u{201c}Curly\u{201d}").unwrap(),
+            "Curly"
+        );
+        assert_eq!(
+            parse_generated_session_title("\u{300c}Bracketed\u{300d}").unwrap(),
+            "Bracketed"
+        );
         assert_eq!(
             parse_generated_session_title("\u{300e}Double bracket\u{300f}").unwrap(),
             "Double bracket"
@@ -462,9 +549,18 @@ mod tests {
 
     #[test]
     fn parse_trailing_punctuation() {
-        assert_eq!(parse_generated_session_title("Ends with period.").unwrap(), "Ends with period");
-        assert_eq!(parse_generated_session_title("结束句号。").unwrap(), "结束句号");
-        assert_eq!(parse_generated_session_title("Emphasis!!").unwrap(), "Emphasis");
+        assert_eq!(
+            parse_generated_session_title("Ends with period.").unwrap(),
+            "Ends with period"
+        );
+        assert_eq!(
+            parse_generated_session_title("结束句号。").unwrap(),
+            "结束句号"
+        );
+        assert_eq!(
+            parse_generated_session_title("Emphasis!!").unwrap(),
+            "Emphasis"
+        );
     }
 
     #[test]
@@ -492,24 +588,27 @@ mod tests {
 
     #[test]
     fn append_to_string_content() {
-        let messages = vec![
-            json!({ "role": "user", "content": "hello" }),
-        ];
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
         let out = append_title_request_to_trailing_user(&messages);
         assert_eq!(out.len(), 1);
-        assert!(out[0]["content"].as_str().unwrap().starts_with("hello\n\nCreate a concise title"));
+        assert!(out[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("hello\n\nCreate a concise title"));
     }
 
     #[test]
     fn append_to_block_content() {
-        let messages = vec![
-            json!({ "role": "user", "content": [{ "type": "text", "text": "hi" }] }),
-        ];
+        let messages =
+            vec![json!({ "role": "user", "content": [{ "type": "text", "text": "hi" }] })];
         let out = append_title_request_to_trailing_user(&messages);
         let blocks = out[0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[1]["type"], "text");
-        assert!(blocks[1]["text"].as_str().unwrap().starts_with("Create a concise title"));
+        assert!(blocks[1]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Create a concise title"));
     }
 
     #[test]
@@ -544,9 +643,11 @@ mod tests {
         ];
         let out = sanitize_title_messages(&messages);
         assert_eq!(out.len(), 4);
-        let tool_call_kept = out[1]["content"].as_array().unwrap().iter().any(|b| {
-            b.get("type").and_then(|t| t.as_str()) == Some("toolCall")
-        });
+        let tool_call_kept = out[1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("toolCall"));
         assert!(tool_call_kept);
         // toolResult 保留
         assert!(out.iter().any(|m| message_role(m) == Some("toolResult")));
@@ -635,7 +736,10 @@ mod tests {
         let messages = vec![
             json!({ "role": "assistant", "stopReason": "error", "errorMessage": "boom", "content": [] }),
         ];
-        assert_eq!(assistant_result_from_messages(&messages, 0).unwrap_err(), "boom");
+        assert_eq!(
+            assistant_result_from_messages(&messages, 0).unwrap_err(),
+            "boom"
+        );
     }
 
     #[test]
@@ -668,7 +772,11 @@ mod tests {
             title_prompt: &str,
             history_length: usize,
             timeout_ms: u64,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GeneratedSessionTitle, String>> + Send + '_>> {
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<GeneratedSessionTitle, String>> + Send + '_,
+            >,
+        > {
             let messages = messages.to_vec();
             let title_prompt = title_prompt.to_string();
             Box::pin(async move {
@@ -678,7 +786,10 @@ mod tests {
                 let last = messages.last().unwrap();
                 let continues_expected = last.get("role").and_then(|r| r.as_str()) == Some("user");
                 assert_eq!(continues, continues_expected);
-                Ok(GeneratedSessionTitle { title: "generated".to_string(), usage: None })
+                Ok(GeneratedSessionTitle {
+                    title: "generated".to_string(),
+                    usage: None,
+                })
             })
         }
     }
@@ -689,7 +800,9 @@ mod tests {
             json!({ "role": "user", "content": "hello" }),
             json!({ "role": "assistant", "content": [{ "type": "text", "text": "hi" }] }),
         ];
-        let result = generate_session_title(&FakeRunner, &messages).await.unwrap();
+        let result = generate_session_title(&FakeRunner, &messages)
+            .await
+            .unwrap();
         assert_eq!(result.title, "generated");
     }
 
@@ -697,7 +810,9 @@ mod tests {
     async fn generate_no_user_errors() {
         let messages = vec![json!({ "role": "assistant", "content": "hi" })];
         assert_eq!(
-            generate_session_title(&FakeRunner, &messages).await.unwrap_err(),
+            generate_session_title(&FakeRunner, &messages)
+                .await
+                .unwrap_err(),
             "The session has no user messages to name"
         );
     }
@@ -705,7 +820,9 @@ mod tests {
     #[tokio::test]
     async fn generate_trailing_user_folds_prompt() {
         let messages = vec![json!({ "role": "user", "content": "hello" })];
-        let result = generate_session_title(&FakeRunner, &messages).await.unwrap();
+        let result = generate_session_title(&FakeRunner, &messages)
+            .await
+            .unwrap();
         assert_eq!(result.title, "generated");
     }
 
@@ -726,7 +843,10 @@ mod tests {
         assert_eq!(json["usage"]["cacheRead"], 3);
         assert_eq!(json["usage"]["total"], 5);
 
-        let no_usage = GeneratedSessionTitle { title: "T".to_string(), usage: None };
+        let no_usage = GeneratedSessionTitle {
+            title: "T".to_string(),
+            usage: None,
+        };
         let json = serde_json::to_value(&no_usage).unwrap();
         assert!(json.get("usage").is_none());
     }

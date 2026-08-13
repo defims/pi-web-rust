@@ -41,9 +41,11 @@ pub fn get_file_directory(file_path: &str) -> String {
     match trimmed.rfind('/') {
         None => String::new(),
         Some(0) => "/".to_string(),
-        Some(2) if trimmed.len() >= 3
-            && trimmed.as_bytes()[1] == b':'
-            && trimmed.as_bytes()[2] == b'/' =>
+        Some(2)
+            if trimmed.len() >= 3
+                && trimmed.as_bytes()[0].is_ascii_alphabetic()
+                && trimmed.as_bytes()[1] == b':'
+                && trimmed.as_bytes()[2] == b'/' =>
         {
             trimmed[..3].to_string()
         }
@@ -57,7 +59,11 @@ pub fn get_relative_file_path(file_path: &str, cwd: Option<&str>) -> String {
         return file_path.to_string();
     };
     let normalized_file = normalize_file_path_slashes(file_path);
-    let normalized_cwd = normalize_file_path_slashes(cwd).trim_end_matches('/').to_string();
+    // 对齐 TS `.replace(/\/$/, "")`:只剥一个尾随斜杠(非全部)。
+    let mut normalized_cwd = normalize_file_path_slashes(cwd);
+    if normalized_cwd.ends_with('/') {
+        normalized_cwd.pop();
+    }
     if let Some(rest) = normalized_file.strip_prefix(&format!("{normalized_cwd}/")) {
         rest.to_string()
     } else {
@@ -67,14 +73,24 @@ pub fn get_relative_file_path(file_path: &str, cwd: Option<&str>) -> String {
 
 /// 对齐 `joinFilePath`。
 pub fn join_file_path(parent: &str, child: &str) -> String {
-    format!("{}/{}", normalize_file_path_slashes(parent).trim_end_matches('/'), child)
+    // 对齐 TS `.replace(/\/$/, "")`:只剥一个尾随斜杠。
+    let mut normalized_parent = normalize_file_path_slashes(parent);
+    if normalized_parent.ends_with('/') {
+        normalized_parent.pop();
+    }
+    format!("{normalized_parent}/{child}")
 }
 
 /// encodeURIComponent 等价(Rust 没有 builtin,手写 RFC 3986 unreserved 之外的转义)。
 pub(crate) fn url_encode_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')') {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            )
+        {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));
@@ -89,7 +105,10 @@ mod tests {
 
     #[test]
     fn normalize_backslashes() {
-        assert_eq!(normalize_file_path_slashes(r"C:\Users\test"), "C:/Users/test");
+        assert_eq!(
+            normalize_file_path_slashes(r"C:\Users\test"),
+            "C:/Users/test"
+        );
         assert_eq!(normalize_file_path_slashes("/unix/path"), "/unix/path");
     }
 

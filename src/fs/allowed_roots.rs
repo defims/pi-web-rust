@@ -23,7 +23,9 @@ pub fn get_additional_allowed_roots() -> HashSet<String> {
         .unwrap_or_default()
 }
 
-/// 对齐 `allowFileRoot`。动态添加白名单根。
+/// 对齐 `allowFileRoot`。动态添加白名单根,并立即失效 file_access 的 roots 缓存
+/// (TS 把根同时写入 `__piAllowedRootsCache.roots`,新根即时生效;Rust 用失效缓存达到同等效果,
+/// 避免最多 5s TTL 内的新根不可见)。
 pub fn allow_file_root(root: &str) {
     if root.is_empty() {
         return;
@@ -32,6 +34,7 @@ pub fn allow_file_root(root: &str) {
     if let Ok(mut guard) = ADDITIONAL_ROOTS.lock() {
         guard.insert(normalized);
     }
+    super::file_access::invalidate_allowed_roots_cache();
 }
 
 #[cfg(test)]

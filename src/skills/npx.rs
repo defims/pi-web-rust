@@ -14,7 +14,11 @@ pub fn find_npx_cli(exec_path: &str) -> Option<String> {
     let node_dir = std::path::Path::new(exec_path).parent()?;
     let candidates = [
         // Windows MSI 布局:node.exe 与 node_modules 同目录
-        node_dir.join("node_modules").join("npm").join("bin").join("npx-cli.js"),
+        node_dir
+            .join("node_modules")
+            .join("npm")
+            .join("bin")
+            .join("npx-cli.js"),
         // Unix 布局:.../bin/node + .../lib/node_modules/npm/bin/npx-cli.js
         node_dir
             .join("..")
@@ -44,7 +48,9 @@ pub fn build_npx_invocation(args: &[String], exec_path: &str) -> NpxInvocation {
     match find_npx_cli(exec_path) {
         Some(npx_cli) => NpxInvocation {
             command: exec_path.to_string(),
-            command_args: std::iter::once(npx_cli).chain(args.iter().cloned()).collect(),
+            command_args: std::iter::once(npx_cli)
+                .chain(args.iter().cloned())
+                .collect(),
         },
         None => NpxInvocation {
             command: "npx".to_string(),
@@ -84,7 +90,10 @@ mod tests {
         let exec = node_dir.join("node").to_string_lossy().to_string();
         let inv = build_npx_invocation(&["ls".to_string(), "pkg".to_string()], &exec);
         assert_eq!(inv.command, exec);
-        assert_eq!(inv.command_args[0], cli.join("npx-cli.js").to_string_lossy().to_string());
+        assert_eq!(
+            inv.command_args[0],
+            cli.join("npx-cli.js").to_string_lossy().to_string()
+        );
         assert_eq!(inv.command_args[1..], ["ls".to_string(), "pkg".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -27,18 +27,34 @@ pub fn get_default_right_panel_width(viewport_width: i64) -> i64 {
 }
 
 /// 对齐 `getSidebarMaxWidth`。
-pub fn get_sidebar_max_width(viewport_width: i64, right_panel_open: bool, right_panel_width: i64) -> i64 {
+pub fn get_sidebar_max_width(
+    viewport_width: i64,
+    right_panel_open: bool,
+    right_panel_width: i64,
+) -> i64 {
     if viewport_width <= MOBILE_MAX_WIDTH {
         return SIDEBAR_MAX_WIDTH;
     }
     let compact = viewport_width < SPLIT_PANEL_MIN_WIDTH;
-    let chat_width = if compact { COMPACT_CHAT_MIN_WIDTH } else { DESKTOP_CHAT_MIN_WIDTH };
-    let visible_right = if !compact && right_panel_open { right_panel_width } else { 0 };
+    let chat_width = if compact {
+        COMPACT_CHAT_MIN_WIDTH
+    } else {
+        DESKTOP_CHAT_MIN_WIDTH
+    };
+    let visible_right = if !compact && right_panel_open {
+        right_panel_width
+    } else {
+        0
+    };
     SIDEBAR_MAX_WIDTH.min(viewport_width - chat_width - visible_right)
 }
 
 /// 对齐 `getRightPanelMaxWidth`。
-pub fn get_right_panel_max_width(viewport_width: i64, sidebar_open: bool, sidebar_width: i64) -> i64 {
+pub fn get_right_panel_max_width(
+    viewport_width: i64,
+    sidebar_open: bool,
+    sidebar_width: i64,
+) -> i64 {
     if viewport_width < SPLIT_PANEL_MIN_WIDTH {
         return RIGHT_PANEL_MAX_WIDTH;
     }

@@ -81,7 +81,6 @@ struct CacheStateInner {
 /// Shared future 要求内部 future `Send + Sync`(futures 0.3 的 `Shared<F>` 约束)。
 type BoxFuture = std::pin::Pin<Box<dyn Future<Output = ModelsData> + Send + Sync>>;
 
-
 impl ModelsCacheState {
     pub fn new() -> Self {
         Self::default()
@@ -99,8 +98,25 @@ impl ModelsCacheState {
 /// 对齐 `withModelRuntimeError`。
 pub fn with_model_runtime_error(data: ModelsData, model_error: Option<String>) -> ModelsData {
     match model_error {
-        Some(error) => ModelsData { model_error: Some(error), ..data },
+        Some(error) => ModelsData {
+            model_error: Some(error),
+            ..data
+        },
         None => data,
+    }
+}
+
+/// 对齐 `SAFE_MODEL_LOAD_FAILURE_MESSAGE`。
+///
+/// 刻意不插值捕获到的错误:SDK 错误可能含路径与 provider 细节。
+pub const SAFE_MODEL_LOAD_FAILURE_MESSAGE: &str =
+    "Model list is temporarily unavailable. Check your configuration and try again.";
+
+/// 对齐 `withSafeModelLoadFailure(data)`。用脱敏的固定文案替换 modelError。
+pub fn with_safe_model_load_failure(data: ModelsData) -> ModelsData {
+    ModelsData {
+        model_error: Some(SAFE_MODEL_LOAD_FAILURE_MESSAGE.to_string()),
+        ..data
     }
 }
 
@@ -176,7 +192,10 @@ where
             }
             inner.entries.push((
                 cwd.to_string(),
-                CacheEntry { data: data.clone(), expires_at: now + MODELS_CACHE_TTL },
+                CacheEntry {
+                    data: data.clone(),
+                    expires_at: now + MODELS_CACHE_TTL,
+                },
             ));
         }
     }
@@ -210,17 +229,19 @@ mod tests {
     async fn fresh_load_stores_and_hits() {
         let state = ModelsCacheState::new();
         let now = Instant::now();
-        let first = load_models_with_cache_at(&state, "/a", now, || async { sample_data("m1") }).await;
+        let first =
+            load_models_with_cache_at(&state, "/a", now, || async { sample_data("m1") }).await;
         assert_eq!(first.model_list[0].id, "m1");
 
         // 缓存命中,loader 不再执行
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls2 = calls.clone();
-        let hit = load_models_with_cache_at(&state, "/a", now + Duration::from_secs(30), move || {
-            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { sample_data("never") }
-        })
-        .await;
+        let hit =
+            load_models_with_cache_at(&state, "/a", now + Duration::from_secs(30), move || {
+                calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { sample_data("never") }
+            })
+            .await;
         assert_eq!(hit.model_list[0].id, "m1");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -230,7 +251,11 @@ mod tests {
         let state = ModelsCacheState::new();
         let now = Instant::now();
         let _ = load_models_with_cache_at(&state, "/a", now, || async { sample_data("old") }).await;
-        let refreshed = load_models_with_cache_at(&state, "/a", now + Duration::from_secs(61), || async { sample_data("new") }).await;
+        let refreshed =
+            load_models_with_cache_at(&state, "/a", now + Duration::from_secs(61), || async {
+                sample_data("new")
+            })
+            .await;
         assert_eq!(refreshed.model_list[0].id, "new");
     }
 
@@ -270,11 +295,12 @@ mod tests {
         state.invalidate();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls2 = calls.clone();
-        let reloaded = load_models_with_cache_at(&state, "/a", now + Duration::from_secs(1), move || {
-            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { sample_data("m2") }
-        })
-        .await;
+        let reloaded =
+            load_models_with_cache_at(&state, "/a", now + Duration::from_secs(1), move || {
+                calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { sample_data("m2") }
+            })
+            .await;
         assert_eq!(reloaded.model_list[0].id, "m2");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -299,11 +325,12 @@ mod tests {
         // 代际已变 → 不写缓存:下次加载应重新执行 loader
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls2 = calls.clone();
-        let reloaded = load_models_with_cache_at(&state, "/a", now + Duration::from_secs(1), move || {
-            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { sample_data("fresh") }
-        })
-        .await;
+        let reloaded =
+            load_models_with_cache_at(&state, "/a", now + Duration::from_secs(1), move || {
+                calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { sample_data("fresh") }
+            })
+            .await;
         assert_eq!(reloaded.model_list[0].id, "fresh");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -316,21 +343,38 @@ mod tests {
         for i in 0..=MAX_MODELS_CACHE_ENTRIES {
             let cwd = format!("/c{i}");
             let id = format!("m{i}");
-            let _ = load_models_with_cache_at(&state, &cwd, now, move || async move { sample_data(&id) }).await;
+            let _ =
+                load_models_with_cache_at(
+                    &state,
+                    &cwd,
+                    now,
+                    move || async move { sample_data(&id) },
+                )
+                .await;
         }
         // 最旧(第 0 条)被逐出
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls2 = calls.clone();
-        let evicted = load_models_with_cache_at(&state, "/c0", now + Duration::from_secs(1), move || {
-            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { sample_data("reload-0") }
-        })
-        .await;
+        let evicted =
+            load_models_with_cache_at(&state, "/c0", now + Duration::from_secs(1), move || {
+                calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { sample_data("reload-0") }
+            })
+            .await;
         assert_eq!(evicted.model_list[0].id, "reload-0");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         // 最新的仍命中
-        let hit = load_models_with_cache_at(&state, &format!("/c{}", MAX_MODELS_CACHE_ENTRIES), now + Duration::from_secs(1), || async { sample_data("no") }).await;
-        assert_eq!(hit.model_list[0].id, format!("m{}", MAX_MODELS_CACHE_ENTRIES));
+        let hit = load_models_with_cache_at(
+            &state,
+            &format!("/c{}", MAX_MODELS_CACHE_ENTRIES),
+            now + Duration::from_secs(1),
+            || async { sample_data("no") },
+        )
+        .await;
+        assert_eq!(
+            hit.model_list[0].id,
+            format!("m{}", MAX_MODELS_CACHE_ENTRIES)
+        );
     }
 
     #[test]
@@ -348,7 +392,11 @@ mod tests {
     fn serialize_shapes() {
         let data = ModelsData {
             models: HashMap::from([("p/m1".to_string(), "M1".to_string())]),
-            model_list: vec![ModelListEntry { id: "m1".to_string(), name: "M1".to_string(), provider: "p".to_string() }],
+            model_list: vec![ModelListEntry {
+                id: "m1".to_string(),
+                name: "M1".to_string(),
+                provider: "p".to_string(),
+            }],
             default_model: None,
             thinking_levels: HashMap::from([("p".to_string(), vec!["high".to_string()])]),
             thinking_level_maps: HashMap::from([(

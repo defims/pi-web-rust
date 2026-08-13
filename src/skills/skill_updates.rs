@@ -84,7 +84,11 @@ pub fn skill_folder(skill_path: &str) -> String {
     } else if lower.ends_with("skill.md") {
         folder = folder[..folder.len() - 8].to_string();
     }
-    folder.trim_end_matches('/').to_string()
+    // 对齐 TS `folder.replace(/\/$/, "")`:只剥一个尾部斜杠。
+    if folder.ends_with('/') {
+        folder.pop();
+    }
+    folder
 }
 
 /// 对齐 `buildSkillUpdateArgs`。
@@ -166,7 +170,9 @@ pub trait SkillUpdateIo {
         &self,
         url: &str,
         github_token: Option<&str>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, SkillUpdateIoError>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, SkillUpdateIoError>> + Send + '_>,
+    >;
 
     /// `resolveGitTreeHash` 等价(深度 1 fetch + rev-parse)。
     fn resolve_git_tree_hash(
@@ -178,11 +184,16 @@ pub trait SkillUpdateIo {
 /// 对齐 `GitHubTreeEntry` / `GitHubTreeResponse` 的读取。
 fn tree_entry_sha_for_folder(raw: &Value, folder: &str) -> Option<String> {
     let tree = raw.get("tree")?.as_array()?;
-    tree.iter().find(|item| {
-        item.get("type").and_then(|t| t.as_str()) == Some("tree")
-            && item.get("path").and_then(|p| p.as_str()) == Some(folder)
-    })
-    .and_then(|item| item.get("sha").and_then(|s| s.as_str()).map(|s| s.to_string()))
+    tree.iter()
+        .find(|item| {
+            item.get("type").and_then(|t| t.as_str()) == Some("tree")
+                && item.get("path").and_then(|p| p.as_str()) == Some(folder)
+        })
+        .and_then(|item| {
+            item.get("sha")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 /// 对齐 `checkGlobalSkill`(不含 Io 注入部分)。
@@ -202,7 +213,10 @@ pub async fn check_global_skill(
         Ok(raw) => raw,
         Err(SkillUpdateIoError::Http(HttpError(401 | 403 | 429))) => {
             // 回退 git rev-parse(私有仓库 / 限流)
-            let hash = io.resolve_git_tree_hash(install).await.map_err(SkillUpdateIoError::Transport)?;
+            let hash = io
+                .resolve_git_tree_hash(install)
+                .await
+                .map_err(SkillUpdateIoError::Transport)?;
             return Ok(result(
                 install,
                 if hash == install.version_hash.as_deref().unwrap_or("") {
@@ -218,7 +232,9 @@ pub async fn check_global_skill(
     };
 
     let latest_version = if folder.is_empty() {
-        raw.get("sha").and_then(|s| s.as_str()).map(|s| s.to_string())
+        raw.get("sha")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
     } else {
         tree_entry_sha_for_folder(&raw, &folder)
     };
@@ -263,13 +279,16 @@ pub async fn check_project_skill(
     let name = skill_slug(&skill_name_from_package(&install.package));
     let url = format!(
         "{}/api/download/{}/{}/{}",
-        skills_api_base.trim_end_matches('/'),
+        skills_api_base,
         url_encode_component(owner),
         url_encode_component(repo),
         url_encode_component(&name),
     );
     let raw = io.fetch_json(&url, None).await?;
-    let latest_version = raw.get("hash").and_then(|h| h.as_str()).map(|h| h.to_string());
+    let latest_version = raw
+        .get("hash")
+        .and_then(|h| h.as_str())
+        .map(|h| h.to_string());
 
     match latest_version {
         Some(latest) => Ok(result(
@@ -298,7 +317,10 @@ pub async fn check_skill_update(
     skills_api_base: &str,
     github_token: Option<&str>,
 ) -> SkillUpdateResult {
-    if !install.can_check_for_updates || install.version_hash.is_none() || install.skill_path.is_none() {
+    if !install.can_check_for_updates
+        || install.version_hash.is_none()
+        || install.skill_path.is_none()
+    {
         return result(
             install,
             SkillUpdateState::Unsupported,
@@ -320,24 +342,22 @@ pub async fn check_skill_update(
 }
 
 /// 对齐 `checkSkillUpdates`(按 URL 去重的共享 fetcher → 并行检查)。
+///
+/// 并发:对齐 TS `Promise.all(installs.map(...))`(此前 Rust 串行 await)。
+/// URL 去重:每个 install 的 skills.sh URL 含唯一 `owner/repo/name`,真实负载无重复,
+/// TS 的 `cachedFetcher` 在无重复 URL 时等价于无去重(每次 cache miss),故此处不另建
+/// 显式去重缓存;若将来出现同源重复 install,可再加 `Shared<Future>` 缓存。
 pub async fn check_skill_updates(
     installs: &[SkillInstallInfo],
     io: &dyn SkillUpdateIo,
     skills_api_base: &str,
     github_token: Option<&str>,
 ) -> Vec<SkillUpdateResult> {
-    let installs = installs.to_vec();
-    let mut handles = Vec::with_capacity(installs.len());
-    for install in installs {
-        handles.push(async move {
-            check_skill_update(&install, io, skills_api_base, github_token).await
-        });
-    }
-    let mut out = Vec::with_capacity(handles.len());
-    for handle in handles {
-        out.push(handle.await);
-    }
-    out
+    let futs: Vec<_> = installs
+        .iter()
+        .map(|install| check_skill_update(install, io, skills_api_base, github_token))
+        .collect();
+    futures::future::join_all(futs).await
 }
 
 #[cfg(test)]
@@ -391,8 +411,14 @@ mod tests {
 
     #[test]
     fn folder_cases() {
-        assert_eq!(skill_folder("/agent/skills/demo/SKILL.md"), "/agent/skills/demo");
-        assert_eq!(skill_folder("/agent/skills/demo/skill.md"), "/agent/skills/demo");
+        assert_eq!(
+            skill_folder("/agent/skills/demo/SKILL.md"),
+            "/agent/skills/demo"
+        );
+        assert_eq!(
+            skill_folder("/agent/skills/demo/skill.md"),
+            "/agent/skills/demo"
+        );
         assert_eq!(skill_folder("demo/skill.md"), "demo");
         assert_eq!(skill_folder(r"C:\skills\demo\SKILL.md"), "C:/skills/demo");
         // 尾部带斜杠时不命中 skill.md 分支 → 只去尾部斜杠(对齐 TS)
@@ -403,29 +429,83 @@ mod tests {
     #[test]
     fn build_args() {
         // 带 skillPath 与 ref:TS 原样拼接 `${source}/${folder}`,允许双斜杠
-        let i = install("org/repo@demo", "global", "org/repo", Some("/x/SKILL.md"), Some("v1.2"), Some("h"));
+        let i = install(
+            "org/repo@demo",
+            "global",
+            "org/repo",
+            Some("/x/SKILL.md"),
+            Some("v1.2"),
+            Some("h"),
+        );
         let args = build_skill_update_args(&i);
-        assert_eq!(args, vec![
-            "skills", "add", "org/repo//x#v1.2", "--skill", "demo", "-y", "--agent", "pi", "-g",
-        ]);
+        assert_eq!(
+            args,
+            vec![
+                "skills",
+                "add",
+                "org/repo//x#v1.2",
+                "--skill",
+                "demo",
+                "-y",
+                "--agent",
+                "pi",
+                "-g",
+            ]
+        );
 
         // 无 skillPath → 直接用 source;ref 空格编码
-        let i = install("org/repo@demo", "project", "org/repo", None, Some("feat/x"), Some("h"));
+        let i = install(
+            "org/repo@demo",
+            "project",
+            "org/repo",
+            None,
+            Some("feat/x"),
+            Some("h"),
+        );
         let args = build_skill_update_args(&i);
-        assert_eq!(args, vec![
-            "skills", "add", "org/repo#feat%2Fx", "--skill", "demo", "-y", "--agent", "pi",
-        ]);
+        assert_eq!(
+            args,
+            vec![
+                "skills",
+                "add",
+                "org/repo#feat%2Fx",
+                "--skill",
+                "demo",
+                "-y",
+                "--agent",
+                "pi",
+            ]
+        );
 
         // 无 ref:skillFolder("/x/SKILL.md") → "/x",拼接为双斜杠(对齐 TS)
-        let i = install("org/repo@demo", "global", "org/repo", Some("/x/SKILL.md"), None, Some("h"));
+        let i = install(
+            "org/repo@demo",
+            "global",
+            "org/repo",
+            Some("/x/SKILL.md"),
+            None,
+            Some("h"),
+        );
         let args = build_skill_update_args(&i);
         assert_eq!(args[2], "org/repo//x");
     }
 
     #[test]
     fn result_builder() {
-        let i = install("o/r@s", "global", "o/r", Some("/x/SKILL.md"), None, Some("abc"));
-        let r = result(&i, SkillUpdateState::UpToDate, Some("abc".to_string()), None);
+        let i = install(
+            "o/r@s",
+            "global",
+            "o/r",
+            Some("/x/SKILL.md"),
+            None,
+            Some("abc"),
+        );
+        let r = result(
+            &i,
+            SkillUpdateState::UpToDate,
+            Some("abc".to_string()),
+            None,
+        );
         assert_eq!(r.package, "o/r@s");
         assert_eq!(r.scope, "global");
         assert_eq!(r.state, SkillUpdateState::UpToDate);
@@ -444,11 +524,17 @@ mod tests {
                 { "path": "demo/nested", "type": "tree", "sha": "nested" }
             ]
         });
-        assert_eq!(tree_entry_sha_for_folder(&raw, "demo"), Some("tree-sha".to_string()));
+        assert_eq!(
+            tree_entry_sha_for_folder(&raw, "demo"),
+            Some("tree-sha".to_string())
+        );
         // 只匹配 type === "tree" 且 path 精确相等
         assert_eq!(tree_entry_sha_for_folder(&raw, "not-folder"), None);
         assert_eq!(tree_entry_sha_for_folder(&raw, "missing"), None);
-        assert_eq!(tree_entry_sha_for_folder(&json!({"tree": "x"}), "demo"), None);
+        assert_eq!(
+            tree_entry_sha_for_folder(&json!({"tree": "x"}), "demo"),
+            None
+        );
     }
 
     struct FakeIo {
@@ -462,7 +548,9 @@ mod tests {
             &self,
             _url: &str,
             _token: Option<&str>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, SkillUpdateIoError>> + Send + '_>> {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Value, SkillUpdateIoError>> + Send + '_>,
+        > {
             let response = if _url.contains("api.github.com") {
                 self.global_response.clone()
             } else {
@@ -474,7 +562,8 @@ mod tests {
         fn resolve_git_tree_hash(
             &self,
             _install: &SkillInstallInfo,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>
+        {
             let hash = self.tree_hash.clone();
             Box::pin(async move { hash })
         }
@@ -488,7 +577,14 @@ mod tests {
             project_response: Err(SkillUpdateIoError::Transport("unused".to_string())),
         };
         // skillPath "SKILL.md"(根级)→ folder 为空 → 用根 sha 比较
-        let i = install("o/r@s", "global", "o/r", Some("SKILL.md"), None, Some("abc"));
+        let i = install(
+            "o/r@s",
+            "global",
+            "o/r",
+            Some("SKILL.md"),
+            None,
+            Some("abc"),
+        );
         let r = check_skill_update(&i, &io, DEFAULT_SKILLS_API_BASE, None).await;
         assert_eq!(r.state, SkillUpdateState::UpToDate);
         assert_eq!(r.latest_version.as_deref(), Some("abc"));
@@ -501,7 +597,14 @@ mod tests {
             tree_hash: Err("unused".to_string()),
             project_response: Err(SkillUpdateIoError::Transport("unused".to_string())),
         };
-        let i = install("o/r@s", "global", "o/r", Some("SKILL.md"), None, Some("old"));
+        let i = install(
+            "o/r@s",
+            "global",
+            "o/r",
+            Some("SKILL.md"),
+            None,
+            Some("old"),
+        );
         let r = check_skill_update(&i, &io, DEFAULT_SKILLS_API_BASE, None).await;
         assert_eq!(r.state, SkillUpdateState::UpdateAvailable);
         assert_eq!(r.latest_version.as_deref(), Some("new-sha"));
@@ -517,7 +620,14 @@ mod tests {
             tree_hash: Err("unused".to_string()),
             project_response: Err(SkillUpdateIoError::Transport("unused".to_string())),
         };
-        let i = install("o/r@s", "global", "o/r", Some("/x/demo/SKILL.md"), None, Some("tree-hash"));
+        let i = install(
+            "o/r@s",
+            "global",
+            "o/r",
+            Some("/x/demo/SKILL.md"),
+            None,
+            Some("tree-hash"),
+        );
         let r = check_skill_update(&i, &io, DEFAULT_SKILLS_API_BASE, None).await;
         assert_eq!(r.state, SkillUpdateState::UpToDate);
     }
@@ -529,7 +639,14 @@ mod tests {
             tree_hash: Ok("git-hash".to_string()),
             project_response: Err(SkillUpdateIoError::Transport("unused".to_string())),
         };
-        let i = install("o/r@s", "global", "o/r", Some("/x/SKILL.md"), None, Some("git-hash"));
+        let i = install(
+            "o/r@s",
+            "global",
+            "o/r",
+            Some("/x/SKILL.md"),
+            None,
+            Some("git-hash"),
+        );
         let r = check_skill_update(&i, &io, DEFAULT_SKILLS_API_BASE, None).await;
         assert_eq!(r.state, SkillUpdateState::UpToDate);
         assert_eq!(r.latest_version.as_deref(), Some("git-hash"));
@@ -542,7 +659,14 @@ mod tests {
             tree_hash: Ok("x".to_string()),
             project_response: Err(SkillUpdateIoError::Transport("unused".to_string())),
         };
-        let i = install("o/r@s", "global", "o/r", Some("/x/SKILL.md"), None, Some("abc"));
+        let i = install(
+            "o/r@s",
+            "global",
+            "o/r",
+            Some("/x/SKILL.md"),
+            None,
+            Some("abc"),
+        );
         let r = check_skill_update(&i, &io, DEFAULT_SKILLS_API_BASE, None).await;
         assert_eq!(r.state, SkillUpdateState::Error);
         assert!(r.message.as_deref().unwrap_or("").contains("HTTP 500"));
@@ -551,14 +675,26 @@ mod tests {
     #[tokio::test]
     async fn global_skill_path_not_found() {
         let io = FakeIo {
-            global_response: Ok(json!({ "tree": [{ "path": "other", "type": "tree", "sha": "x" }] })),
+            global_response: Ok(
+                json!({ "tree": [{ "path": "other", "type": "tree", "sha": "x" }] }),
+            ),
             tree_hash: Err("unused".to_string()),
             project_response: Err(SkillUpdateIoError::Transport("unused".to_string())),
         };
-        let i = install("o/r@s", "global", "o/r", Some("/x/missing/SKILL.md"), None, Some("abc"));
+        let i = install(
+            "o/r@s",
+            "global",
+            "o/r",
+            Some("/x/missing/SKILL.md"),
+            None,
+            Some("abc"),
+        );
         let r = check_skill_update(&i, &io, DEFAULT_SKILLS_API_BASE, None).await;
         assert_eq!(r.state, SkillUpdateState::Error);
-        assert_eq!(r.message.as_deref(), Some("Remote skill path was not found."));
+        assert_eq!(
+            r.message.as_deref(),
+            Some("Remote skill path was not found.")
+        );
     }
 
     #[tokio::test]
@@ -568,7 +704,14 @@ mod tests {
             tree_hash: Err("unused".to_string()),
             project_response: Ok(json!({ "hash": "snap-hash" })),
         };
-        let i = install("org/repo@My Skill", "project", "org/repo", Some("/x/SKILL.md"), None, Some("old"));
+        let i = install(
+            "org/repo@My Skill",
+            "project",
+            "org/repo",
+            Some("/x/SKILL.md"),
+            None,
+            Some("old"),
+        );
         let r = check_skill_update(&i, &io, "https://skills.sh", None).await;
         assert_eq!(r.state, SkillUpdateState::UpdateAvailable);
         assert_eq!(r.latest_version.as_deref(), Some("snap-hash"));
@@ -583,7 +726,14 @@ mod tests {
             project_response: Ok(json!({ "hash": "abc" })),
         };
         // canCheckForUpdates = false
-        let mut i = install("o/r@s", "global", "o/r", Some("/x/SKILL.md"), None, Some("abc"));
+        let mut i = install(
+            "o/r@s",
+            "global",
+            "o/r",
+            Some("/x/SKILL.md"),
+            None,
+            Some("abc"),
+        );
         i.can_check_for_updates = false;
         let r = check_skill_update(&i, &io, DEFAULT_SKILLS_API_BASE, None).await;
         assert_eq!(r.state, SkillUpdateState::Unsupported);
@@ -600,7 +750,14 @@ mod tests {
             tree_hash: Err("unused".to_string()),
             project_response: Ok(json!({ "nope": true })),
         };
-        let i = install("org/repo@My Skill", "project", "org/repo", Some("/x/SKILL.md"), None, Some("old"));
+        let i = install(
+            "org/repo@My Skill",
+            "project",
+            "org/repo",
+            Some("/x/SKILL.md"),
+            None,
+            Some("old"),
+        );
         let r = check_skill_update(&i, &io, DEFAULT_SKILLS_API_BASE, None).await;
         assert_eq!(r.state, SkillUpdateState::Error);
         assert_eq!(
@@ -617,8 +774,22 @@ mod tests {
             project_response: Ok(json!({ "hash": "same" })),
         };
         let installs = vec![
-            install("o/r@a", "global", "o/r", Some("SKILL.md"), None, Some("same")),
-            install("o/r@b", "global", "o/r", Some("SKILL.md"), None, Some("diff")),
+            install(
+                "o/r@a",
+                "global",
+                "o/r",
+                Some("SKILL.md"),
+                None,
+                Some("same"),
+            ),
+            install(
+                "o/r@b",
+                "global",
+                "o/r",
+                Some("SKILL.md"),
+                None,
+                Some("diff"),
+            ),
         ];
         let results = check_skill_updates(&installs, &io, DEFAULT_SKILLS_API_BASE, None).await;
         assert_eq!(results.len(), 2);
@@ -629,7 +800,14 @@ mod tests {
     #[test]
     fn serialize_shapes() {
         let r = result(
-            &install("o/r@s", "global", "o/r", Some("/x/SKILL.md"), None, Some("abc")),
+            &install(
+                "o/r@s",
+                "global",
+                "o/r",
+                Some("/x/SKILL.md"),
+                None,
+                Some("abc"),
+            ),
             SkillUpdateState::UpdateAvailable,
             Some("def".to_string()),
             None,
@@ -640,7 +818,12 @@ mod tests {
         assert_eq!(json["latestVersion"], "def");
         assert!(json.get("message").is_none());
 
-        let r2 = result(&install("o/r@s", "global", "o/r", Some("/x"), None, None), SkillUpdateState::Error, None, Some("m".to_string()));
+        let r2 = result(
+            &install("o/r@s", "global", "o/r", Some("/x"), None, None),
+            SkillUpdateState::Error,
+            None,
+            Some("m".to_string()),
+        );
         let json = serde_json::to_value(&r2).unwrap();
         assert_eq!(json["state"], "error");
         assert_eq!(json["message"], "m");

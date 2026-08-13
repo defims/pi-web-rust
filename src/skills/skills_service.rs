@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::skill_lock::{SkillInfo, annotate_skills_with_install_info};
+use super::skill_lock::{annotate_skills_with_install_info, SkillInfo};
 
 /// 对齐 `ResourceDiagnostic`(TS SDK 类型)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

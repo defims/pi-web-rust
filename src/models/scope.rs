@@ -131,7 +131,10 @@ pub fn resolve_visible_models(
             })
         })
         .collect();
-    let visible = scoped_models.iter().map(|scoped| scoped.model.clone()).collect();
+    let visible = scoped_models
+        .iter()
+        .map(|scoped| scoped.model.clone())
+        .collect();
 
     ModelScopeResult {
         visible,
@@ -154,7 +157,10 @@ pub fn select_initial_model_scope(
     let requested_ref = options.requested_model.as_ref();
     let default_ref = options.default_model.as_ref();
     let requested = requested_ref.and_then(|ref_| {
-        scope.visible.iter().find(|model| model.matches(&ref_.provider, &ref_.model_id))
+        scope
+            .visible
+            .iter()
+            .find(|model| model.matches(&ref_.provider, &ref_.model_id))
     });
     if let Some(ref_) = requested_ref {
         if requested.is_none() {
@@ -167,14 +173,16 @@ pub fn select_initial_model_scope(
 
     let requested_scoped = match requested {
         Some(model) => scope.scoped_models.iter().find(|scoped| {
-            scoped.model == *model
-                || scoped.model.matches(&model.provider, &model.id)
+            scoped.model == *model || scoped.model.matches(&model.provider, &model.id)
         }),
         None => None,
     };
     let default_scoped = if requested.is_none() {
         default_ref.and_then(|ref_| {
-            scope.scoped_models.iter().find(|scoped| scoped.model.matches(&ref_.provider, &ref_.model_id))
+            scope
+                .scoped_models
+                .iter()
+                .find(|scoped| scoped.model.matches(&ref_.provider, &ref_.model_id))
         })
     } else {
         None
@@ -186,13 +194,18 @@ pub fn select_initial_model_scope(
     };
     let default_visible = if requested.is_none() && fallback_scoped.is_none() {
         default_ref.and_then(|ref_| {
-            scope.visible.iter().find(|model| model.matches(&ref_.provider, &ref_.model_id))
+            scope
+                .visible
+                .iter()
+                .find(|model| model.matches(&ref_.provider, &ref_.model_id))
         })
     } else {
         None
     };
 
-    let selected_model = requested.or(fallback_scoped.map(|s| &s.model)).or(default_visible);
+    let selected_model = requested
+        .or(fallback_scoped.map(|s| &s.model))
+        .or(default_visible);
     let scoped_selection = requested_scoped.or(fallback_scoped);
     let thinking_level = options
         .thinking_level
@@ -211,11 +224,18 @@ mod tests {
     use super::*;
 
     fn model(id: &str, provider: &str, name: &str) -> Model {
-        Model { id: id.to_string(), name: name.to_string(), provider: provider.to_string() }
+        Model {
+            id: id.to_string(),
+            name: name.to_string(),
+            provider: provider.to_string(),
+        }
     }
 
     fn scoped(model: Model, thinking_level: Option<&str>) -> ScopedModel {
-        ScopedModel { model, thinking_level: thinking_level.map(|s| s.to_string()) }
+        ScopedModel {
+            model,
+            thinking_level: thinking_level.map(|s| s.to_string()),
+        }
     }
 
     #[test]
@@ -273,8 +293,17 @@ mod tests {
         );
         assert_eq!(result.visible.len(), 2);
         assert_eq!(result.scoped_models.len(), 2);
-        assert_eq!(result.thinking_level_pins.get("anthropic/claude-x").map(|s| s.as_str()), Some("high"));
-        assert!(result.thinking_level_pins.get("anthropic/claude-y").is_none());
+        assert_eq!(
+            result
+                .thinking_level_pins
+                .get("anthropic/claude-x")
+                .map(|s| s.as_str()),
+            Some("high")
+        );
+        assert!(result
+            .thinking_level_pins
+            .get("anthropic/claude-y")
+            .is_none());
         assert!(result.warnings.is_empty());
     }
 
@@ -289,7 +318,10 @@ mod tests {
         let result = select_initial_model_scope(
             &scope,
             &InitialModelScopeOptions {
-                requested_model: Some(ModelRef { provider: "p".to_string(), model_id: "m1".to_string() }),
+                requested_model: Some(ModelRef {
+                    provider: "p".to_string(),
+                    model_id: "m1".to_string(),
+                }),
                 default_model: None,
                 thinking_level: None,
             },
@@ -311,7 +343,10 @@ mod tests {
         let err = select_initial_model_scope(
             &scope,
             &InitialModelScopeOptions {
-                requested_model: Some(ModelRef { provider: "p".to_string(), model_id: "nope".to_string() }),
+                requested_model: Some(ModelRef {
+                    provider: "p".to_string(),
+                    model_id: "nope".to_string(),
+                }),
                 default_model: None,
                 thinking_level: None,
             },
@@ -334,7 +369,10 @@ mod tests {
             &scope,
             &InitialModelScopeOptions {
                 requested_model: None,
-                default_model: Some(ModelRef { provider: "p".to_string(), model_id: "m2".to_string() }),
+                default_model: Some(ModelRef {
+                    provider: "p".to_string(),
+                    model_id: "m2".to_string(),
+                }),
                 thinking_level: None,
             },
         )
@@ -351,7 +389,8 @@ mod tests {
             thinking_level_pins: HashMap::new(),
             warnings: vec![],
         };
-        let result = select_initial_model_scope(&scope, &InitialModelScopeOptions::default()).unwrap();
+        let result =
+            select_initial_model_scope(&scope, &InitialModelScopeOptions::default()).unwrap();
         assert_eq!(result.model.as_ref().map(|m| m.id.as_str()), Some("m1"));
         assert_eq!(result.thinking_level, None);
     }
@@ -368,7 +407,10 @@ mod tests {
             &scope,
             &InitialModelScopeOptions {
                 requested_model: None,
-                default_model: Some(ModelRef { provider: "p".to_string(), model_id: "m2".to_string() }),
+                default_model: Some(ModelRef {
+                    provider: "p".to_string(),
+                    model_id: "m2".to_string(),
+                }),
                 thinking_level: None,
             },
         )
@@ -388,7 +430,10 @@ mod tests {
         let result = select_initial_model_scope(
             &scope,
             &InitialModelScopeOptions {
-                requested_model: Some(ModelRef { provider: "p".to_string(), model_id: "m1".to_string() }),
+                requested_model: Some(ModelRef {
+                    provider: "p".to_string(),
+                    model_id: "m1".to_string(),
+                }),
                 default_model: None,
                 thinking_level: Some("high".to_string()),
             },

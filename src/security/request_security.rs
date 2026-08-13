@@ -20,7 +20,11 @@ fn normalize_hostname(value: &str) -> String {
 /// 对齐 `hostnameFromAuthority`。从 `host[:port]` 形式解析主机名。
 /// 含空白 / `@` / `\` 或非空 userinfo / 非 `/` path / query / fragment 时返回 None。
 pub fn hostname_from_authority(value: &str) -> Option<String> {
-    if value.is_empty() || value.chars().any(|ch| ch.is_whitespace() || matches!(ch, '/' | '@' | '\\')) {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '@' | '\\'))
+    {
         return None;
     }
     // `/` 已被上面的 regex 拒绝,`?`/`#` 只能落在 query/fragment 上
@@ -88,7 +92,12 @@ fn parse_authority(value: &str) -> Option<AuthorityParts> {
         rest.to_string()
     };
 
-    Some(AuthorityParts { username, password, hostname: host, pathname })
+    Some(AuthorityParts {
+        username,
+        password,
+        hostname: host,
+        pathname,
+    })
 }
 
 /// 切分 authority 的 host 与端口。IPv6 方括号整体作 host;否则按第一个冒号切分。
@@ -115,7 +124,10 @@ fn split_host_port(authority: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     match authority.find(':') {
-        Some(idx) => Some((authority[..idx].to_string(), Some(authority[idx + 1..].to_string()))),
+        Some(idx) => Some((
+            authority[..idx].to_string(),
+            Some(authority[idx + 1..].to_string()),
+        )),
         None => Some((authority.to_string(), None)),
     }
 }
@@ -179,7 +191,11 @@ pub fn canonical_origin(value: &str) -> Option<String> {
         "ftp" => Some(21),
         _ => None,
     };
-    let port_num = url.port.as_deref().filter(|p| !p.is_empty()).and_then(|p| p.parse::<u32>().ok());
+    let port_num = url
+        .port
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| p.parse::<u32>().ok());
     let mut origin = format!("{scheme}://{host}");
     if let Some(p) = port_num {
         if default_port != Some(p) {
@@ -225,7 +241,11 @@ fn parse_url(value: &str) -> Option<UrlParts> {
             return None;
         }
     }
-    Some(UrlParts { scheme: scheme.to_string(), host, port })
+    Some(UrlParts {
+        scheme: scheme.to_string(),
+        host,
+        port,
+    })
 }
 
 /// 对齐 `getRequestOrigin`。从请求 URL + Host 头构造规范 origin。
@@ -266,8 +286,12 @@ fn is_user_initiated_session_export_navigation(
     let Some(rest) = pathname.strip_prefix("/api/sessions/") else {
         return false;
     };
-    let (_, tail) = rest.split_once('/').unwrap_or((rest, ""));
-    tail == "export"
+    // 对齐 TS `/^\/api\/sessions\/[^/]+\/export$/`:session id 非空(`[^/]+`)且整串
+    // 以 `/export` 结尾(无尾随内容)。空 id(`/api/sessions//export`)不豁免。
+    let Some((id, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    !id.is_empty() && tail == "export"
 }
 
 /// 对齐 `isApiRequestHostAllowed`。仅信任本地名、IP 字面量或显式配置的主机名。
@@ -278,7 +302,9 @@ pub fn is_api_request_host_allowed(host_header: Option<&str>) -> bool {
 /// 带配置注入的版本(便于测试;配置为空等价于未设置环境变量)。
 pub fn is_api_request_host_allowed_with(host_header: Option<&str>, configured: &[String]) -> bool {
     let hostname = host_header.and_then(hostname_from_authority);
-    let Some(hostname) = hostname else { return false; };
+    let Some(hostname) = hostname else {
+        return false;
+    };
     if is_loopback_hostname(&hostname) || is_ip(&hostname) {
         return true;
     }
@@ -297,7 +323,9 @@ pub fn is_api_request_origin_allowed(
     if sec_fetch_site == Some("cross-site") {
         return false;
     }
-    let Some(origin) = origin else { return true; };
+    let Some(origin) = origin else {
+        return true;
+    };
     let request_origin = get_request_origin(request_url, host_header);
     request_origin.is_some() && canonical_origin(origin) == request_origin
 }
@@ -351,8 +379,15 @@ fn parse_url_pathname(value: &str) -> Option<String> {
 
 /// 对齐 `hasJsonContentType`。`application/json` 或 `application/*+json`。
 pub fn has_json_content_type(content_type: Option<&str>) -> bool {
-    let Some(media_type) = content_type else { return false; };
-    let media_type = media_type.split(';').next().unwrap_or("").trim().to_lowercase();
+    let Some(media_type) = content_type else {
+        return false;
+    };
+    let media_type = media_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
     media_type == "application/json"
         || (media_type.starts_with("application/") && media_type.ends_with("+json"))
 }
@@ -417,8 +452,16 @@ fn is_ipv6(value: &str) -> bool {
 
     // 空串 = 零组(合法);非空但有非法分隔(空组)时返回 None
     let (Some(head_groups), Some(tail_groups)) = (
-        if head.is_empty() { Some(Vec::new()) } else { split_groups(head) },
-        if tail.is_empty() { Some(Vec::new()) } else { split_groups(tail) },
+        if head.is_empty() {
+            Some(Vec::new())
+        } else {
+            split_groups(head)
+        },
+        if tail.is_empty() {
+            Some(Vec::new())
+        } else {
+            split_groups(tail)
+        },
     ) else {
         return false;
     };
@@ -433,7 +476,9 @@ fn is_ipv6_full_form(value: &str) -> bool {
         return false;
     }
     let groups = split_groups(value);
-    let Some(groups) = groups else { return false; };
+    let Some(groups) = groups else {
+        return false;
+    };
     count_groups(&groups, true) == 8
 }
 
@@ -474,14 +519,26 @@ mod tests {
 
     #[test]
     fn hostname_from_authority_cases() {
-        assert_eq!(hostname_from_authority("example.com"), Some("example.com".into()));
-        assert_eq!(hostname_from_authority("example.com:8080"), Some("example.com".into()));
+        assert_eq!(
+            hostname_from_authority("example.com"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            hostname_from_authority("example.com:8080"),
+            Some("example.com".into())
+        );
         // 空端口怪癖:整体按 host 解析
-        assert_eq!(hostname_from_authority("example.com:"), Some("example.com".into()));
+        assert_eq!(
+            hostname_from_authority("example.com:"),
+            Some("example.com".into())
+        );
         assert_eq!(hostname_from_authority("[::1]:8080"), Some("::1".into()));
         // 含 `/` 的值在解析前被 regex 拒绝(对齐 TS 的 /[\s/@\\]/ 先行校验)
         assert_eq!(hostname_from_authority("example.com:/x"), None);
-        assert_eq!(hostname_from_authority("Example.COM."), Some("example.com".into()));
+        assert_eq!(
+            hostname_from_authority("Example.COM."),
+            Some("example.com".into())
+        );
 
         assert_eq!(hostname_from_authority(""), None);
         assert_eq!(hostname_from_authority("host/"), None);
@@ -501,31 +558,79 @@ mod tests {
         assert_eq!(hostname_from_authority("example.com:99999"), None);
         assert_eq!(hostname_from_authority("example.com:65536"), None);
         assert_eq!(hostname_from_authority("example.com:abc"), None);
-        assert_eq!(hostname_from_authority("example.com:65535"), Some("example.com".into()));
-        assert_eq!(hostname_from_authority("example.com:0"), Some("example.com".into()));
+        assert_eq!(
+            hostname_from_authority("example.com:65535"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            hostname_from_authority("example.com:0"),
+            Some("example.com".into())
+        );
         assert_eq!(hostname_from_authority("example.com:8080:9090"), None);
     }
 
     #[test]
     fn canonical_origin_cases() {
-        assert_eq!(canonical_origin("http://example.com:80"), Some("http://example.com".into()));
-        assert_eq!(canonical_origin("http://example.com"), Some("http://example.com".into()));
-        assert_eq!(canonical_origin("https://example.com:443"), Some("https://example.com".into()));
-        assert_eq!(canonical_origin("http://user:pass@example.com/x"), Some("http://example.com".into()));
-        assert_eq!(canonical_origin("http://[::1]:8080"), Some("http://[::1]:8080".into()));
-        assert_eq!(canonical_origin("http://example.com:8080/path"), Some("http://example.com:8080".into()));
-        assert_eq!(canonical_origin("HTTPS://EXAMPLE.com:8443"), Some("https://example.com:8443".into()));
-        assert_eq!(canonical_origin("http://[::1]"), Some("http://[::1]".into()));
+        assert_eq!(
+            canonical_origin("http://example.com:80"),
+            Some("http://example.com".into())
+        );
+        assert_eq!(
+            canonical_origin("http://example.com"),
+            Some("http://example.com".into())
+        );
+        assert_eq!(
+            canonical_origin("https://example.com:443"),
+            Some("https://example.com".into())
+        );
+        assert_eq!(
+            canonical_origin("http://user:pass@example.com/x"),
+            Some("http://example.com".into())
+        );
+        assert_eq!(
+            canonical_origin("http://[::1]:8080"),
+            Some("http://[::1]:8080".into())
+        );
+        assert_eq!(
+            canonical_origin("http://example.com:8080/path"),
+            Some("http://example.com:8080".into())
+        );
+        assert_eq!(
+            canonical_origin("HTTPS://EXAMPLE.com:8443"),
+            Some("https://example.com:8443".into())
+        );
+        assert_eq!(
+            canonical_origin("http://[::1]"),
+            Some("http://[::1]".into())
+        );
         // 空端口省略(对齐 Node)
-        assert_eq!(canonical_origin("http://example.com:"), Some("http://example.com".into()));
+        assert_eq!(
+            canonical_origin("http://example.com:"),
+            Some("http://example.com".into())
+        );
         // 端口 0 保留
-        assert_eq!(canonical_origin("http://example.com:0"), Some("http://example.com:0".into()));
+        assert_eq!(
+            canonical_origin("http://example.com:0"),
+            Some("http://example.com:0".into())
+        );
         // 前导零归约后与默认端口一致 → 省略
-        assert_eq!(canonical_origin("http://example.com:00080"), Some("http://example.com".into()));
-        assert_eq!(canonical_origin("http://example.com:00"), Some("http://example.com:0".into()));
-        assert_eq!(canonical_origin("http://example.com:65535"), Some("http://example.com:65535".into()));
+        assert_eq!(
+            canonical_origin("http://example.com:00080"),
+            Some("http://example.com".into())
+        );
+        assert_eq!(
+            canonical_origin("http://example.com:00"),
+            Some("http://example.com:0".into())
+        );
+        assert_eq!(
+            canonical_origin("http://example.com:65535"),
+            Some("http://example.com:65535".into())
+        );
         // 非默认 https 端口保留
-        assert_eq!(canonical_origin("https://example.com:8443"), Some("https://example.com:8443".into()));
+        assert_eq!(
+            canonical_origin("https://example.com:8443"),
+            Some("https://example.com:8443".into())
+        );
         // 无 host → None
         assert_eq!(canonical_origin("http:///x"), None);
         assert_eq!(canonical_origin("not a url"), None);
@@ -551,7 +656,7 @@ mod tests {
         assert!(is_ip("fe80::1"));
         assert!(is_ip("1:2:3:4:5:6:7:8"));
         assert!(!is_ip("1:2:3:4:5:6:7:8:9"));
-        assert!(!is_ip(":::" ));
+        assert!(!is_ip(":::"));
         assert!(!is_ip("g:2:3:4:5:6:7:8"));
         assert!(!is_ip("::1:2:3:4:5:6:7:8:9"));
     }
@@ -592,19 +697,37 @@ mod tests {
     fn host_allowed_with_config() {
         let empty: Vec<String> = vec![];
         assert!(is_api_request_host_allowed_with(Some("localhost"), &empty));
-        assert!(is_api_request_host_allowed_with(Some("api.localhost"), &empty));
+        assert!(is_api_request_host_allowed_with(
+            Some("api.localhost"),
+            &empty
+        ));
         assert!(is_api_request_host_allowed_with(Some("127.0.0.1"), &empty));
-        assert!(is_api_request_host_allowed_with(Some("192.168.1.5"), &empty));
+        assert!(is_api_request_host_allowed_with(
+            Some("192.168.1.5"),
+            &empty
+        ));
         assert!(is_api_request_host_allowed_with(Some("[::1]"), &empty));
-        assert!(!is_api_request_host_allowed_with(Some("example.com"), &empty));
+        assert!(!is_api_request_host_allowed_with(
+            Some("example.com"),
+            &empty
+        ));
         assert!(!is_api_request_host_allowed_with(None, &empty));
         assert!(!is_api_request_host_allowed_with(Some(""), &empty));
         assert!(!is_api_request_host_allowed_with(Some("evil.com"), &empty));
 
         let cfg = vec!["pi.example.com".to_string()];
-        assert!(is_api_request_host_allowed_with(Some("pi.example.com"), &cfg));
-        assert!(is_api_request_host_allowed_with(Some("pi.example.com:8080"), &cfg));
-        assert!(!is_api_request_host_allowed_with(Some("sub.pi.example.com"), &cfg));
+        assert!(is_api_request_host_allowed_with(
+            Some("pi.example.com"),
+            &cfg
+        ));
+        assert!(is_api_request_host_allowed_with(
+            Some("pi.example.com:8080"),
+            &cfg
+        ));
+        assert!(!is_api_request_host_allowed_with(
+            Some("sub.pi.example.com"),
+            &cfg
+        ));
     }
 
     #[test]
@@ -613,19 +736,54 @@ mod tests {
         let host = Some("example.com");
 
         // 无 origin:浏览器同站/非浏览器放行(除非 cross-site)
-        assert!(is_api_request_origin_allowed(None, Some("same-origin"), url, host));
-        assert!(is_api_request_origin_allowed(None, Some("same-site"), url, host));
+        assert!(is_api_request_origin_allowed(
+            None,
+            Some("same-origin"),
+            url,
+            host
+        ));
+        assert!(is_api_request_origin_allowed(
+            None,
+            Some("same-site"),
+            url,
+            host
+        ));
         assert!(is_api_request_origin_allowed(None, None, url, host));
-        assert!(!is_api_request_origin_allowed(None, Some("cross-site"), url, host));
+        assert!(!is_api_request_origin_allowed(
+            None,
+            Some("cross-site"),
+            url,
+            host
+        ));
 
         // 同 origin
-        assert!(is_api_request_origin_allowed(Some("http://example.com"), None, url, host));
+        assert!(is_api_request_origin_allowed(
+            Some("http://example.com"),
+            None,
+            url,
+            host
+        ));
         // 不同 origin → 拒绝
-        assert!(!is_api_request_origin_allowed(Some("http://evil.com"), None, url, host));
+        assert!(!is_api_request_origin_allowed(
+            Some("http://evil.com"),
+            None,
+            url,
+            host
+        ));
         // 仅端口不同 → 拒绝
-        assert!(!is_api_request_origin_allowed(Some("http://example.com:8080"), None, url, host));
+        assert!(!is_api_request_origin_allowed(
+            Some("http://example.com:8080"),
+            None,
+            url,
+            host
+        ));
         // 非法 origin → 拒绝
-        assert!(!is_api_request_origin_allowed(Some("not a url"), None, url, host));
+        assert!(!is_api_request_origin_allowed(
+            Some("not a url"),
+            None,
+            url,
+            host
+        ));
         // Host 头带端口时 origin 按端口比较
         assert!(is_api_request_origin_allowed(
             Some("http://example.com:8080"),
@@ -634,7 +792,12 @@ mod tests {
             Some("example.com:8080"),
         ));
         // Host 头缺失 → requestOrigin 为空 → 拒绝
-        assert!(!is_api_request_origin_allowed(Some("http://example.com"), None, url, None));
+        assert!(!is_api_request_origin_allowed(
+            Some("http://example.com"),
+            None,
+            url,
+            None
+        ));
     }
 
     #[test]
@@ -643,8 +806,14 @@ mod tests {
         let host = Some("localhost");
         // Host 未过 → 拒绝
         assert!(!is_api_request_allowed(
-            "GET", Some("example.com"), Some("http://localhost"), Some("navigate"),
-            Some("document"), None, Some("?1"), url,
+            "GET",
+            Some("example.com"),
+            Some("http://localhost"),
+            Some("navigate"),
+            Some("document"),
+            None,
+            Some("?1"),
+            url,
         ));
         // Host 过 + 无 origin 头 → 放行
         assert!(is_api_request_allowed(
@@ -652,12 +821,24 @@ mod tests {
         ));
         // Host 过 + 非法跨站 origin → 拒绝
         assert!(!is_api_request_allowed(
-            "GET", host, Some("http://evil.com"), None, None, Some("cross-site"), None, url,
+            "GET",
+            host,
+            Some("http://evil.com"),
+            None,
+            None,
+            Some("cross-site"),
+            None,
+            url,
         ));
         // 会话导出导航豁免(即使有 origin 头)
         assert!(is_api_request_allowed(
-            "GET", host, Some("http://evil.com"), Some("navigate"),
-            Some("document"), None, Some("?1"),
+            "GET",
+            host,
+            Some("http://evil.com"),
+            Some("navigate"),
+            Some("document"),
+            None,
+            Some("?1"),
             "http://example.com/api/sessions/abc/export",
         ));
     }
@@ -666,8 +847,12 @@ mod tests {
     fn json_content_type_cases() {
         assert!(has_json_content_type(Some("application/json")));
         assert!(has_json_content_type(Some("application/problem+json")));
-        assert!(has_json_content_type(Some(" Application/JSON; charset=utf-8 ")));
-        assert!(has_json_content_type(Some("application/json; charset=utf-8")));
+        assert!(has_json_content_type(Some(
+            " Application/JSON; charset=utf-8 "
+        )));
+        assert!(has_json_content_type(Some(
+            "application/json; charset=utf-8"
+        )));
         assert!(!has_json_content_type(Some("text/plain")));
         assert!(!has_json_content_type(Some("application/jsonx")));
         assert!(!has_json_content_type(Some("application/x-json")));

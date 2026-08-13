@@ -36,7 +36,11 @@ pub struct SessionHeader {
     pub thinking_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "leafId")]
     pub leaf_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "branchedFrom")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "branchedFrom"
+    )]
     pub branched_from: Option<String>,
 }
 
@@ -47,8 +51,12 @@ struct PathCache {
     path_to_id: HashMap<String, String>,
 }
 
-static PATH_CACHE: LazyLock<Mutex<PathCache>> =
-    LazyLock::new(|| Mutex::new(PathCache { id_to_path: HashMap::new(), path_to_id: HashMap::new() }));
+static PATH_CACHE: LazyLock<Mutex<PathCache>> = LazyLock::new(|| {
+    Mutex::new(PathCache {
+        id_to_path: HashMap::new(),
+        path_to_id: HashMap::new(),
+    })
+});
 
 /// 对齐 `cacheSessionPath`。
 pub fn cache_session_path(session_id: &str, file_path: &str) {
@@ -58,7 +66,8 @@ pub fn cache_session_path(session_id: &str, file_path: &str) {
     // 清理旧映射
     if let Some(old_path) = cache.id_to_path.get(session_id) {
         let old_key = session_path_key(old_path);
-        if old_key != key && cache.path_to_id.get(&old_key).map(|s| s.as_str()) == Some(session_id) {
+        if old_key != key && cache.path_to_id.get(&old_key).map(|s| s.as_str()) == Some(session_id)
+        {
             cache.path_to_id.remove(&old_key);
         }
     }
@@ -86,7 +95,8 @@ pub fn resolve_session_path(session_id: &str) -> Option<String> {
 }
 
 fn normalize_file_path(p: &str) -> String {
-    PathBuf::from(p).to_string_lossy().to_string()
+    // 对齐 TS `normalizePath(filePath)`(Node path.normalize,平台相关)。
+    crate::paths::normalize(p)
 }
 
 // ── JSONL 读取 ─────────────────────────────────────────────────────────
@@ -222,7 +232,13 @@ pub fn list_all_sessions(
                 project_root: project
                     .as_ref()
                     .map(|p| p.project_root.clone())
-                    .or_else(|| if m.cwd.is_empty() { None } else { Some(m.cwd.clone()) }),
+                    .or_else(|| {
+                        if m.cwd.is_empty() {
+                            None
+                        } else {
+                            Some(m.cwd.clone())
+                        }
+                    }),
                 worktree_branch,
             }
         })

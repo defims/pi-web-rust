@@ -7,6 +7,6 @@
 pub mod startup_preferences;
 
 pub use startup_preferences::{
-    EffectiveStartupPreferences, ExplicitStartupPreferences, SettingsOps,
-    StartupPreferencesOutcome, persist_explicit_startup_preferences,
+    persist_explicit_startup_preferences, EffectiveStartupPreferences, ExplicitStartupPreferences,
+    SettingsOps, StartupPreferencesOutcome,
 };

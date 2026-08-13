@@ -57,7 +57,9 @@ pub fn persist_explicit_startup_preferences(
     effective: &EffectiveStartupPreferences,
 ) -> StartupPreferencesOutcome {
     if explicit.model.is_none() && explicit.thinking_level.is_none() {
-        return StartupPreferencesOutcome { model_default_changed: false };
+        return StartupPreferencesOutcome {
+            model_default_changed: false,
+        };
     }
 
     let mut model_default_changed = false;
@@ -66,7 +68,10 @@ pub fn persist_explicit_startup_preferences(
         if explicit_model.provider == effective_model.provider
             && explicit_model.model_id == effective_model.model_id
         {
-            settings.set_default_model_and_provider(&effective_model.provider, &effective_model.model_id);
+            settings.set_default_model_and_provider(
+                &effective_model.provider,
+                &effective_model.model_id,
+            );
             model_default_changed = true;
         }
     }
@@ -78,7 +83,9 @@ pub fn persist_explicit_startup_preferences(
     }
 
     settings.flush();
-    StartupPreferencesOutcome { model_default_changed }
+    StartupPreferencesOutcome {
+        model_default_changed,
+    }
 }
 
 #[cfg(test)]
@@ -92,7 +99,8 @@ mod tests {
 
     impl SettingsOps for RecordingSettings {
         fn set_default_model_and_provider(&mut self, provider: &str, model_id: &str) {
-            self.calls.push(format!("setDefaultModelAndProvider({provider},{model_id})"));
+            self.calls
+                .push(format!("setDefaultModelAndProvider({provider},{model_id})"));
         }
         fn set_default_thinking_level(&mut self, level: &str) {
             self.calls.push(format!("setDefaultThinkingLevel({level})"));
@@ -103,10 +111,17 @@ mod tests {
     }
 
     fn model(provider: &str, model_id: &str) -> ModelRef {
-        ModelRef { provider: provider.to_string(), model_id: model_id.to_string() }
+        ModelRef {
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+        }
     }
 
-    fn effective(model: Option<ModelRef>, thinking_level: &str, supports_thinking: bool) -> EffectiveStartupPreferences {
+    fn effective(
+        model: Option<ModelRef>,
+        thinking_level: &str,
+        supports_thinking: bool,
+    ) -> EffectiveStartupPreferences {
         EffectiveStartupPreferences {
             model,
             thinking_level: thinking_level.to_string(),
@@ -122,7 +137,12 @@ mod tests {
             &ExplicitStartupPreferences::default(),
             &effective(None, "off", false),
         );
-        assert_eq!(outcome, StartupPreferencesOutcome { model_default_changed: false });
+        assert_eq!(
+            outcome,
+            StartupPreferencesOutcome {
+                model_default_changed: false
+            }
+        );
         assert!(settings.calls.is_empty());
     }
 
@@ -131,14 +151,25 @@ mod tests {
         let mut settings = RecordingSettings::default();
         let outcome = persist_explicit_startup_preferences(
             &mut settings,
-            &ExplicitStartupPreferences { model: Some(model("p", "m1")), thinking_level: None },
+            &ExplicitStartupPreferences {
+                model: Some(model("p", "m1")),
+                thinking_level: None,
+            },
             &effective(Some(model("p", "m1")), "off", false),
         );
-        assert_eq!(outcome, StartupPreferencesOutcome { model_default_changed: true });
-        assert_eq!(settings.calls, vec![
-            "setDefaultModelAndProvider(p,m1)".to_string(),
-            "flush()".to_string(),
-        ]);
+        assert_eq!(
+            outcome,
+            StartupPreferencesOutcome {
+                model_default_changed: true
+            }
+        );
+        assert_eq!(
+            settings.calls,
+            vec![
+                "setDefaultModelAndProvider(p,m1)".to_string(),
+                "flush()".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -146,7 +177,10 @@ mod tests {
         let mut settings = RecordingSettings::default();
         let outcome = persist_explicit_startup_preferences(
             &mut settings,
-            &ExplicitStartupPreferences { model: Some(model("p", "m2")), thinking_level: None },
+            &ExplicitStartupPreferences {
+                model: Some(model("p", "m2")),
+                thinking_level: None,
+            },
             &effective(Some(model("p", "m1")), "off", false),
         );
         assert_eq!(outcome.model_default_changed, false);
@@ -160,19 +194,28 @@ mod tests {
         let mut settings = RecordingSettings::default();
         persist_explicit_startup_preferences(
             &mut settings,
-            &ExplicitStartupPreferences { model: None, thinking_level: Some("high".to_string()) },
+            &ExplicitStartupPreferences {
+                model: None,
+                thinking_level: Some("high".to_string()),
+            },
             &effective(None, "high", true),
         );
-        assert_eq!(settings.calls, vec![
-            "setDefaultThinkingLevel(high)".to_string(),
-            "flush()".to_string(),
-        ]);
+        assert_eq!(
+            settings.calls,
+            vec![
+                "setDefaultThinkingLevel(high)".to_string(),
+                "flush()".to_string(),
+            ]
+        );
 
         // supportsThinking=false 且生效 level = "off" → 不写
         let mut settings = RecordingSettings::default();
         persist_explicit_startup_preferences(
             &mut settings,
-            &ExplicitStartupPreferences { model: None, thinking_level: Some("high".to_string()) },
+            &ExplicitStartupPreferences {
+                model: None,
+                thinking_level: Some("high".to_string()),
+            },
             &effective(None, "off", false),
         );
         assert_eq!(settings.calls, vec!["flush()".to_string()]);
@@ -181,13 +224,19 @@ mod tests {
         let mut settings = RecordingSettings::default();
         persist_explicit_startup_preferences(
             &mut settings,
-            &ExplicitStartupPreferences { model: None, thinking_level: Some("low".to_string()) },
+            &ExplicitStartupPreferences {
+                model: None,
+                thinking_level: Some("low".to_string()),
+            },
             &effective(None, "low", false),
         );
-        assert_eq!(settings.calls, vec![
-            "setDefaultThinkingLevel(low)".to_string(),
-            "flush()".to_string(),
-        ]);
+        assert_eq!(
+            settings.calls,
+            vec![
+                "setDefaultThinkingLevel(low)".to_string(),
+                "flush()".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -202,11 +251,14 @@ mod tests {
             &effective(Some(model("p", "m1")), "high", true),
         );
         assert_eq!(outcome.model_default_changed, true);
-        assert_eq!(settings.calls, vec![
-            "setDefaultModelAndProvider(p,m1)".to_string(),
-            "setDefaultThinkingLevel(high)".to_string(),
-            "flush()".to_string(),
-        ]);
+        assert_eq!(
+            settings.calls,
+            vec![
+                "setDefaultModelAndProvider(p,m1)".to_string(),
+                "setDefaultThinkingLevel(high)".to_string(),
+                "flush()".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -220,7 +272,9 @@ mod tests {
         assert_eq!(json["model"]["modelId"], "m1");
         assert_eq!(json["thinkingLevel"], "high");
 
-        let outcome = StartupPreferencesOutcome { model_default_changed: true };
+        let outcome = StartupPreferencesOutcome {
+            model_default_changed: true,
+        };
         let json = serde_json::to_value(&outcome).unwrap();
         assert_eq!(json["modelDefaultChanged"], true);
     }

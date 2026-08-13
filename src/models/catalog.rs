@@ -107,7 +107,10 @@ pub struct ModelCatalogRecommendation {
     pub metadata_method: ModelCatalogMatchMethod,
     #[serde(skip_serializing_if = "Option::is_none", rename = "matchedProviderId")]
     pub matched_provider_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "matchedProviderName")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "matchedProviderName"
+    )]
     pub matched_provider_name: Option<String>,
     pub preset: ModelCatalogPreset,
     pub price: ModelCatalogPriceRecommendation,
@@ -115,6 +118,8 @@ pub struct ModelCatalogRecommendation {
 
 /// 对齐 `CONSENSUS_MIN_SHARE`。
 const CONSENSUS_MIN_SHARE: f64 = 0.6;
+/// 对齐 `CONSENSUS_MIN_SUPPORT`。winner 达到此数量即视为共识(无论占比)。
+const CONSENSUS_MIN_SUPPORT: usize = 5;
 
 /// 对齐 `KNOWN_PROVIDER_HOSTS`。
 fn known_provider_hosts(provider_id: &str) -> &'static [&'static str] {
@@ -146,16 +151,12 @@ fn clean_string(value: &Value) -> Option<String> {
 
 /// 对齐 `optionalNonNegativeNumber`。
 fn optional_non_negative_number(value: &Value) -> Option<f64> {
-    value
-        .as_f64()
-        .filter(|v| v.is_finite() && *v >= 0.0)
+    value.as_f64().filter(|v| v.is_finite() && *v >= 0.0)
 }
 
 /// 对齐 `optionalPositiveNumber`。
 fn optional_positive_number(value: &Value) -> Option<f64> {
-    value
-        .as_f64()
-        .filter(|v| v.is_finite() && *v > 0.0)
+    value.as_f64().filter(|v| v.is_finite() && *v > 0.0)
 }
 
 /// 对齐 `readCost`。把 models.dev 的 snake_case 字段映射到条目结构。
@@ -179,12 +180,18 @@ fn read_input_modalities(value: &Value) -> Option<Vec<String>> {
     for item in arr {
         if let Some(s) = item.as_str() {
             let normalized = s.trim().to_lowercase();
-            if supported_input_modalities().contains(&normalized.as_str()) && !seen.contains(&normalized) {
+            if supported_input_modalities().contains(&normalized.as_str())
+                && !seen.contains(&normalized)
+            {
                 seen.push(normalized);
             }
         }
     }
-    if seen.is_empty() { None } else { Some(seen) }
+    if seen.is_empty() {
+        None
+    } else {
+        Some(seen)
+    }
 }
 
 /// 对齐 `normalizeProvider`:小写 + 去除非字母数字。
@@ -218,9 +225,7 @@ fn hostname(value: Option<&str>) -> Option<String> {
 fn url_hostname(value: &str) -> Option<String> {
     let scheme_end = value.find("://")?;
     let rest = &value[scheme_end + 3..];
-    let authority_end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if authority.is_empty() {
         return None;
@@ -242,7 +247,10 @@ fn url_hostname(value: &str) -> Option<String> {
 
 /// 对齐 `hostMatches`:相等或 `.<expected>` 后缀。
 fn host_matches(actual: &str, expected: &str) -> bool {
-    actual == expected || actual.strip_suffix(expected).is_some_and(|prefix| prefix.ends_with('.'))
+    actual == expected
+        || actual
+            .strip_suffix(expected)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// 对齐 `providerMatches`。
@@ -257,7 +265,9 @@ fn provider_matches(entry: &ModelCatalogEntry, provider_hint: &str) -> bool {
 
 /// 对齐 `baseUrlMatches`:实际 host 命中已知 provider host 或条目 providerBaseUrl。
 fn base_url_matches(entry: &ModelCatalogEntry, base_url: &str) -> bool {
-    let Some(actual_host) = hostname(Some(base_url)) else { return false; };
+    let Some(actual_host) = hostname(Some(base_url)) else {
+        return false;
+    };
     let known_hosts = known_provider_hosts(&entry.provider_id);
     let provider_host = hostname(entry.provider_base_url.as_deref());
     known_hosts
@@ -306,7 +316,10 @@ where
     if (winner.1 as f64) / (total as f64) < CONSENSUS_MIN_SHARE {
         return None;
     }
-    if groups.get(1).is_some_and(|(_, (_, count))| *count == winner.1) {
+    if groups
+        .get(1)
+        .is_some_and(|(_, (_, count))| *count == winner.1)
+    {
         return None;
     }
     Some(winner.0.clone())
@@ -320,7 +333,10 @@ fn mode_number(values: &[f64]) -> Option<f64> {
     }
     let mut groups: Vec<(f64, usize)> = Vec::new();
     for value in values {
-        match groups.iter_mut().find(|(v, _)| v.to_bits() == value.to_bits()) {
+        match groups
+            .iter_mut()
+            .find(|(v, _)| v.to_bits() == value.to_bits())
+        {
             Some((_, count)) => *count += 1,
             None => groups.push((*value, 1)),
         }
@@ -375,7 +391,13 @@ fn price_from_entry(
 ) -> ModelCatalogPriceRecommendation {
     ModelCatalogPriceRecommendation::Reliable {
         method,
-        cost: entry.cost.clone(),
+        // 对齐 TS `cacheRead ?? 0, cacheWrite ?? 0`:缺失的 cache 字段补 0(非省略)。
+        cost: ModelCatalogCost {
+            input: entry.cost.input,
+            output: entry.cost.output,
+            cache_read: Some(entry.cost.cache_read.unwrap_or(0.0)),
+            cache_write: Some(entry.cost.cache_write.unwrap_or(0.0)),
+        },
         provider_id: Some(entry.provider_id.clone()),
         provider_name: Some(entry.provider_name.clone()),
         support: 1,
@@ -414,8 +436,13 @@ fn consensus_price(entries: &[ModelCatalogEntry]) -> ModelCatalogPriceRecommenda
     }
     groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
     let winner = &groups[0];
-    if groups.get(1).is_some_and(|(_, g)| g.len() == winner.1.len())
-        || (winner.1.len() as f64) / (priced.len() as f64) < CONSENSUS_MIN_SHARE
+    // 对齐 TS:`hasConsensus = share >= CONSENSUS_MIN_SHARE || winner.length >= CONSENSUS_MIN_SUPPORT`。
+    let has_consensus = (winner.1.len() as f64) / (priced.len() as f64) >= CONSENSUS_MIN_SHARE
+        || winner.1.len() >= CONSENSUS_MIN_SUPPORT;
+    if groups
+        .get(1)
+        .is_some_and(|(_, g)| g.len() == winner.1.len())
+        || !has_consensus
     {
         return ModelCatalogPriceRecommendation::Unreliable {
             reason: UnreliableReason::Conflict,
@@ -424,15 +451,24 @@ fn consensus_price(entries: &[ModelCatalogEntry]) -> ModelCatalogPriceRecommenda
         };
     }
 
-    let cache_reads: Vec<f64> = winner.1.iter().filter_map(|e| e.cost.cache_read).collect();
-    let cache_writes: Vec<f64> = winner.1.iter().filter_map(|e| e.cost.cache_write).collect();
+    // 对齐 TS `winner.map(e => e.cost.cacheRead ?? 0)`:缺失值补 0 后再取众数,结果 `?? 0`。
+    let cache_reads: Vec<f64> = winner
+        .1
+        .iter()
+        .map(|e| e.cost.cache_read.unwrap_or(0.0))
+        .collect();
+    let cache_writes: Vec<f64> = winner
+        .1
+        .iter()
+        .map(|e| e.cost.cache_write.unwrap_or(0.0))
+        .collect();
     ModelCatalogPriceRecommendation::Reliable {
         method: ModelCatalogMatchMethod::Consensus,
         cost: ModelCatalogCost {
             input: winner.1[0].cost.input,
             output: winner.1[0].cost.output,
-            cache_read: mode_number(&cache_reads),
-            cache_write: mode_number(&cache_writes),
+            cache_read: Some(mode_number(&cache_reads).unwrap_or(0.0)),
+            cache_write: Some(mode_number(&cache_writes).unwrap_or(0.0)),
         },
         provider_id: None,
         provider_name: None,
@@ -443,7 +479,9 @@ fn consensus_price(entries: &[ModelCatalogEntry]) -> ModelCatalogPriceRecommenda
 
 /// 对齐 `flattenModelsDevCatalog`。原始 models.dev JSON → 扁平条目。
 pub fn flatten_models_dev_catalog(value: &Value) -> Vec<ModelCatalogEntry> {
-    let Some(obj) = value.as_object() else { return vec![]; };
+    let Some(obj) = value.as_object() else {
+        return vec![];
+    };
     let mut entries = Vec::new();
 
     for (provider_id, raw_provider) in obj {
@@ -453,15 +491,19 @@ pub fn flatten_models_dev_catalog(value: &Value) -> Vec<ModelCatalogEntry> {
         let Some(raw_models) = raw_provider.get("models").filter(|m| m.is_object()) else {
             continue;
         };
-        let provider_name = clean_string(&raw_provider["name"]).unwrap_or_else(|| provider_id.clone());
+        let provider_name =
+            clean_string(&raw_provider["name"]).unwrap_or_else(|| provider_id.clone());
         let provider_base_url = clean_string(&raw_provider["api"]);
 
-        let Some(models_obj) = raw_models.as_object() else { continue; };
+        let Some(models_obj) = raw_models.as_object() else {
+            continue;
+        };
         for (fallback_id, raw_model) in models_obj {
             if !raw_model.is_object() {
                 continue;
             }
-            let Some(id) = clean_string(&raw_model["id"]).or_else(|| Some(fallback_id.clone())) else {
+            let Some(id) = clean_string(&raw_model["id"]).or_else(|| Some(fallback_id.clone()))
+            else {
                 continue;
             };
             if id.is_empty() {
@@ -490,7 +532,8 @@ pub fn flatten_models_dev_catalog(value: &Value) -> Vec<ModelCatalogEntry> {
             }
             if raw_model.get("limit").is_some_and(|l| l.is_object()) {
                 let limit = &raw_model["limit"];
-                if let Some(context) = optional_positive_number(&limit["context"]).map(|v| v as u64) {
+                if let Some(context) = optional_positive_number(&limit["context"]).map(|v| v as u64)
+                {
                     entry.context_window = Some(context);
                 }
                 if let Some(output) = optional_positive_number(&limit["output"]).map(|v| v as u64) {
@@ -511,8 +554,10 @@ pub fn recommend_model_catalog_preset(
     provider_hint: &str,
     base_url: &str,
 ) -> ModelCatalogRecommendation {
-    let exact_entries: Vec<&ModelCatalogEntry> =
-        entries.iter().filter(|e| exact_model_matches(e, query)).collect();
+    let exact_entries: Vec<&ModelCatalogEntry> = entries
+        .iter()
+        .filter(|e| exact_model_matches(e, query))
+        .collect();
     if exact_entries.is_empty() {
         return ModelCatalogRecommendation {
             exact_matches: 0,
@@ -528,11 +573,20 @@ pub fn recommend_model_catalog_preset(
         };
     }
 
-    let provider_entries: Vec<&ModelCatalogEntry> =
-        exact_entries.iter().copied().filter(|e| provider_matches(e, provider_hint)).collect();
-    let base_url_entries: Vec<&ModelCatalogEntry> =
-        exact_entries.iter().copied().filter(|e| base_url_matches(e, base_url)).collect();
-    let metadata_entry = provider_entries.first().copied().or_else(|| base_url_entries.first().copied());
+    let provider_entries: Vec<&ModelCatalogEntry> = exact_entries
+        .iter()
+        .copied()
+        .filter(|e| provider_matches(e, provider_hint))
+        .collect();
+    let base_url_entries: Vec<&ModelCatalogEntry> = exact_entries
+        .iter()
+        .copied()
+        .filter(|e| base_url_matches(e, base_url))
+        .collect();
+    let metadata_entry = provider_entries
+        .first()
+        .copied()
+        .or_else(|| base_url_entries.first().copied());
     let metadata_method = if !provider_entries.is_empty() {
         ModelCatalogMatchMethod::Provider
     } else if !base_url_entries.is_empty() {
@@ -542,7 +596,12 @@ pub fn recommend_model_catalog_preset(
     };
     let mut preset = match metadata_entry {
         Some(entry) => metadata_from_entry(entry),
-        None => consensus_metadata(&exact_entries.iter().map(|e| (*e).clone()).collect::<Vec<_>>()),
+        None => consensus_metadata(
+            &exact_entries
+                .iter()
+                .map(|e| (*e).clone())
+                .collect::<Vec<_>>(),
+        ),
     };
 
     let provider_price = provider_entries.iter().copied().find(|e| valid_price(e));
@@ -551,7 +610,12 @@ pub fn recommend_model_catalog_preset(
         Some(entry) => price_from_entry(entry, ModelCatalogMatchMethod::Provider),
         None => match base_url_price {
             Some(entry) => price_from_entry(entry, ModelCatalogMatchMethod::BaseUrl),
-            None => consensus_price(&exact_entries.iter().map(|e| (*e).clone()).collect::<Vec<_>>()),
+            None => consensus_price(
+                &exact_entries
+                    .iter()
+                    .map(|e| (*e).clone())
+                    .collect::<Vec<_>>(),
+            ),
         },
     };
     if let ModelCatalogPriceRecommendation::Reliable { cost, .. } = &price {
@@ -593,7 +657,8 @@ fn match_rank(entry: &ModelCatalogEntry, query: &str, provider_hint: &str) -> f6
         rank = 5.0;
     }
 
-    if rank < 20.0 && !provider_hint.is_empty()
+    if rank < 20.0
+        && !provider_hint.is_empty()
         && (provider_id == provider_hint || provider_name == provider_hint)
     {
         rank -= 0.5;
@@ -684,18 +749,28 @@ pub fn search_model_catalog(
 
     let mut ranked: Vec<(f64, &ModelCatalogEntry)> = entries
         .iter()
-        .map(|entry| (match_rank(entry, &normalized_query, &normalized_provider), entry))
+        .map(|entry| {
+            (
+                match_rank(entry, &normalized_query, &normalized_provider),
+                entry,
+            )
+        })
         .filter(|(rank, _)| normalized_query.is_empty() || *rank < 20.0)
         .collect();
 
     ranked.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| locale_compare_base(&a.1.provider_name, &b.1.provider_name))
             .then_with(|| locale_compare_numeric_base(&a.1.name, &b.1.name))
             .then_with(|| locale_compare_numeric_base(&a.1.id, &b.1.id))
     });
 
-    ranked.into_iter().take(capped_limit).map(|(_, entry)| entry.clone()).collect()
+    ranked
+        .into_iter()
+        .take(capped_limit)
+        .map(|(_, entry)| entry.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -703,7 +778,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn entry(id: &str, provider_id: &str, provider_name: &str, cost: ModelCatalogCost) -> ModelCatalogEntry {
+    fn entry(
+        id: &str,
+        provider_id: &str,
+        provider_name: &str,
+        cost: ModelCatalogCost,
+    ) -> ModelCatalogEntry {
         ModelCatalogEntry {
             key: format!("{provider_id}/{id}"),
             provider_id: provider_id.to_string(),
@@ -743,7 +823,10 @@ mod tests {
         assert_eq!(e.key, "anthropic/claude-3-5-sonnet-20241022");
         assert_eq!(e.provider_id, "anthropic");
         assert_eq!(e.provider_name, "Anthropic");
-        assert_eq!(e.provider_base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!(
+            e.provider_base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
         assert_eq!(e.id, "claude-3-5-sonnet-20241022");
         assert_eq!(e.name, "Claude 3.5 Sonnet");
         assert_eq!(e.reasoning, Some(true));
@@ -780,15 +863,27 @@ mod tests {
 
     #[test]
     fn flatten_skips_non_object_models() {
-        assert_eq!(flatten_models_dev_catalog(&json!({"p": {"models": 5}})), Vec::<ModelCatalogEntry>::new());
-        assert_eq!(flatten_models_dev_catalog(&json!(null)), Vec::<ModelCatalogEntry>::new());
-        assert_eq!(flatten_models_dev_catalog(&json!([])), Vec::<ModelCatalogEntry>::new());
+        assert_eq!(
+            flatten_models_dev_catalog(&json!({"p": {"models": 5}})),
+            Vec::<ModelCatalogEntry>::new()
+        );
+        assert_eq!(
+            flatten_models_dev_catalog(&json!(null)),
+            Vec::<ModelCatalogEntry>::new()
+        );
+        assert_eq!(
+            flatten_models_dev_catalog(&json!([])),
+            Vec::<ModelCatalogEntry>::new()
+        );
     }
 
     #[test]
     fn read_input_modalities_dedup_and_filter() {
         let v = json!({"input": ["TEXT", "text", "image", "audio", "  video  ", 42]});
-        assert_eq!(read_input_modalities(&v), Some(vec!["text".to_string(), "image".to_string()]));
+        assert_eq!(
+            read_input_modalities(&v),
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
         assert_eq!(read_input_modalities(&json!({"input": []})), None);
         assert_eq!(read_input_modalities(&json!({"input": ["audio"]})), None);
         assert_eq!(read_input_modalities(&json!({})), None);
@@ -797,10 +892,19 @@ mod tests {
 
     #[test]
     fn hostname_and_matches() {
-        assert_eq!(hostname(Some("https://api.openai.com/v1")), Some("api.openai.com".to_string()));
-        assert_eq!(hostname(Some("http://openrouter.ai:8080/x")), Some("openrouter.ai".to_string()));
+        assert_eq!(
+            hostname(Some("https://api.openai.com/v1")),
+            Some("api.openai.com".to_string())
+        );
+        assert_eq!(
+            hostname(Some("http://openrouter.ai:8080/x")),
+            Some("openrouter.ai".to_string())
+        );
         assert_eq!(hostname(Some("openrouter.ai")), None); // 无 scheme → None
-        assert_eq!(hostname(Some("HTTPS://API.OPENAI.COM.")), Some("api.openai.com".to_string()));
+        assert_eq!(
+            hostname(Some("HTTPS://API.OPENAI.COM.")),
+            Some("api.openai.com".to_string())
+        );
         assert_eq!(hostname(None), None);
         assert!(host_matches("api.anthropic.com", "anthropic.com"));
         assert!(host_matches("api.anthropic.com", "api.anthropic.com"));
@@ -818,7 +922,12 @@ mod tests {
 
     #[test]
     fn exact_matches() {
-        let e = entry("models/foo/bar", "acme", "Acme", ModelCatalogCost::default());
+        let e = entry(
+            "models/foo/bar",
+            "acme",
+            "Acme",
+            ModelCatalogCost::default(),
+        );
         // normalizeModelId 去掉 models/ 前缀
         assert!(exact_model_matches(&e, "models/foo/bar"));
         assert!(exact_model_matches(&e, "foo/bar"));
@@ -891,11 +1000,14 @@ mod tests {
         assert_eq!(rec.metadata_method, ModelCatalogMatchMethod::Consensus);
         assert_eq!(rec.matched_provider_id, None);
         // consensus:两个条目价格不同 → conflict
-        assert_eq!(rec.price, ModelCatalogPriceRecommendation::Unreliable {
-            reason: UnreliableReason::Conflict,
-            support: 1,
-            total: 2,
-        });
+        assert_eq!(
+            rec.price,
+            ModelCatalogPriceRecommendation::Unreliable {
+                reason: UnreliableReason::Conflict,
+                support: 1,
+                total: 2,
+            }
+        );
         // preset 未填充 cost
         assert_eq!(rec.preset.cost, None);
 
@@ -905,28 +1017,37 @@ mod tests {
         assert_eq!(rec2.matched_provider_id.as_deref(), Some("openai"));
         assert_eq!(rec2.preset.name.as_deref(), Some("GPT-4o"));
         assert_eq!(rec2.preset.context_window, Some(128000));
-        assert_eq!(rec2.preset.cost, Some(ModelCatalogCost {
-            input: Some(2.5),
-            output: Some(10.0),
-            cache_read: None,
-            cache_write: None,
-        }));
-        assert_eq!(rec2.price, ModelCatalogPriceRecommendation::Reliable {
-            method: ModelCatalogMatchMethod::Provider,
-            cost: ModelCatalogCost {
+        assert_eq!(
+            rec2.preset.cost,
+            Some(ModelCatalogCost {
                 input: Some(2.5),
                 output: Some(10.0),
-                cache_read: None,
-                cache_write: None,
-            },
-            provider_id: Some("openai".to_string()),
-            provider_name: Some("OpenAI".to_string()),
-            support: 1,
-            total: 1,
-        });
+                // 对齐 TS priceFromEntry:`cacheRead ?? 0, cacheWrite ?? 0`(缺失补 0)。
+                cache_read: Some(0.0),
+                cache_write: Some(0.0),
+            })
+        );
+        assert_eq!(
+            rec2.price,
+            ModelCatalogPriceRecommendation::Reliable {
+                method: ModelCatalogMatchMethod::Provider,
+                cost: ModelCatalogCost {
+                    input: Some(2.5),
+                    output: Some(10.0),
+                    // 对齐 TS priceFromEntry:`cacheRead ?? 0, cacheWrite ?? 0`(缺失补 0)。
+                    cache_read: Some(0.0),
+                    cache_write: Some(0.0),
+                },
+                provider_id: Some("openai".to_string()),
+                provider_name: Some("OpenAI".to_string()),
+                support: 1,
+                total: 1,
+            }
+        );
 
         // base-url 命中(api.openai.com)
-        let rec3 = recommend_model_catalog_preset(&entries, "gpt-4o", "", "https://api.openai.com/v1");
+        let rec3 =
+            recommend_model_catalog_preset(&entries, "gpt-4o", "", "https://api.openai.com/v1");
         assert_eq!(rec3.metadata_method, ModelCatalogMatchMethod::BaseUrl);
         assert_eq!(rec3.matched_provider_id.as_deref(), Some("openai"));
         assert_eq!(rec3.preset.name.as_deref(), Some("GPT-4o"));
@@ -935,62 +1056,112 @@ mod tests {
         let rec4 = recommend_model_catalog_preset(&entries, "nonexistent", "", "");
         assert_eq!(rec4.exact_matches, 0);
         assert_eq!(rec4.metadata_method, ModelCatalogMatchMethod::None);
-        assert_eq!(rec4.price, ModelCatalogPriceRecommendation::Unreliable {
-            reason: UnreliableReason::NoExactMatch,
-            support: 0,
-            total: 0,
-        });
+        assert_eq!(
+            rec4.price,
+            ModelCatalogPriceRecommendation::Unreliable {
+                reason: UnreliableReason::NoExactMatch,
+                support: 0,
+                total: 0,
+            }
+        );
     }
 
     #[test]
     fn consensus_price_semantics() {
-        let mk = |input: f64, output: f64, cache_read: Option<f64>| entry(
-            "x",
-            "p",
-            "P",
-            ModelCatalogCost { input: Some(input), output: Some(output), cache_read, cache_write: None },
-        );
+        let mk = |input: f64, output: f64, cache_read: Option<f64>| {
+            entry(
+                "x",
+                "p",
+                "P",
+                ModelCatalogCost {
+                    input: Some(input),
+                    output: Some(output),
+                    cache_read,
+                    cache_write: None,
+                },
+            )
+        };
         // 两个相同价格 → reliable consensus, cache 取众数
-        let entries = vec![mk(1.0, 2.0, Some(0.1)), mk(1.0, 2.0, Some(0.1)), mk(1.0, 2.0, Some(0.2))];
+        let entries = vec![
+            mk(1.0, 2.0, Some(0.1)),
+            mk(1.0, 2.0, Some(0.1)),
+            mk(1.0, 2.0, Some(0.2)),
+        ];
         let price = consensus_price(&entries);
-        assert_eq!(price, ModelCatalogPriceRecommendation::Reliable {
-            method: ModelCatalogMatchMethod::Consensus,
-            cost: ModelCatalogCost {
-                input: Some(1.0),
-                output: Some(2.0),
-                cache_read: Some(0.1),
-                cache_write: None,
-            },
-            provider_id: None,
-            provider_name: None,
-            support: 3,
-            total: 3,
-        });
+        assert_eq!(
+            price,
+            ModelCatalogPriceRecommendation::Reliable {
+                method: ModelCatalogMatchMethod::Consensus,
+                cost: ModelCatalogCost {
+                    input: Some(1.0),
+                    output: Some(2.0),
+                    cache_read: Some(0.1),
+                    // 对齐 TS consensusPrice:`modeNumber(winner.map(e => e.cost.cacheWrite ?? 0)) ?? 0`
+                    // 所有 entry 的 cacheWrite 缺失 → 补 0 → 众数 0。
+                    cache_write: Some(0.0),
+                },
+                provider_id: None,
+                provider_name: None,
+                support: 3,
+                total: 3,
+            }
+        );
 
         // 只有 1 个有效价格 → insufficient-support
         let single = vec![mk(1.0, 2.0, None)];
-        assert_eq!(consensus_price(&single), ModelCatalogPriceRecommendation::Unreliable {
-            reason: UnreliableReason::InsufficientSupport,
-            support: 1,
-            total: 1,
-        });
+        assert_eq!(
+            consensus_price(&single),
+            ModelCatalogPriceRecommendation::Unreliable {
+                reason: UnreliableReason::InsufficientSupport,
+                support: 1,
+                total: 1,
+            }
+        );
 
         // 无有效价格
-        let none = vec![entry("x", "p", "P", ModelCatalogCost { input: None, output: None, cache_read: None, cache_write: None })];
-        assert_eq!(consensus_price(&none), ModelCatalogPriceRecommendation::Unreliable {
-            reason: UnreliableReason::NoValidPrice,
-            support: 0,
-            total: 0,
-        });
+        let none = vec![entry(
+            "x",
+            "p",
+            "P",
+            ModelCatalogCost {
+                input: None,
+                output: None,
+                cache_read: None,
+                cache_write: None,
+            },
+        )];
+        assert_eq!(
+            consensus_price(&none),
+            ModelCatalogPriceRecommendation::Unreliable {
+                reason: UnreliableReason::NoValidPrice,
+                support: 0,
+                total: 0,
+            }
+        );
     }
 
     #[test]
     fn search_ranking_and_limit() {
         let entries = vec![
             entry("gpt-4o", "openai", "OpenAI", ModelCatalogCost::default()),
-            entry("gpt-4o-mini", "openai", "OpenAI", ModelCatalogCost::default()),
-            entry("claude-3-5-sonnet", "anthropic", "Anthropic", ModelCatalogCost::default()),
-            entry("claude-3-haiku", "anthropic", "Anthropic", ModelCatalogCost::default()),
+            entry(
+                "gpt-4o-mini",
+                "openai",
+                "OpenAI",
+                ModelCatalogCost::default(),
+            ),
+            entry(
+                "claude-3-5-sonnet",
+                "anthropic",
+                "Anthropic",
+                ModelCatalogCost::default(),
+            ),
+            entry(
+                "claude-3-haiku",
+                "anthropic",
+                "Anthropic",
+                ModelCatalogCost::default(),
+            ),
         ];
         // 空 query → rank 10,按 providerName/name/id 自然排序
         let all = search_model_catalog(&entries, "", "", 50);
@@ -1016,11 +1187,26 @@ mod tests {
 
     #[test]
     fn natural_sort_ordering() {
-        assert_eq!(locale_compare_numeric_base("gpt-4o", "gpt-4o-mini"), std::cmp::Ordering::Less);
-        assert_eq!(locale_compare_numeric_base("a2", "a10"), std::cmp::Ordering::Less);
-        assert_eq!(locale_compare_numeric_base("a10", "a2"), std::cmp::Ordering::Greater);
-        assert_eq!(locale_compare_numeric_base("a2", "a2"), std::cmp::Ordering::Equal);
-        assert_eq!(locale_compare_numeric_base("GPT-4O", "gpt-4o"), std::cmp::Ordering::Equal);
+        assert_eq!(
+            locale_compare_numeric_base("gpt-4o", "gpt-4o-mini"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            locale_compare_numeric_base("a2", "a10"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            locale_compare_numeric_base("a10", "a2"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            locale_compare_numeric_base("a2", "a2"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            locale_compare_numeric_base("GPT-4O", "gpt-4o"),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
@@ -1036,11 +1222,21 @@ mod tests {
                 input: Some(vec!["text".to_string(), "image".to_string()]),
                 context_window: Some(128000),
                 max_tokens: None,
-                cost: Some(ModelCatalogCost { input: Some(2.5), output: Some(10.0), cache_read: None, cache_write: None }),
+                cost: Some(ModelCatalogCost {
+                    input: Some(2.5),
+                    output: Some(10.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
             },
             price: ModelCatalogPriceRecommendation::Reliable {
                 method: ModelCatalogMatchMethod::BaseUrl,
-                cost: ModelCatalogCost { input: Some(2.5), output: Some(10.0), cache_read: None, cache_write: None },
+                cost: ModelCatalogCost {
+                    input: Some(2.5),
+                    output: Some(10.0),
+                    cache_read: None,
+                    cache_write: None,
+                },
                 provider_id: Some("openai".to_string()),
                 provider_name: Some("OpenAI".to_string()),
                 support: 1,
@@ -1078,6 +1274,9 @@ mod tests {
         assert_eq!(json["price"]["status"], "unreliable");
         assert_eq!(json["price"]["reason"], "no-exact-match");
         // preset 全空 → 无字段
-        assert!(json["preset"].as_object().map(|o| o.is_empty()).unwrap_or(false));
+        assert!(json["preset"]
+            .as_object()
+            .map(|o| o.is_empty())
+            .unwrap_or(false));
     }
 }

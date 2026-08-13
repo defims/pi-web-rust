@@ -139,8 +139,18 @@ mod tests {
     #[test]
     fn referenced_and_not() {
         let sid = Some("12345678-1234-1234-1234-123456789abc");
-        assert!(is_file_path_referenced_by_session("/home/test/foo.rs", sid, cache_only, read_entries));
-        assert!(!is_file_path_referenced_by_session("/home/test/other.rs", sid, cache_only, read_entries));
+        assert!(is_file_path_referenced_by_session(
+            "/home/test/foo.rs",
+            sid,
+            cache_only,
+            read_entries
+        ));
+        assert!(!is_file_path_referenced_by_session(
+            "/home/test/other.rs",
+            sid,
+            cache_only,
+            read_entries
+        ));
     }
 
     #[test]
@@ -151,26 +161,40 @@ mod tests {
             "message": { "role": "bashExecution", "fullOutputPath": "/tmp/out.txt" }
         })];
         let read = |_p: &str| entries.clone();
-        assert!(is_bash_output_path_referenced_by_session("/tmp/out.txt", sid, cache_only, read));
-        assert!(!is_bash_output_path_referenced_by_session("/tmp/other.txt", sid, cache_only, read));
+        assert!(is_bash_output_path_referenced_by_session(
+            "/tmp/out.txt",
+            sid,
+            cache_only,
+            read
+        ));
+        assert!(!is_bash_output_path_referenced_by_session(
+            "/tmp/other.txt",
+            sid,
+            cache_only,
+            read
+        ));
     }
 
     #[tokio::test]
     async fn async_versions_match() {
         let sid = Some("12345678-1234-1234-1234-123456789abc");
-        assert!(is_file_path_referenced_by_session_async(
-            "/home/test/foo.rs",
-            sid,
-            cache_only,
-            read_entries,
-        )
-        .await);
-        assert!(!is_bash_output_path_referenced_by_session_async(
-            "/tmp/missing.txt",
-            sid,
-            cache_only,
-            read_entries,
-        )
-        .await);
+        assert!(
+            is_file_path_referenced_by_session_async(
+                "/home/test/foo.rs",
+                sid,
+                cache_only,
+                read_entries,
+            )
+            .await
+        );
+        assert!(
+            !is_bash_output_path_referenced_by_session_async(
+                "/tmp/missing.txt",
+                sid,
+                cache_only,
+                read_entries,
+            )
+            .await
+        );
     }
 }

@@ -5,11 +5,19 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+/// 对齐 TS `/[\/\\:*?"<>|\s]+/g`(特殊字符或空白「连续段」折叠为单个 `-`)。
+static SANITIZE_SPECIAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[\/\\:*?"<>|\s]+"#).expect("valid sanitize special regex"));
+/// 对齐 TS `/^-+|-+$/g`(剥离开头/结尾的连字符)。
+static SANITIZE_EDGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^-+|-+$").expect("valid sanitize edge regex"));
 
 use crate::fs::allowed_roots::allow_file_root;
 
@@ -40,8 +48,11 @@ struct ProjectCache {
     entries: HashMap<String, (ProjectInfo, Instant)>,
 }
 
-static PROJECT_CACHE: LazyLock<Mutex<ProjectCache>> =
-    LazyLock::new(|| Mutex::new(ProjectCache { entries: HashMap::new() }));
+static PROJECT_CACHE: LazyLock<Mutex<ProjectCache>> = LazyLock::new(|| {
+    Mutex::new(ProjectCache {
+        entries: HashMap::new(),
+    })
+});
 
 /// 对齐 `invalidateProjectCache`。
 pub fn invalidate_project_cache() {
@@ -53,7 +64,10 @@ pub fn invalidate_project_cache() {
 // ── git 执行 ─────────────────────────────────────────────────────────────
 
 fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
-    let full: Vec<&str> = ["-C", cwd].into_iter().chain(args.iter().copied()).collect();
+    let full: Vec<&str> = ["-C", cwd]
+        .into_iter()
+        .chain(args.iter().copied())
+        .collect();
     let output = Command::new("git")
         .args(&full)
         .env("LC_ALL", "C")
@@ -72,6 +86,14 @@ fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
 
 // ── 项目解析 ─────────────────────────────────────────────────────────────
 
+/// 对齐 TS `realPathOrSelf(filePath)`:`realpathSync`(canonicalize,解析符号链接),
+/// 失败回退原值。project_root / repo_root 等用它消除 symlink 差异,保证同一仓库分组一致。
+fn real_path_or_self(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| p.to_string())
+}
+
 /// 对齐 `inferRemovedWorktree`。
 fn infer_removed_worktree(cwd: &str) -> Option<ProjectInfo> {
     let parent = Path::new(cwd).parent()?;
@@ -84,13 +106,9 @@ fn infer_removed_worktree(cwd: &str) -> Option<ProjectInfo> {
         return None;
     }
     Some(ProjectInfo {
-        project_root: repo_root.to_string(),
-        branch: Some(
-            Path::new(cwd)
-                .file_name()?
-                .to_string_lossy()
-                .to_string(),
-        ),
+        // 对齐 TS `projectRoot: realPathOrSelf(repoRoot)`。
+        project_root: real_path_or_self(repo_root),
+        branch: Some(Path::new(cwd).file_name()?.to_string_lossy().to_string()),
         is_worktree: true,
         is_top_level: true,
     })
@@ -124,9 +142,10 @@ pub async fn resolve_project(cwd: &str) -> ProjectInfo {
 
     // 写缓存
     if let Ok(mut cache) = PROJECT_CACHE.lock() {
-        cache
-            .entries
-            .insert(cwd.to_string(), (info.clone(), Instant::now() + PROJECT_CACHE_TTL));
+        cache.entries.insert(
+            cwd.to_string(),
+            (info.clone(), Instant::now() + PROJECT_CACHE_TTL),
+        );
     }
     info
 }
@@ -141,18 +160,27 @@ fn resolve_project_blocking(cwd: &str) -> ProjectInfo {
         });
     }
 
-    let out = match git(cwd, &[
-        "rev-parse", "--path-format=absolute",
-        "--git-common-dir", "--git-dir", "--show-toplevel",
-        "--abbrev-ref", "HEAD",
-    ]) {
+    let out = match git(
+        cwd,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--git-dir",
+            "--show-toplevel",
+            "--abbrev-ref",
+            "HEAD",
+        ],
+    ) {
         Ok(s) => s,
-        Err(_) => return ProjectInfo {
-            project_root: cwd.to_string(),
-            branch: None,
-            is_worktree: false,
-            is_top_level: false,
-        },
+        Err(_) => {
+            return ProjectInfo {
+                project_root: cwd.to_string(),
+                branch: None,
+                is_worktree: false,
+                is_top_level: false,
+            }
+        }
     };
 
     let lines: Vec<&str> = out.lines().collect();
@@ -170,19 +198,23 @@ fn resolve_project_blocking(cwd: &str) -> ProjectInfo {
     let toplevel = lines[2].trim();
     let ref_name = lines[3].trim();
 
-    let real_cwd = std::fs::canonicalize(cwd)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| cwd.to_string());
+    let real_cwd = real_path_or_self(cwd);
 
-    let is_top_level = toplevel == real_cwd;
-    let is_worktree_top_level = git_dir != common_dir && is_top_level;
+    // 对齐 TS `samePath(toplevel, realCwd)` / `!samePath(gitDir, commonDir)`:
+    // 大小写/分隔符不敏感比较(Windows 上尤为重要),而非裸字符串相等。
+    let is_top_level = crate::paths::same_path(toplevel, &real_cwd);
+    let is_worktree_top_level = !crate::paths::same_path(git_dir, common_dir) && is_top_level;
 
     ProjectInfo {
         project_root: if is_worktree_top_level {
+            // 对齐 TS `realPathOrSelf(repoRoot)`(repoRoot = dirname(commonDir))。
             Path::new(common_dir)
                 .parent()
-                .map(|p| p.to_string_lossy().to_string())
+                .map(|p| real_path_or_self(&p.to_string_lossy()))
                 .unwrap_or_else(|| cwd.to_string())
+        } else if is_top_level {
+            // 对齐 TS `isTopLevel ? realPathOrSelf(topLevelProjectRoot) : cwd`。
+            real_path_or_self(toplevel)
         } else {
             cwd.to_string()
         },
@@ -211,9 +243,9 @@ pub async fn list_worktrees(cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
             let mut prunable = false;
 
             let flush = |path: &mut Option<String>,
-                             branch: &mut Option<String>,
-                             prunable: &mut bool,
-                             worktrees: &mut Vec<WorktreeInfo>| {
+                         branch: &mut Option<String>,
+                         prunable: &mut bool,
+                         worktrees: &mut Vec<WorktreeInfo>| {
                 if let Some(path) = path.take() {
                     if !*prunable && Path::new(&path).exists() {
                         worktrees.push(WorktreeInfo {
@@ -229,7 +261,12 @@ pub async fn list_worktrees(cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
 
             for line in out.lines() {
                 if let Some(rest) = line.strip_prefix("worktree ") {
-                    flush(&mut current_path, &mut current_branch, &mut prunable, &mut worktrees);
+                    flush(
+                        &mut current_path,
+                        &mut current_branch,
+                        &mut prunable,
+                        &mut worktrees,
+                    );
                     current_path = Some(rest.trim().to_string());
                 } else if let Some(rest) = line.strip_prefix("branch ") {
                     current_branch = Some(
@@ -241,10 +278,20 @@ pub async fn list_worktrees(cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
                 } else if line.trim() == "prunable" {
                     prunable = true;
                 } else if line.trim().is_empty() {
-                    flush(&mut current_path, &mut current_branch, &mut prunable, &mut worktrees);
+                    flush(
+                        &mut current_path,
+                        &mut current_branch,
+                        &mut prunable,
+                        &mut worktrees,
+                    );
                 }
             }
-            flush(&mut current_path, &mut current_branch, &mut prunable, &mut worktrees);
+            flush(
+                &mut current_path,
+                &mut current_branch,
+                &mut prunable,
+                &mut worktrees,
+            );
             Ok(worktrees)
         })();
         let _ = tx.send(result);
@@ -254,18 +301,10 @@ pub async fn list_worktrees(cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
 
 /// 对齐 `sanitizeBranchForDir`。
 fn sanitize_branch_for_dir(branch: &str) -> String {
-    branch
-        .chars()
-        .map(|c| {
-            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ') {
-                '-'
-            } else {
-                c
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
+    // 对齐 TS `branch.replace(/[\/\\:*?"<>|\s]+/g, "-").replace(/^-+|-+$/g, "")`:
+    // 连续特殊字符/空白折叠为单个 `-`,再剥离首尾连字符。
+    let collapsed = SANITIZE_SPECIAL_RE.replace_all(branch, "-");
+    SANITIZE_EDGE_RE.replace_all(&collapsed, "").to_string()
 }
 
 /// 对齐 `addWorktree`。
@@ -285,35 +324,61 @@ pub async fn add_worktree(cwd: &str, branch: &str) -> Result<(String, String), S
     let (tx, rx) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let result = (|| -> Result<(String, String), String> {
-            let common_dir = git(&cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+            let common_dir = git(
+                &cwd,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )?;
+            // 对齐 TS getRepoRoot:`realPathOrSelf(dirname(toNativePath(commonDir)))`。
             let repo_root = Path::new(&common_dir)
                 .parent()
                 .ok_or("Cannot determine repo root")?
                 .to_path_buf();
+            let repo_root = PathBuf::from(real_path_or_self(&repo_root.to_string_lossy()));
 
             let base_dir = PathBuf::from(format!("{}-worktrees", repo_root.display()));
             let worktree_path = base_dir.join(&dir_name_clone);
             if worktree_path.exists() {
-                return Err(format!("Directory already exists: {}", worktree_path.display()));
+                return Err(format!(
+                    "Directory already exists: {}",
+                    worktree_path.display()
+                ));
             }
             std::fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
 
             // 检查分支是否已存在
             let branch_exists = git(
                 &repo_root.to_string_lossy(),
-                &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{trimmed_clone}")],
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{trimmed_clone}"),
+                ],
             )
             .is_ok();
 
             if branch_exists {
                 git(
                     &repo_root.to_string_lossy(),
-                    &["worktree", "add", "--", worktree_path.to_str().unwrap(), &trimmed_clone],
+                    &[
+                        "worktree",
+                        "add",
+                        "--",
+                        worktree_path.to_str().unwrap(),
+                        &trimmed_clone,
+                    ],
                 )?;
             } else {
                 git(
                     &repo_root.to_string_lossy(),
-                    &["worktree", "add", "-b", &trimmed_clone, "--", worktree_path.to_str().unwrap()],
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        &trimmed_clone,
+                        "--",
+                        worktree_path.to_str().unwrap(),
+                    ],
                 )?;
             }
 
@@ -330,23 +395,27 @@ pub async fn add_worktree(cwd: &str, branch: &str) -> Result<(String, String), S
 /// 对齐 `removeWorktree`。
 pub async fn remove_worktree(cwd: &str, worktree_path: &str, force: bool) -> Result<(), String> {
     let worktrees = list_worktrees(cwd).await?;
+    // 对齐 TS `findWorktreeByPath`:`samePath(worktree.path, candidate)`(大小写/分隔符不敏感)。
     let target = worktrees
         .iter()
-        .find(|w| w.path == worktree_path)
-        .ok_or(format!("Not a worktree of this repository: {worktree_path}"))?;
+        .find(|w| crate::paths::same_path(&w.path, worktree_path))
+        .ok_or(format!(
+            "Not a worktree of this repository: {worktree_path}"
+        ))?;
     if target.is_main {
         return Err("Cannot remove the main worktree".to_string());
     }
 
+    // 对齐 TS:把 git 的规范路径 `target.path` 传给 `git worktree remove`(而非原始输入)。
+    let target_path = target.path.clone();
     let cwd = cwd.to_string();
-    let worktree_path = worktree_path.to_string();
     let (tx, rx) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let mut args = vec!["worktree", "remove"];
         if force {
             args.push("--force");
         }
-        args.push(&worktree_path);
+        args.push(&target_path);
         let result = git(&cwd, &args);
         if result.is_ok() {
             invalidate_project_cache();
@@ -362,7 +431,10 @@ mod tests {
 
     #[test]
     fn sanitize_branch() {
-        assert_eq!(sanitize_branch_for_dir("feature/foo bar"), "feature-foo-bar");
+        assert_eq!(
+            sanitize_branch_for_dir("feature/foo bar"),
+            "feature-foo-bar"
+        );
         assert_eq!(sanitize_branch_for_dir("---leading"), "leading");
         assert_eq!(sanitize_branch_for_dir("clean"), "clean");
     }

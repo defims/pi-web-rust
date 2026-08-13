@@ -13,16 +13,18 @@ pub mod skill_lock;
 pub mod skill_updates;
 pub mod skills_service;
 
-pub use npx::{NpxInvocation, build_npx_invocation, find_npx_cli};
+pub use npx::{build_npx_invocation, find_npx_cli, NpxInvocation};
 pub use skill_lock::{
-    SkillInfo, SkillInstallInfo, SkillInstallScope, SourceInfo, annotate_skills_with_install_info,
-    build_skills_sh_url, find_lock_entry, get_global_skills_lock_path, get_install_info,
-    is_within, normalize_source, path_resolve, read_skill_lock,
+    annotate_skills_with_install_info, build_skills_sh_url, find_lock_entry,
+    get_global_skills_lock_path, get_install_info, is_within, normalize_source, path_resolve,
+    read_skill_lock, SkillInfo, SkillInstallInfo, SkillInstallScope, SourceInfo,
 };
 pub use skill_updates::{
-    CHECK_TIMEOUT_MS, DEFAULT_SKILLS_API_BASE, GIT_CHECK_TIMEOUT_MS, HttpError,
-    SkillUpdateIo, SkillUpdateIoError, SkillUpdateResult, SkillUpdateState, build_skill_update_args,
-    check_global_skill, check_project_skill, check_skill_update, check_skill_updates, result,
-    skill_folder, skill_name_from_package, skill_slug, skill_update_key,
+    build_skill_update_args, check_global_skill, check_project_skill, check_skill_update,
+    check_skill_updates, result, skill_folder, skill_name_from_package, skill_slug,
+    skill_update_key, HttpError, SkillUpdateIo, SkillUpdateIoError, SkillUpdateResult,
+    SkillUpdateState, CHECK_TIMEOUT_MS, DEFAULT_SKILLS_API_BASE, GIT_CHECK_TIMEOUT_MS,
 };
-pub use skills_service::{ResourceDiagnostic, SkillsLoader, SkillsResponse, load_skills_with_install_info};
+pub use skills_service::{
+    load_skills_with_install_info, ResourceDiagnostic, SkillsLoader, SkillsResponse,
+};

@@ -29,7 +29,9 @@ pub enum CredentialRemovalResult {
     Removed,
     NotFound,
     #[serde(rename_all = "camelCase")]
-    TypeMismatch { stored_type: String },
+    TypeMismatch {
+        stored_type: String,
+    },
 }
 
 /// 凭证存储/移除的错误(锁获取失败、锁被劫持、auth.json 损坏、IO 失败)。
@@ -49,7 +51,9 @@ impl std::fmt::Display for CredentialStoreError {
         match self {
             CredentialStoreError::LockTimeout => f.write_str("could not acquire auth.json lock"),
             CredentialStoreError::LockCompromised(msg) => write!(f, "lock compromised: {msg}"),
-            CredentialStoreError::InvalidAuthFile => f.write_str("Invalid auth.json: expected an object"),
+            CredentialStoreError::InvalidAuthFile => {
+                f.write_str("Invalid auth.json: expected an object")
+            }
             CredentialStoreError::Io(e) => e.fmt(f),
         }
     }
@@ -94,7 +98,12 @@ struct HeldLock {
 /// pid 已死且 mtime 超过 stale → 直接偷锁;否则按退避重试。
 fn acquire_lock(auth_path: &Path, options: &LockOptions) -> Result<HeldLock, CredentialStoreError> {
     let lock_path = lock_path_for(auth_path);
-    let token = format!("{}:{}:{}", std::process::id(), lock_token_seed(), now_millis());
+    let token = format!(
+        "{}:{}:{}",
+        std::process::id(),
+        lock_token_seed(),
+        now_millis()
+    );
     let mut attempt: u32 = 0;
     let mut delay = options.min_timeout;
     loop {
@@ -237,10 +246,7 @@ fn is_record(value: &Value) -> bool {
 }
 
 /// 对齐 `updateStoredCredentials<T>`。
-fn update_stored_credentials<F>(
-    auth_path: &Path,
-    update: F,
-) -> Result<Value, CredentialStoreError>
+fn update_stored_credentials<F>(auth_path: &Path, update: F) -> Result<Value, CredentialStoreError>
 where
     F: FnOnce(&mut serde_json::Map<String, Value>) -> (Value, bool),
 {
@@ -295,23 +301,34 @@ pub fn remove_stored_credential_if_type(
 ) -> Result<CredentialRemovalResult, CredentialStoreError> {
     update_stored_credentials(auth_path, |credentials| {
         if !credentials.contains_key(provider_id) {
-            return (serde_json::to_value(CredentialRemovalResult::NotFound).unwrap(), false);
+            return (
+                serde_json::to_value(CredentialRemovalResult::NotFound).unwrap(),
+                false,
+            );
         }
 
         let credential = &credentials[provider_id];
-        let stored_type = match credential.as_object().and_then(|obj| obj.get("type")).and_then(|t| t.as_str()) {
+        let stored_type = match credential
+            .as_object()
+            .and_then(|obj| obj.get("type"))
+            .and_then(|t| t.as_str())
+        {
             Some(t) => t.to_string(),
             None => "unknown".to_string(),
         };
         if stored_type != expected_type {
             return (
-                serde_json::to_value(CredentialRemovalResult::TypeMismatch { stored_type }).unwrap(),
+                serde_json::to_value(CredentialRemovalResult::TypeMismatch { stored_type })
+                    .unwrap(),
                 false,
             );
         }
 
         credentials.remove(provider_id);
-        (serde_json::to_value(CredentialRemovalResult::Removed).unwrap(), true)
+        (
+            serde_json::to_value(CredentialRemovalResult::Removed).unwrap(),
+            true,
+        )
     })
     .and_then(|value| {
         serde_json::from_value(value).map_err(|_| CredentialStoreError::InvalidAuthFile)
@@ -324,7 +341,8 @@ mod tests {
     use serde_json::json;
 
     fn temp_auth_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pi-web-cred-store-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pi-web-cred-store-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir.join("auth.json")
@@ -333,12 +351,22 @@ mod tests {
     #[test]
     fn store_creates_file_and_entries() {
         let path = temp_auth_path("store");
-        store_provider_credential("openai", &json!({ "type": "api_key", "apiKey": "sk-1" }), &path).unwrap();
+        store_provider_credential(
+            "openai",
+            &json!({ "type": "api_key", "apiKey": "sk-1" }),
+            &path,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["openai"]["type"], "api_key");
         assert_eq!(parsed["openai"]["apiKey"], "sk-1");
         // 再次存储覆盖
-        store_provider_credential("openai", &json!({ "type": "api_key", "apiKey": "sk-2" }), &path).unwrap();
+        store_provider_credential(
+            "openai",
+            &json!({ "type": "api_key", "apiKey": "sk-2" }),
+            &path,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["openai"]["apiKey"], "sk-2");
     }
@@ -346,11 +374,14 @@ mod tests {
     #[test]
     fn remove_type_mismatch_keeps_credential() {
         let path = temp_auth_path("mismatch");
-        store_provider_credential("openai", &json!({ "type": "oauth", "token": "t" }), &path).unwrap();
+        store_provider_credential("openai", &json!({ "type": "oauth", "token": "t" }), &path)
+            .unwrap();
         let result = remove_stored_credential_if_type("openai", "api_key", &path).unwrap();
         assert_eq!(
             result,
-            CredentialRemovalResult::TypeMismatch { stored_type: "oauth".to_string() }
+            CredentialRemovalResult::TypeMismatch {
+                stored_type: "oauth".to_string()
+            }
         );
         // 凭证未被删除
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -360,7 +391,12 @@ mod tests {
     #[test]
     fn remove_matching_type_deletes() {
         let path = temp_auth_path("remove");
-        store_provider_credential("openai", &json!({ "type": "api_key", "apiKey": "sk-1" }), &path).unwrap();
+        store_provider_credential(
+            "openai",
+            &json!({ "type": "api_key", "apiKey": "sk-1" }),
+            &path,
+        )
+        .unwrap();
         let result = remove_stored_credential_if_type("openai", "api_key", &path).unwrap();
         assert_eq!(result, CredentialRemovalResult::Removed);
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -382,7 +418,9 @@ mod tests {
         let result = remove_stored_credential_if_type("p", "api_key", &path).unwrap();
         assert_eq!(
             result,
-            CredentialRemovalResult::TypeMismatch { stored_type: "unknown".to_string() }
+            CredentialRemovalResult::TypeMismatch {
+                stored_type: "unknown".to_string()
+            }
         );
     }
 
@@ -410,8 +448,10 @@ mod tests {
     fn serialization_shapes() {
         let removed = serde_json::to_value(CredentialRemovalResult::Removed).unwrap();
         assert_eq!(removed["status"], "removed");
-        let mismatch =
-            serde_json::to_value(CredentialRemovalResult::TypeMismatch { stored_type: "oauth".to_string() }).unwrap();
+        let mismatch = serde_json::to_value(CredentialRemovalResult::TypeMismatch {
+            stored_type: "oauth".to_string(),
+        })
+        .unwrap();
         assert_eq!(mismatch["status"], "type_mismatch");
         assert_eq!(mismatch["storedType"], "oauth");
     }

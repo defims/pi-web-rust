@@ -7,8 +7,8 @@
 //! `session::reader`(会话 cwd 扫描)。
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::allowed_roots::{get_additional_allowed_roots, normalize_slashes};
@@ -24,8 +24,12 @@ struct AllowedRootsCache {
     expires_at: Option<Instant>,
 }
 
-static ROOTS_CACHE: LazyLock<Mutex<AllowedRootsCache>> =
-    LazyLock::new(|| Mutex::new(AllowedRootsCache { roots: HashSet::new(), expires_at: None }));
+static ROOTS_CACHE: LazyLock<Mutex<AllowedRootsCache>> = LazyLock::new(|| {
+    Mutex::new(AllowedRootsCache {
+        roots: HashSet::new(),
+        expires_at: None,
+    })
+});
 
 /// 对齐 `isWindowsAbsolutePath`。
 pub fn is_windows_absolute_path(file_path: &str) -> bool {
@@ -44,6 +48,68 @@ pub fn is_windows_absolute_path(file_path: &str) -> bool {
 ///
 /// session 列表获取是 async 的,由调用方传入 session_roots(HashSet<String>),
 /// 本函数负责缓存 + 组合 ~/pi-cwd-* + 额外根。
+/// 异步版 `get_allowed_file_roots`:把 `read_dir` + `home_dir()`(可能 `getpwuid`)
+/// 移入线程,避免阻塞 executor。缓存逻辑与同步版一致。
+pub async fn get_allowed_file_roots_async(
+    session_roots: HashSet<String>,
+) -> HashSet<String> {
+    // 检查缓存(快速路径,纯内存,无需线程)
+    {
+        let cache = ROOTS_CACHE.lock().unwrap();
+        if let Some(expires_at) = cache.expires_at {
+            if expires_at > Instant::now() {
+                return cache.roots.clone();
+            }
+        }
+    }
+
+    // 慢路径(可能 read_dir + getpwuid)移入线程
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut roots = HashSet::new();
+
+        // 1. 会话 cwd + projectRoot
+        for root in &session_roots {
+            let normalized = normalize_slashes(root);
+            if !normalized.is_empty() {
+                roots.insert(normalized);
+            }
+        }
+
+        // 2. ~/pi-cwd-* 目录
+        if let Some(home) = crate::paths::home_dir() {
+            if let Ok(entries) = std::fs::read_dir(&home) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("pi-cwd-")
+                        && name_str.len() == 15
+                        && name_str[7..].chars().all(|c| c.is_ascii_digit())
+                    {
+                        roots.insert(normalize_slashes(&entry.path().to_string_lossy()));
+                    }
+                }
+            }
+        }
+
+        // 3. 额外根
+        for root in get_additional_allowed_roots() {
+            roots.insert(root);
+        }
+
+        // 写缓存
+        {
+            let mut cache = ROOTS_CACHE.lock().unwrap();
+            cache.roots = roots.clone();
+            cache.expires_at = Some(Instant::now() + ALLOWED_ROOTS_TTL);
+        }
+
+        let _ = tx.send(roots);
+    });
+    rx.await.unwrap_or_default()
+}
+
+/// 同步版 `get_allowed_file_roots`(供不需要 async 的调用方/测试使用)。
 pub fn get_allowed_file_roots(session_roots: &HashSet<String>) -> HashSet<String> {
     // 检查缓存
     {
@@ -65,8 +131,8 @@ pub fn get_allowed_file_roots(session_roots: &HashSet<String>) -> HashSet<String
         }
     }
 
-    // 2. ~/pi-cwd-* 目录
-    if let Some(home) = std::env::var_os("HOME") {
+    // 2. ~/pi-cwd-* 目录(对齐 TS 扫描 os.homedir():HOME,缺失回退 getpwuid passwd)
+    if let Some(home) = crate::paths::home_dir() {
         if let Ok(entries) = std::fs::read_dir(&home) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let name = entry.file_name();
@@ -76,9 +142,7 @@ pub fn get_allowed_file_roots(session_roots: &HashSet<String>) -> HashSet<String
                     && name_str.len() == 15 // "pi-cwd-" (7) + 8 digits
                     && name_str[7..].chars().all(|c| c.is_ascii_digit())
                 {
-                    roots.insert(normalize_slashes(
-                        &entry.path().to_string_lossy(),
-                    ));
+                    roots.insert(normalize_slashes(&entry.path().to_string_lossy()));
                 }
             }
         }
@@ -105,10 +169,7 @@ pub fn is_file_path_allowed(target: &str, allowed_roots: &HashSet<String>) -> bo
 }
 
 /// 对齐 `isExistingFilePathAllowed`。canonicalize 后校验(async IO)。
-pub async fn is_existing_file_path_allowed(
-    target: &str,
-    allowed_roots: &HashSet<String>,
-) -> bool {
+pub async fn is_existing_file_path_allowed(target: &str, allowed_roots: &HashSet<String>) -> bool {
     is_existing_path_within_roots(target, allowed_roots).await
 }
 
@@ -133,7 +194,10 @@ mod tests {
     fn file_path_allowed() {
         let mut roots = HashSet::new();
         roots.insert("/home/user/project".to_string());
-        assert!(is_file_path_allowed("/home/user/project/src/main.rs", &roots));
+        assert!(is_file_path_allowed(
+            "/home/user/project/src/main.rs",
+            &roots
+        ));
         assert!(!is_file_path_allowed("/etc/passwd", &roots));
     }
 

@@ -17,8 +17,7 @@ pub async fn write_private_file_atomic(path: &Path, contents: &str) -> io::Resul
         let result = write_private_file_atomic_blocking(&path, &contents);
         let _ = tx.send(result);
     });
-    rx.await
-        .map_err(|_| io::Error::other("thread panicked"))?
+    rx.await.map_err(|_| io::Error::other("thread panicked"))?
 }
 
 /// 同步版(供非 async 调用方直接用)。
@@ -28,10 +27,7 @@ pub fn write_private_file_atomic_blocking(path: &Path, contents: &str) -> io::Re
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    let temp_path = dir.join(format!(
-        ".{basename}-{}.tmp",
-        uuid_v4_simple()
-    ));
+    let temp_path = dir.join(format!(".{basename}-{}.tmp", uuid::Uuid::new_v4()));
 
     let result: io::Result<()> = (|| {
         use std::io::Write;
@@ -67,34 +63,6 @@ pub fn write_private_file_atomic_blocking(path: &Path, contents: &str) -> io::Re
     result
 }
 
-/// 简单 UUID v4(不依赖 uuid crate,手写随机 hex)。
-fn uuid_v4_simple() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seed = nanos as u64;
-    // 简单 LCG 生成 16 字节
-    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    let mut bytes = [0u8; 16];
-    for i in 0..8 {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        bytes[i * 2] = (state >> 56) as u8;
-        bytes[i * 2 + 1] = (state >> 48) as u8;
-    }
-    // version 4, variant 10xx
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11],
-        bytes[12], bytes[13], bytes[14], bytes[15]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,7 +71,9 @@ mod tests {
     async fn write_atomic() {
         let dir = std::env::temp_dir();
         let path = dir.join("pi_web_rust_test_atomic.txt");
-        write_private_file_atomic(&path, "hello world").await.unwrap();
+        write_private_file_atomic(&path, "hello world")
+            .await
+            .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "hello world");
         let _ = std::fs::remove_file(&path);
@@ -111,9 +81,12 @@ mod tests {
 
     #[test]
     fn uuid_format() {
-        let id = uuid_v4_simple();
+        // 对齐 crypto.randomUUID():密码学随机 UUID v4。
+        let id = uuid::Uuid::new_v4().to_string();
         assert_eq!(id.len(), 36);
         assert_eq!(id.as_bytes()[8], b'-');
         assert_eq!(id.as_bytes()[14], b'4'); // version 4
+                                             // 两次生成应不同(非确定性)
+        assert_ne!(uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     }
 }

@@ -18,7 +18,36 @@ pub struct StreamingState {
 
 /// 对齐 `INITIAL_STREAMING_STATE`。
 pub fn initial_streaming_state() -> StreamingState {
-    StreamingState { is_streaming: false, streaming_message: None }
+    StreamingState {
+        is_streaming: false,
+        streaming_message: None,
+    }
+}
+
+/// 复刻 JS `String(value)` 隐式 ToString coercion,用于 `current.text + delta` / `current.thinking + delta`。
+///
+/// TS `current.text + event.delta`:当 `text` 字段缺失(undefined)时,`undefined + "x"`
+/// 得 `"undefinedx"`(JS 把 undefined 强制为字符串 `"undefined"`)。Rust 此前用 `""`
+/// 兜底,与上游不一致。此处忠实复刻:缺失→`"undefined"`,null→`"null"`,
+/// bool/number→其字符串形式,object→`"[object Object]"`。
+fn js_string(value: Option<&Value>) -> String {
+    match value {
+        None => "undefined".to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) => "null".to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Object(_)) => "[object Object]".to_string(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|v| match v {
+                Value::Null => String::new(),
+                Value::String(s) if s.is_empty() => String::new(),
+                _ => js_string(Some(v)),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    }
 }
 
 /// 对齐 `StreamAction`。
@@ -60,17 +89,37 @@ impl DeltaEvent {
         let obj = value.as_object()?;
         let r#type = obj.get("type").and_then(|t| t.as_str())?.to_string();
         let content_index = obj.get("contentIndex").and_then(|v| v.as_u64());
-        let delta = obj.get("delta").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let content = obj.get("content").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let delta = obj
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let content = obj
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let tool_call = obj.get("toolCall").and_then(|tc| {
             let tc = tc.as_object()?;
             Some(ToolCallInfo {
-                id: tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                name: tc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                id: tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: tc
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 arguments: tc.get("arguments").cloned().unwrap_or(Value::Null),
             })
         });
-        Some(DeltaEvent { r#type, content_index, delta, content, tool_call })
+        Some(DeltaEvent {
+            r#type,
+            content_index,
+            delta,
+            content,
+            tool_call,
+        })
     }
 }
 
@@ -113,8 +162,12 @@ pub fn normalize_tool_calls(message: &Value) -> Value {
     if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
         return message.clone();
     }
-    let Some(content) = message.get("content") else { return message.clone(); };
-    let Some(blocks) = content.as_array() else { return message.clone(); };
+    let Some(content) = message.get("content") else {
+        return message.clone();
+    };
+    let Some(blocks) = content.as_array() else {
+        return message.clone();
+    };
 
     let normalized: Vec<Value> = blocks
         .iter()
@@ -142,14 +195,17 @@ fn update_content_block(
     let index = content_index?;
     let index = index as usize;
     let content = message.get("content")?.as_array()?;
-    if index > content.len() {
-        return None;
-    }
     let next_block = update(content.get(index))?;
     if !next_block.is_object() {
         return None;
     }
     let mut new_content = content.clone();
+    // 对齐 JS `content[index] = block` 的自动扩长:index 超出当前长度时,
+    // 间隙用稀疏洞填充(undefined → JSON.stringify 输出 null)。正常 delta 序列不会触发
+    // (agent 顺序产出块),仅畸形/越界 index 下与上游一致。
+    while new_content.len() < index {
+        new_content.push(Value::Null);
+    }
     if index == new_content.len() {
         new_content.push(next_block);
     } else {
@@ -178,7 +234,8 @@ fn apply_delta(state: &StreamingState, event: &DeltaEvent) -> StreamingState {
                 Some("text") => {
                     let mut out = current.unwrap().clone();
                     if let Value::Object(map) = &mut out {
-                        let text = map.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        // 对齐 TS `current.text + event.delta`(缺失 text → "undefined"+delta)。
+                        let text = js_string(map.get("text"));
                         let delta = event.delta.as_deref().unwrap_or("");
                         map.insert("text".to_string(), Value::String(format!("{text}{delta}")));
                     }
@@ -194,30 +251,41 @@ fn apply_delta(state: &StreamingState, event: &DeltaEvent) -> StreamingState {
             };
             if let Value::Object(map) = &mut out {
                 map.insert("type".to_string(), Value::String("text".to_string()));
-                map.insert("text".to_string(), Value::String(event.content.clone().unwrap_or_default()));
+                map.insert(
+                    "text".to_string(),
+                    Value::String(event.content.clone().unwrap_or_default()),
+                );
             }
             Some(out)
         }),
-        "thinking_start" => update_content_block(state, event.content_index, |current| {
-            match current.and_then(|b| b.get("type").and_then(|t| t.as_str())) {
-                Some("thinking") => current.cloned(),
-                _ => Some(serde_json::json!({ "type": "thinking", "thinking": "" })),
-            }
-        }),
-        "thinking_delta" => update_content_block(state, event.content_index, |current| {
-            match current.and_then(|b| b.get("type").and_then(|t| t.as_str())) {
-                Some("thinking") => {
-                    let mut out = current.unwrap().clone();
-                    if let Value::Object(map) = &mut out {
-                        let text = map.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
-                        let delta = event.delta.as_deref().unwrap_or("");
-                        map.insert("thinking".to_string(), Value::String(format!("{text}{delta}")));
-                    }
-                    Some(out)
+        "thinking_start" => {
+            update_content_block(state, event.content_index, |current| {
+                match current.and_then(|b| b.get("type").and_then(|t| t.as_str())) {
+                    Some("thinking") => current.cloned(),
+                    _ => Some(serde_json::json!({ "type": "thinking", "thinking": "" })),
                 }
-                _ => None,
-            }
-        }),
+            })
+        }
+        "thinking_delta" => {
+            update_content_block(state, event.content_index, |current| {
+                match current.and_then(|b| b.get("type").and_then(|t| t.as_str())) {
+                    Some("thinking") => {
+                        let mut out = current.unwrap().clone();
+                        if let Value::Object(map) = &mut out {
+                            // 对齐 TS `current.thinking + event.delta`(缺失 → "undefined"+delta)。
+                            let text = js_string(map.get("thinking"));
+                            let delta = event.delta.as_deref().unwrap_or("");
+                            map.insert(
+                                "thinking".to_string(),
+                                Value::String(format!("{text}{delta}")),
+                            );
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                }
+            })
+        }
         "thinking_end" => update_content_block(state, event.content_index, |current| {
             let mut out = match current.and_then(|b| b.get("type").and_then(|t| t.as_str())) {
                 Some("thinking") => current.unwrap().clone(),
@@ -225,7 +293,10 @@ fn apply_delta(state: &StreamingState, event: &DeltaEvent) -> StreamingState {
             };
             if let Value::Object(map) = &mut out {
                 map.insert("type".to_string(), Value::String("thinking".to_string()));
-                map.insert("thinking".to_string(), Value::String(event.content.clone().unwrap_or_default()));
+                map.insert(
+                    "thinking".to_string(),
+                    Value::String(event.content.clone().unwrap_or_default()),
+                );
             }
             Some(out)
         }),
@@ -233,13 +304,9 @@ fn apply_delta(state: &StreamingState, event: &DeltaEvent) -> StreamingState {
             let Some(tool_call) = event.tool_call.as_ref() else {
                 return state.clone();
             };
-            let mut arguments = tool_call.arguments.clone();
-            // event.toolCall.arguments 可能是 JSON 字符串,解析成对象(对齐 TS input 形状)
-            if let Value::String(s) = &arguments {
-                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                    arguments = parsed;
-                }
-            }
+            let arguments = tool_call.arguments.clone();
+            // 对齐 TS `input: event.toolCall.arguments`:原样赋值。字符串参数保持字符串,
+            // 不解析成对象(Rust 此前会解析,导致 input 形状与上游不一致)。
             update_content_block(state, event.content_index, |_| {
                 Some(serde_json::json!({
                     "type": "toolCall",
@@ -257,11 +324,17 @@ fn apply_delta(state: &StreamingState, event: &DeltaEvent) -> StreamingState {
 /// 对齐 `streamReducer`。
 pub fn stream_reducer(state: &StreamingState, action: &StreamAction) -> StreamingState {
     match action {
-        StreamAction::Start => StreamingState { is_streaming: true, streaming_message: None },
+        StreamAction::Start => StreamingState {
+            is_streaming: true,
+            streaming_message: None,
+        },
         StreamAction::Snapshot(message) => {
             let normalized = normalize_tool_calls(message);
             if normalized.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                StreamingState { is_streaming: true, streaming_message: Some(normalized) }
+                StreamingState {
+                    is_streaming: true,
+                    streaming_message: Some(normalized),
+                }
             } else {
                 state.clone()
             }
@@ -290,7 +363,10 @@ mod tests {
         assert!(started.is_streaming);
         assert_eq!(started.streaming_message, None);
         // end 回到初始
-        assert_eq!(stream_reducer(&started, &StreamAction::End), initial_streaming_state());
+        assert_eq!(
+            stream_reducer(&started, &StreamAction::End),
+            initial_streaming_state()
+        );
     }
 
     #[test]
@@ -312,7 +388,10 @@ mod tests {
             "role": "assistant",
             "content": [{ "type": "toolCall", "id": "c1", "name": "bash", "arguments": { "cmd": "ls" } }]
         });
-        let next = stream_reducer(&initial_streaming_state(), &StreamAction::Snapshot(assistant));
+        let next = stream_reducer(
+            &initial_streaming_state(),
+            &StreamAction::Snapshot(assistant),
+        );
         let content = next.streaming_message.unwrap();
         let block = &content["content"][0];
         assert_eq!(block["toolCallId"], "c1");
@@ -329,27 +408,41 @@ mod tests {
             &initial_streaming_state(),
             &StreamAction::Snapshot(msg(json!([]))),
         );
-        let delta = |t: &str, idx: u64, d: Option<&str>| StreamAction::Delta(DeltaEvent {
-            r#type: t.to_string(),
-            content_index: Some(idx),
-            delta: d.map(|s| s.to_string()),
-            content: None,
-            tool_call: None,
-        });
+        let delta = |t: &str, idx: u64, d: Option<&str>| {
+            StreamAction::Delta(DeltaEvent {
+                r#type: t.to_string(),
+                content_index: Some(idx),
+                delta: d.map(|s| s.to_string()),
+                content: None,
+                tool_call: None,
+            })
+        };
 
         let s1 = stream_reducer(&snapshot, &delta("text_start", 0, None));
-        assert_eq!(s1.streaming_message.as_ref().unwrap()["content"][0], json!({"type":"text","text":""}));
+        assert_eq!(
+            s1.streaming_message.as_ref().unwrap()["content"][0],
+            json!({"type":"text","text":""})
+        );
         let s2 = stream_reducer(&s1, &delta("text_delta", 0, Some("Hel")));
         let s3 = stream_reducer(&s2, &delta("text_delta", 0, Some("lo")));
-        assert_eq!(s3.streaming_message.as_ref().unwrap()["content"][0]["text"], "Hello");
-        let s4 = stream_reducer(&s3, &StreamAction::Delta(DeltaEvent {
-            r#type: "text_end".to_string(),
-            content_index: Some(0),
-            delta: None,
-            content: Some("Final text".to_string()),
-            tool_call: None,
-        }));
-        assert_eq!(s4.streaming_message.as_ref().unwrap()["content"][0]["text"], "Final text");
+        assert_eq!(
+            s3.streaming_message.as_ref().unwrap()["content"][0]["text"],
+            "Hello"
+        );
+        let s4 = stream_reducer(
+            &s3,
+            &StreamAction::Delta(DeltaEvent {
+                r#type: "text_end".to_string(),
+                content_index: Some(0),
+                delta: None,
+                content: Some("Final text".to_string()),
+                tool_call: None,
+            }),
+        );
+        assert_eq!(
+            s4.streaming_message.as_ref().unwrap()["content"][0]["text"],
+            "Final text"
+        );
     }
 
     #[test]
@@ -369,24 +462,57 @@ mod tests {
     }
 
     #[test]
+    fn text_delta_on_block_missing_text_uses_undefined() {
+        // 对齐 TS `current.text + event.delta`:text 字段缺失(undefined)→ "undefined"+delta。
+        // 畸形块(agent 不会产出),仅校验与上游 JS coercion 一致。
+        let state = StreamingState {
+            is_streaming: true,
+            streaming_message: Some(msg(json!([{ "type": "text" }]))),
+        };
+        let delta = StreamAction::Delta(DeltaEvent {
+            r#type: "text_delta".to_string(),
+            content_index: Some(0),
+            delta: Some("abc".to_string()),
+            content: None,
+            tool_call: None,
+        });
+        let next = stream_reducer(&state, &delta);
+        assert_eq!(
+            next.streaming_message.as_ref().unwrap()["content"][0]["text"],
+            json!("undefinedabc")
+        );
+    }
+
+    #[test]
     fn thinking_streaming() {
         let state = StreamingState {
             is_streaming: true,
             streaming_message: Some(msg(json!([{ "type": "text", "text": "keep" }]))),
         };
-        let mk = |t: &str, delta: Option<&str>, content: Option<&str>| StreamAction::Delta(DeltaEvent {
-            r#type: t.to_string(),
-            content_index: Some(0),
-            delta: delta.map(|s| s.to_string()),
-            content: content.map(|s| s.to_string()),
-            tool_call: None,
-        });
+        let mk = |t: &str, delta: Option<&str>, content: Option<&str>| {
+            StreamAction::Delta(DeltaEvent {
+                r#type: t.to_string(),
+                content_index: Some(0),
+                delta: delta.map(|s| s.to_string()),
+                content: content.map(|s| s.to_string()),
+                tool_call: None,
+            })
+        };
         let s1 = stream_reducer(&state, &mk("thinking_start", None, None));
-        assert_eq!(s1.streaming_message.as_ref().unwrap()["content"][0], json!({"type":"thinking","thinking":""}));
+        assert_eq!(
+            s1.streaming_message.as_ref().unwrap()["content"][0],
+            json!({"type":"thinking","thinking":""})
+        );
         let s2 = stream_reducer(&s1, &mk("thinking_delta", Some("a"), None));
-        assert_eq!(s2.streaming_message.as_ref().unwrap()["content"][0]["thinking"], "a");
-        let s3 = stream_reducer(&s2, &mk("thinking_end", None, Some("final")), );
-        assert_eq!(s3.streaming_message.as_ref().unwrap()["content"][0]["thinking"], "final");
+        assert_eq!(
+            s2.streaming_message.as_ref().unwrap()["content"][0]["thinking"],
+            "a"
+        );
+        let s3 = stream_reducer(&s2, &mk("thinking_end", None, Some("final")));
+        assert_eq!(
+            s3.streaming_message.as_ref().unwrap()["content"][0]["thinking"],
+            "final"
+        );
     }
 
     #[test]
@@ -411,8 +537,8 @@ mod tests {
         assert_eq!(block["type"], "toolCall");
         assert_eq!(block["toolCallId"], "c9");
         assert_eq!(block["toolName"], "bash");
-        // 字符串 arguments 被解析为对象
-        assert_eq!(block["input"]["cmd"], "ls");
+        // 对齐 TS `input: event.toolCall.arguments`:原样赋值,字符串参数保持字符串。
+        assert_eq!(block["input"], json!("{\"cmd\":\"ls\"}"));
     }
 
     #[test]

@@ -68,13 +68,14 @@ pub fn configure_http_dispatcher(timeout_ms: u64) -> Result<HttpDispatcherConfig
         return Ok(existing);
     }
 
-    let normalized = match parse_http_idle_timeout_ms(&Value::Number(
-        serde_json::Number::from(timeout_ms),
-    )) {
-        Some(n) => n,
-        None => return Err(format!("Invalid HTTP idle timeout: {timeout_ms}")),
+    let normalized =
+        match parse_http_idle_timeout_ms(&Value::Number(serde_json::Number::from(timeout_ms))) {
+            Some(n) => n,
+            None => return Err(format!("Invalid HTTP idle timeout: {timeout_ms}")),
+        };
+    let config = HttpDispatcherConfig {
+        idle_timeout_ms: normalized,
     };
-    let config = HttpDispatcherConfig { idle_timeout_ms: normalized };
     *guard = Some(config);
     Ok(config)
 }
@@ -100,7 +101,10 @@ mod tests {
         assert_eq!(parse_http_idle_timeout_ms(&json!("300000")), Some(300_000));
         assert_eq!(parse_http_idle_timeout_ms(&json!("disabled")), Some(0));
         assert_eq!(parse_http_idle_timeout_ms(&json!("DISABLED")), Some(0));
-        assert_eq!(parse_http_idle_timeout_ms(&json!(" 300000 ")), Some(300_000));
+        assert_eq!(
+            parse_http_idle_timeout_ms(&json!(" 300000 ")),
+            Some(300_000)
+        );
         assert_eq!(parse_http_idle_timeout_ms(&json!("")), None);
         assert_eq!(parse_http_idle_timeout_ms(&json!("  ")), None);
         assert_eq!(parse_http_idle_timeout_ms(&json!("abc")), None);
@@ -124,11 +128,21 @@ mod tests {
         reset_dispatcher_guard();
         assert!(!http_dispatcher_configured());
         let cfg = configure_http_dispatcher(150_000).unwrap();
-        assert_eq!(cfg, HttpDispatcherConfig { idle_timeout_ms: 150_000 });
+        assert_eq!(
+            cfg,
+            HttpDispatcherConfig {
+                idle_timeout_ms: 150_000
+            }
+        );
         assert!(http_dispatcher_configured());
         // 二次调用幂等,返回首次生效配置
         let cfg2 = configure_http_dispatcher(99_000).unwrap();
-        assert_eq!(cfg2, HttpDispatcherConfig { idle_timeout_ms: 150_000 });
+        assert_eq!(
+            cfg2,
+            HttpDispatcherConfig {
+                idle_timeout_ms: 150_000
+            }
+        );
     }
 
     #[test]

@@ -26,8 +26,13 @@ pub struct SplitDiffCell {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SplitDiffRow {
-    Hunk { text: String },
-    Line { left: SplitDiffCell, right: SplitDiffCell },
+    Hunk {
+        text: String,
+    },
+    Line {
+        left: SplitDiffCell,
+        right: SplitDiffCell,
+    },
 }
 
 /// 对齐 `SplitDiffFile`。
@@ -63,9 +68,9 @@ pub fn parse_unified_patch(text: &str) -> Option<Vec<SplitDiffFile>> {
     };
 
     let flush_changes = |files: &mut Vec<SplitDiffFile>,
-                             current_idx: &mut Option<usize>,
-                             removed: &mut Vec<PendingChangeLine>,
-                             added: &mut Vec<PendingChangeLine>| {
+                         current_idx: &mut Option<usize>,
+                         removed: &mut Vec<PendingChangeLine>,
+                         added: &mut Vec<PendingChangeLine>| {
         let Some(idx) = *current_idx else {
             removed.clear();
             added.clear();
@@ -131,7 +136,9 @@ pub fn parse_unified_patch(text: &str) -> Option<Vec<SplitDiffFile>> {
             hunk_old_remaining = hunk.old_count;
             hunk_new_remaining = hunk.new_count;
             if let Some(idx) = current_idx {
-                files[idx].rows.push(SplitDiffRow::Hunk { text: line.to_string() });
+                files[idx].rows.push(SplitDiffRow::Hunk {
+                    text: line.to_string(),
+                });
             }
             continue;
         }
@@ -143,7 +150,9 @@ pub fn parse_unified_patch(text: &str) -> Option<Vec<SplitDiffFile>> {
         if line.starts_with("\\ ") {
             flush_changes(&mut files, &mut current_idx, &mut removed, &mut added);
             if let Some(idx) = current_idx {
-                files[idx].rows.push(SplitDiffRow::Hunk { text: line.to_string() });
+                files[idx].rows.push(SplitDiffRow::Hunk {
+                    text: line.to_string(),
+                });
             }
             continue;
         }
@@ -170,23 +179,39 @@ pub fn parse_unified_patch(text: &str) -> Option<Vec<SplitDiffFile>> {
                 }
                 old_line_no += 1;
                 new_line_no += 1;
-                if hunk_old_remaining > 0 { hunk_old_remaining -= 1; }
-                if hunk_new_remaining > 0 { hunk_new_remaining -= 1; }
+                if hunk_old_remaining > 0 {
+                    hunk_old_remaining -= 1;
+                }
+                if hunk_new_remaining > 0 {
+                    hunk_new_remaining -= 1;
+                }
             }
             Some(b'-') => {
-                removed.push(PendingChangeLine { line_no: old_line_no, text: content.to_string() });
+                removed.push(PendingChangeLine {
+                    line_no: old_line_no,
+                    text: content.to_string(),
+                });
                 old_line_no += 1;
-                if hunk_old_remaining > 0 { hunk_old_remaining -= 1; }
+                if hunk_old_remaining > 0 {
+                    hunk_old_remaining -= 1;
+                }
             }
             Some(b'+') => {
-                added.push(PendingChangeLine { line_no: new_line_no, text: content.to_string() });
+                added.push(PendingChangeLine {
+                    line_no: new_line_no,
+                    text: content.to_string(),
+                });
                 new_line_no += 1;
-                if hunk_new_remaining > 0 { hunk_new_remaining -= 1; }
+                if hunk_new_remaining > 0 {
+                    hunk_new_remaining -= 1;
+                }
             }
             _ if !line.is_empty() => {
                 flush_changes(&mut files, &mut current_idx, &mut removed, &mut added);
                 if let Some(idx) = current_idx {
-                    files[idx].rows.push(SplitDiffRow::Hunk { text: line.to_string() });
+                    files[idx].rows.push(SplitDiffRow::Hunk {
+                        text: line.to_string(),
+                    });
                 }
             }
             _ => {}
@@ -197,9 +222,17 @@ pub fn parse_unified_patch(text: &str) -> Option<Vec<SplitDiffFile>> {
 
     let parsed: Vec<SplitDiffFile> = files
         .into_iter()
-        .filter(|f| f.rows.iter().any(|r| matches!(r, SplitDiffRow::Line { .. })))
+        .filter(|f| {
+            f.rows
+                .iter()
+                .any(|r| matches!(r, SplitDiffRow::Line { .. }))
+        })
         .collect();
-    if parsed.is_empty() { None } else { Some(parsed) }
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
 }
 
 struct HunkHeader {
@@ -209,27 +242,20 @@ struct HunkHeader {
     new_count: i64,
 }
 
-/// 对齐 `/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/`
+/// 对齐 `/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/`(末尾 `@@` 后可跟上下文,无 `$` 锚定)。
 fn parse_hunk_header(line: &str) -> Option<HunkHeader> {
-    let line = line.strip_prefix("@@ ")?;
-    let rest = line.strip_prefix('-')?;
-    let (old_start_s, rest) = rest.split_once(' ')?;
-    let _old_start: i64 = old_start_s.parse().ok()?;
-    // rest = "+123,45 @@" 或 "+123 @@"
+    let line = line.strip_prefix("@@ -")?;
+    // old 段到首个空格为止:`"1,2 +1,2 @@ ..."` → old="1,2", 余="+1,2 @@ ..."
+    let (old_section, rest) = line.split_once(' ')?;
     let rest = rest.strip_prefix('+')?;
-    let parts: Vec<&str> = rest.splitn(2, " @@").collect();
-    let new_part = parts.first()?;
-    let (new_start_s, new_count_s) = new_part.split_once(',').unwrap_or((new_part, "1"));
-    let new_start: i64 = new_start_s.parse().ok()?;
-    let new_count: i64 = new_count_s.parse().unwrap_or(1);
-
-    // old_count: 从 "@@ -123,45" 的 45,无则 1
-    let (_old_count_s, _) = old_start_s.split_once(',').unwrap_or((old_start_s, ""));
-    // 重新解析 old_start,old_count(old_start_s 可能含逗号)
-    let (os, oc) = old_start_s.split_once(',').unwrap_or((old_start_s, "1"));
+    // new 段到 " @@" 为止(必须存在尾随 @@)
+    let (new_section, _) = rest.split_once(" @@")?;
+    let (os, oc) = old_section.split_once(',').unwrap_or((old_section, "1"));
+    let (ns, nc) = new_section.split_once(',').unwrap_or((new_section, "1"));
     let old_start: i64 = os.parse().ok()?;
     let old_count: i64 = oc.parse().unwrap_or(1);
-
+    let new_start: i64 = ns.parse().ok()?;
+    let new_count: i64 = nc.parse().unwrap_or(1);
     Some(HunkHeader {
         old_start,
         old_count,
@@ -255,7 +281,10 @@ mod tests {
         assert_eq!(result[0].old_path.as_deref(), Some("a/test.rs"));
         assert_eq!(result[0].new_path.as_deref(), Some("b/test.rs"));
         // 至少有 line rows
-        assert!(result[0].rows.iter().any(|r| matches!(r, SplitDiffRow::Line { .. })));
+        assert!(result[0]
+            .rows
+            .iter()
+            .any(|r| matches!(r, SplitDiffRow::Line { .. })));
     }
 
     #[test]

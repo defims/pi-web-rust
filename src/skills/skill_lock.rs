@@ -82,7 +82,10 @@ pub fn get_global_skills_lock_path(home_dir: &str, xdg_state_home: Option<&str>)
         Some(xdg) if !xdg.trim().is_empty() => {
             format!("{}/skills/.skill-lock.json", xdg.trim_end_matches('/'))
         }
-        _ => format!("{}/.agents/.skill-lock.json", home_dir.trim_end_matches('/')),
+        _ => format!(
+            "{}/.agents/.skill-lock.json",
+            home_dir.trim_end_matches('/')
+        ),
     }
 }
 
@@ -123,7 +126,12 @@ pub fn find_lock_entry<'a>(
 /// `git@github.com:`/`.git`/尾部 `/`;其他源只去尾部 `/`。
 pub fn normalize_source(source: &str, source_type: Option<&str>) -> String {
     if source_type != Some("github") {
-        return source.trim_end_matches('/').to_string();
+        // 对齐 TS `source.replace(/\/$/, "")`:只剥一个尾部斜杠(非全部)。
+        let mut s = source.to_string();
+        if s.ends_with('/') {
+            s.pop();
+        }
+        return s;
     }
     let mut out = source.to_string();
     for prefix in [
@@ -191,8 +199,7 @@ pub fn get_install_info(
         entry.computed_hash.clone()
     };
     let version_hash = raw_version_hash.filter(|h| !h.is_empty());
-    let is_github_source =
-        source_type.as_deref() == Some("github") && is_github_repo_path(&source);
+    let is_github_source = source_type.as_deref() == Some("github") && is_github_repo_path(&source);
     let has_comparable_version = scope == "global" || ref_.is_none();
 
     Some(SkillInstallInfo {
@@ -208,7 +215,10 @@ pub fn get_install_info(
         skill_path: skill_path.clone(),
         ref_,
         version_hash: version_hash.clone(),
-        can_check_for_updates: is_github_source && skill_path.is_some() && version_hash.is_some() && has_comparable_version,
+        can_check_for_updates: is_github_source
+            && skill_path.is_some()
+            && version_hash.is_some()
+            && has_comparable_version,
     })
 }
 
@@ -221,7 +231,10 @@ fn is_github_repo_path(source: &str) -> bool {
 }
 
 fn is_word_dot_dash(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
 /// 对齐 `annotateSkillsWithInstallInfo`。
@@ -285,7 +298,11 @@ pub fn path_resolve(value: &str) -> String {
         let cwd = std::env::current_dir()
             .map(|d| d.to_string_lossy().to_string())
             .unwrap_or_else(|_| "/".to_string());
-        let cwd_abs = if cwd.starts_with('/') { cwd } else { format!("/{cwd}") };
+        let cwd_abs = if cwd.starts_with('/') {
+            cwd
+        } else {
+            format!("/{cwd}")
+        };
         let mut combined = cwd_abs;
         for seg in &stack {
             combined.push('/');
@@ -326,7 +343,14 @@ fn is_absolute(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn entry(source: Option<&str>, source_type: Option<&str>, skill_path: Option<&str>, ref_: Option<&str>, folder_hash: Option<&str>, computed_hash: Option<&str>) -> SkillLockEntry {
+    fn entry(
+        source: Option<&str>,
+        source_type: Option<&str>,
+        skill_path: Option<&str>,
+        ref_: Option<&str>,
+        folder_hash: Option<&str>,
+        computed_hash: Option<&str>,
+    ) -> SkillLockEntry {
         SkillLockEntry {
             source: source.map(|s| s.to_string()),
             source_type: source_type.map(|s| s.to_string()),
@@ -373,7 +397,10 @@ mod tests {
     #[test]
     fn find_entry_case_insensitive() {
         let mut entries = BTreeMap::new();
-        entries.insert("MySkill".to_string(), entry(Some("org/repo"), None, None, None, None, None));
+        entries.insert(
+            "MySkill".to_string(),
+            entry(Some("org/repo"), None, None, None, None, None),
+        );
         assert!(find_lock_entry(&entries, "MySkill").is_some());
         assert!(find_lock_entry(&entries, "myskill").is_some());
         assert!(find_lock_entry(&entries, "other").is_none());
@@ -381,15 +408,30 @@ mod tests {
 
     #[test]
     fn normalize_source_cases() {
-        assert_eq!(normalize_source("git+https://github.com/foo/bar.git", Some("github")), "foo/bar");
-        assert_eq!(normalize_source("https://github.com/foo/bar", Some("github")), "foo/bar");
-        assert_eq!(normalize_source("git@github.com:foo/bar.git", Some("github")), "foo/bar");
+        assert_eq!(
+            normalize_source("git+https://github.com/foo/bar.git", Some("github")),
+            "foo/bar"
+        );
+        assert_eq!(
+            normalize_source("https://github.com/foo/bar", Some("github")),
+            "foo/bar"
+        );
+        assert_eq!(
+            normalize_source("git@github.com:foo/bar.git", Some("github")),
+            "foo/bar"
+        );
         assert_eq!(normalize_source("foo/bar/", Some("github")), "foo/bar");
         assert_eq!(normalize_source("foo/bar", None), "foo/bar");
         assert_eq!(normalize_source("local-dir/", None), "local-dir");
-        assert_eq!(normalize_source("https://example.com/x/", None), "https://example.com/x");
+        assert_eq!(
+            normalize_source("https://example.com/x/", None),
+            "https://example.com/x"
+        );
         // 非 github 源不去前缀
-        assert_eq!(normalize_source("https://github.com/foo/bar", None), "https://github.com/foo/bar");
+        assert_eq!(
+            normalize_source("https://github.com/foo/bar", None),
+            "https://github.com/foo/bar"
+        );
     }
 
     #[test]
@@ -460,22 +502,56 @@ mod tests {
     fn install_info_can_check_rules() {
         // 缺 skillPath → false
         let mut entries = BTreeMap::new();
-        entries.insert("a".to_string(), entry(Some("o/r"), Some("github"), None, None, Some("h"), None));
-        assert_eq!(get_install_info(&entries, "a", "global").unwrap().can_check_for_updates, false);
+        entries.insert(
+            "a".to_string(),
+            entry(Some("o/r"), Some("github"), None, None, Some("h"), None),
+        );
+        assert_eq!(
+            get_install_info(&entries, "a", "global")
+                .unwrap()
+                .can_check_for_updates,
+            false
+        );
         // 缺 versionHash → false
         let mut entries = BTreeMap::new();
-        entries.insert("a".to_string(), entry(Some("o/r"), Some("github"), Some("/x"), None, None, None));
-        assert_eq!(get_install_info(&entries, "a", "global").unwrap().can_check_for_updates, false);
+        entries.insert(
+            "a".to_string(),
+            entry(Some("o/r"), Some("github"), Some("/x"), None, None, None),
+        );
+        assert_eq!(
+            get_install_info(&entries, "a", "global")
+                .unwrap()
+                .can_check_for_updates,
+            false
+        );
         // 非 github → false
         let mut entries = BTreeMap::new();
-        entries.insert("a".to_string(), entry(Some("o/r"), None, Some("/x"), None, Some("h"), None));
-        assert_eq!(get_install_info(&entries, "a", "global").unwrap().can_check_for_updates, false);
+        entries.insert(
+            "a".to_string(),
+            entry(Some("o/r"), None, Some("/x"), None, Some("h"), None),
+        );
+        assert_eq!(
+            get_install_info(&entries, "a", "global")
+                .unwrap()
+                .can_check_for_updates,
+            false
+        );
     }
 
     #[test]
     fn install_info_local_no_sh_url() {
         let mut entries = BTreeMap::new();
-        entries.insert("a".to_string(), entry(Some("/local/path"), Some("local"), Some("/x"), None, None, None));
+        entries.insert(
+            "a".to_string(),
+            entry(
+                Some("/local/path"),
+                Some("local"),
+                Some("/x"),
+                None,
+                None,
+                None,
+            ),
+        );
         let info = get_install_info(&entries, "a", "global").unwrap();
         assert_eq!(info.skills_sh_url, None);
     }
@@ -484,7 +560,10 @@ mod tests {
     fn install_info_missing_parts() {
         let mut entries = BTreeMap::new();
         // source 为空 → undefined
-        entries.insert("a".to_string(), entry(Some("  "), None, None, None, None, None));
+        entries.insert(
+            "a".to_string(),
+            entry(Some("  "), None, None, None, None, None),
+        );
         assert!(get_install_info(&entries, "a", "global").is_none());
         // 完全缺失 → undefined
         assert!(get_install_info(&entries, "nope", "global").is_none());
@@ -556,7 +635,10 @@ mod tests {
             global_lock.to_str().unwrap(),
             "/nonexistent/project-lock.json",
         );
-        let install = skills[0].install.as_ref().expect("global install annotated");
+        let install = skills[0]
+            .install
+            .as_ref()
+            .expect("global install annotated");
         assert_eq!(install.scope, "global");
         assert_eq!(install.source, "org/demo");
         assert_eq!(install.version_hash.as_deref(), Some("h1"));

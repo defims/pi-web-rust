@@ -60,10 +60,7 @@ pub fn collect_provider_listing_inputs(
         .map(|(id, name)| {
             let auth = runtime.provider_auth(id);
             let status = runtime.auth_status(id);
-            let model_count = models
-                .iter()
-                .filter(|(provider, _)| provider == id)
-                .count();
+            let model_count = models.iter().filter(|(provider, _)| provider == id).count();
             ProviderListingInput {
                 id: id.clone(),
                 name: name.clone(),
@@ -122,16 +119,28 @@ mod tests {
             auths: std::collections::HashMap::from([
                 (
                     "openai".to_string(),
-                    ProviderAuthDecl { api_key_login: true, has_oauth: true, oauth_name: Some("OpenAI OAuth".to_string()) },
+                    ProviderAuthDecl {
+                        api_key_login: true,
+                        has_oauth: true,
+                        oauth_name: Some("OpenAI OAuth".to_string()),
+                    },
                 ),
                 (
                     "anthropic".to_string(),
-                    ProviderAuthDecl { api_key_login: true, has_oauth: true, oauth_name: Some("Anthropic (Claude Pro/Max)".to_string()) },
+                    ProviderAuthDecl {
+                        api_key_login: true,
+                        has_oauth: true,
+                        oauth_name: Some("Anthropic (Claude Pro/Max)".to_string()),
+                    },
                 ),
             ]),
-            statuses: std::collections::HashMap::from([
-                ("openai".to_string(), AuthStatus { configured: true, source: Some("env".to_string()) }),
-            ]),
+            statuses: std::collections::HashMap::from([(
+                "openai".to_string(),
+                AuthStatus {
+                    configured: true,
+                    source: Some("env".to_string()),
+                },
+            )]),
         };
         let names = vec![
             ("openai".to_string(), "OpenAI".to_string()),
@@ -171,14 +180,22 @@ mod tests {
             credentials: Err("Invalid auth.json".to_string()),
             auths: std::collections::HashMap::from([(
                 "p".to_string(),
-                ProviderAuthDecl { api_key_login: true, has_oauth: false, oauth_name: None },
+                ProviderAuthDecl {
+                    api_key_login: true,
+                    has_oauth: false,
+                    oauth_name: None,
+                },
             )]),
             statuses: std::collections::HashMap::from([(
                 "p".to_string(),
-                AuthStatus { configured: true, source: Some("models_json_key".to_string()) },
+                AuthStatus {
+                    configured: true,
+                    source: Some("models_json_key".to_string()),
+                },
             )]),
         };
-        let inputs = collect_provider_listing_inputs(&runtime, &[("p".to_string(), "P".to_string())]);
+        let inputs =
+            collect_provider_listing_inputs(&runtime, &[("p".to_string(), "P".to_string())]);
         assert_eq!(inputs.len(), 1);
         // 凭证损坏 → credential_type 缺失,但 auth status 仍在
         assert_eq!(inputs[0].credential_type, None);

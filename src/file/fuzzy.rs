@@ -5,7 +5,23 @@
 //! `localeCompare`(默认,无 options)用「大小写折叠比较 + 小写优先平局」
 //! 近似 ICU en 排序(路径以 ASCII 为主,非 ASCII 可能微差)。
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+
+/// 对齐 TS `/(?:^|\s)@"([^"\n]*)$/`(引号形式)。
+static QUOTED_AT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:^|\s)@"([^"\n]*)$"#).expect("valid quoted @ regex"));
+
+/// 对齐 TS `/(?:^|\s)@([^\s"]*)$/`(普通形式)。
+static PLAIN_AT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:^|\s)@([^\s"]*)$"#).expect("valid plain @ regex"));
+
+/// JS 字符串 `.length`(UTF-16 码元数)。`start`/`cursorOffset` 返回给 JS 前端,
+/// 须用 UTF-16 单位而非字节数,否则非 ASCII 文本会错位切片。
+fn utf16_len(s: &str) -> usize {
+    s.chars().map(|c| c.len_utf16()).sum()
+}
 
 /// 对齐 `AtQueryMatch`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,72 +53,25 @@ pub const AT_RESULT_LIMIT: usize = 20;
 /// `@"my dir/fi` 引号形式(可钻入含空格路径)。
 pub fn extract_at_query(text_before_cursor: &str) -> Option<AtQueryMatch> {
     // 引号形式 /(?:^|\s)@"([^"\n]*)$/
-    if let Some(captured) = quoted_form(text_before_cursor) {
+    if let Some(caps) = QUOTED_AT_RE.captures(text_before_cursor) {
+        let query = caps.get(1)?.as_str();
         return Some(AtQueryMatch {
-            start: text_before_cursor.len() - (captured.len() + 2),
-            query: captured.to_string(),
+            // 对齐 TS `textBeforeCursor.length - (quoted[1].length + 2)`,以 UTF-16 单位计。
+            start: utf16_len(text_before_cursor) - utf16_len(query) - 2,
+            query: query.to_string(),
             quoted: true,
         });
     }
-    // 普通形式 /(?:^|\s)@([^\s"]*)$/
-    if let Some(captured) = plain_form(text_before_cursor) {
+    // 普通形式 /(?:^|\s)@([^\s"]*)$/:正则匹配最左「空白/^ 后的 @」,query 可含后续 @。
+    if let Some(caps) = PLAIN_AT_RE.captures(text_before_cursor) {
+        let query = caps.get(1)?.as_str();
         return Some(AtQueryMatch {
-            start: text_before_cursor.len() - (captured.len() + 1),
-            query: captured.to_string(),
+            start: utf16_len(text_before_cursor) - utf16_len(query) - 1,
+            query: query.to_string(),
             quoted: false,
         });
     }
     None
-}
-
-fn quoted_form(text: &str) -> Option<&str> {
-    // 对齐 /(?:^|\s)@"([^"\n]*)$/:找最右的 `@"`,其前须是 ^ 或 \s,
-    // 之后到末尾不含 " 与换行(引号形式的内容可含空格)。
-    let bytes = text.as_bytes();
-    let mut at = None;
-    for idx in (0..text.len()).rev() {
-        if bytes[idx] == b'@' && bytes.get(idx + 1) == Some(&b'"') {
-            at = Some(idx);
-            break;
-        }
-    }
-    let at = at?;
-    // @ 前一个字符须为空白(或开头)
-    if at > 0 {
-        let prev = bytes[at - 1];
-        if !(prev == b' ' || prev == b'\t' || prev == b'\n' || prev == b'\r') {
-            return None;
-        }
-    }
-    let content = &text[at + 2..];
-    if content.contains('"') || content.contains('\n') {
-        return None;
-    }
-    Some(content)
-}
-
-fn plain_form(text: &str) -> Option<&str> {
-    // 末尾 @token(无空白/引号),@ 前须是空白或开头(对齐 (?:^|\s)@([^\s"]*)$)
-    let bytes = text.as_bytes();
-    let mut at = None;
-    for (idx, b) in bytes.iter().enumerate().rev() {
-        if *b == b'@' {
-            at = Some(idx);
-            break;
-        }
-        if *b == b' ' || *b == b'\t' || *b == b'\n' || *b == b'\r' || *b == b'"' {
-            break;
-        }
-    }
-    let at = at?;
-    // @ 前一个字符须为空白(或开头)
-    if at > 0 {
-        let prev = bytes[at - 1];
-        if !(prev == b' ' || prev == b'\t' || prev == b'\n' || prev == b'\r') {
-            return None;
-        }
-    }
-    Some(&text[at + 1..])
 }
 
 /// 对齐 `pathDepth`:`/` 出现次数。
@@ -126,13 +95,18 @@ pub fn build_entries_from_files(files: &[String]) -> Vec<FileIndexEntry> {
             idx = f[i + 1..].find('/').map(|j| i + 1 + j);
         }
     }
-    let mut entries: Vec<FileIndexEntry> =
-        dirs.into_iter().map(|path| FileIndexEntry { path, is_dir: true }).collect();
+    let mut entries: Vec<FileIndexEntry> = dirs
+        .into_iter()
+        .map(|path| FileIndexEntry { path, is_dir: true })
+        .collect();
     for f in files {
         if f.is_empty() {
             continue;
         }
-        entries.push(FileIndexEntry { path: f.clone(), is_dir: false });
+        entries.push(FileIndexEntry {
+            path: f.clone(),
+            is_dir: false,
+        });
     }
     entries.sort_by(|a, b| {
         path_depth(&a.path)
@@ -229,7 +203,7 @@ pub fn filter_file_entries(
     limit: usize,
 ) -> Vec<FileIndexEntry> {
     let lower_query = query.to_lowercase();
-    let limit = if limit == 0 { AT_RESULT_LIMIT } else { limit };
+    // 对齐 TS:limit 由调用方传入(默认 AT_RESULT_LIMIT 在调用点);显式 0 → 返回空。
     if lower_query.is_empty() {
         return entries.iter().take(limit).cloned().collect();
     }
@@ -250,7 +224,11 @@ pub fn filter_file_entries(
             .then_with(|| path_depth(&a.1.path).cmp(&path_depth(&b.1.path)))
             .then_with(|| locale_compare_default(&a.1.path, &b.1.path))
     });
-    scored.into_iter().take(limit).map(|(_, entry)| entry.clone()).collect()
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, entry)| entry.clone())
+        .collect()
 }
 
 /// 对齐 `AtInsertion`。
@@ -269,23 +247,46 @@ pub struct AtInsertion {
 /// 目录:保持菜单打开(`@dir/`);引号形式目录插入闭合形式(`@"my dir/"`),
 /// caret 放在闭合引号前。
 pub fn build_at_insert_text(entry_path: &str, is_dir: bool, force_quotes: bool) -> AtInsertion {
-    let p = if is_dir { format!("{entry_path}/") } else { entry_path.to_string() };
+    let p = if is_dir {
+        format!("{entry_path}/")
+    } else {
+        entry_path.to_string()
+    };
     let needs_quotes = force_quotes || p.contains(' ');
     if is_dir {
-        let text = if needs_quotes { format!("@\"{p}\"") } else { format!("@{p}") };
+        let text = if needs_quotes {
+            format!("@\"{p}\"")
+        } else {
+            format!("@{p}")
+        };
         return AtInsertion {
-            cursor_offset: if needs_quotes { text.len() - 1 } else { text.len() },
+            cursor_offset: if needs_quotes {
+                text.len() - 1
+            } else {
+                text.len()
+            },
             text,
         };
     }
-    let text = if needs_quotes { format!("@\"{p}\" ") } else { format!("@{p} ") };
+    let text = if needs_quotes {
+        format!("@\"{p}\" ")
+    } else {
+        format!("@{p} ")
+    };
     let cursor_offset = text.len();
-    AtInsertion { text, cursor_offset }
+    AtInsertion {
+        text,
+        cursor_offset,
+    }
 }
 
 /// 对齐 `buildAtMentionText`。闭合 `@mention`(文件浏览器 @ 按钮)。
 pub fn build_at_mention_text(entry_path: &str, is_dir: bool) -> String {
-    let p = if is_dir { format!("{entry_path}/") } else { entry_path.to_string() };
+    let p = if is_dir {
+        format!("{entry_path}/")
+    } else {
+        entry_path.to_string()
+    };
     if p.contains(' ') {
         format!("@\"{p}\" ")
     } else {
@@ -294,7 +295,11 @@ pub fn build_at_mention_text(entry_path: &str, is_dir: bool) -> String {
 }
 
 /// 对齐 `buildFileLineMentionText`。限定单行或行范围的闭合 `@mention`。
-pub fn build_file_line_mention_text(entry_path: &str, start_line: usize, end_line: usize) -> String {
+pub fn build_file_line_mention_text(
+    entry_path: &str,
+    start_line: usize,
+    end_line: usize,
+) -> String {
     // Math.max(1, Math.min(a, b)) / Math.max(1, Math.max(a, b))
     let first_line = start_line.min(end_line).max(1);
     let last_line = start_line.max(end_line).max(1);
@@ -325,46 +330,87 @@ mod tests {
     use super::*;
 
     fn entry(path: &str, is_dir: bool) -> FileIndexEntry {
-        FileIndexEntry { path: path.to_string(), is_dir }
+        FileIndexEntry {
+            path: path.to_string(),
+            is_dir,
+        }
     }
 
     #[test]
     fn extract_at_query_plain() {
         assert_eq!(
             extract_at_query("@"),
-            Some(AtQueryMatch { start: 0, query: String::new(), quoted: false })
+            Some(AtQueryMatch {
+                start: 0,
+                query: String::new(),
+                quoted: false
+            })
         );
         assert_eq!(
             extract_at_query("  @foo"),
-            Some(AtQueryMatch { start: 2, query: "foo".to_string(), quoted: false })
+            Some(AtQueryMatch {
+                start: 2,
+                query: "foo".to_string(),
+                quoted: false
+            })
         );
         assert_eq!(
             extract_at_query("hi @foo"),
-            Some(AtQueryMatch { start: 3, query: "foo".to_string(), quoted: false })
+            Some(AtQueryMatch {
+                start: 3,
+                query: "foo".to_string(),
+                quoted: false
+            })
         );
         assert_eq!(
             extract_at_query("\t@tab"),
-            Some(AtQueryMatch { start: 1, query: "tab".to_string(), quoted: false })
+            Some(AtQueryMatch {
+                start: 1,
+                query: "tab".to_string(),
+                quoted: false
+            })
         );
         assert_eq!(extract_at_query("a@b"), None);
         assert_eq!(extract_at_query("foo@bar.com"), None);
         assert_eq!(extract_at_query("@foo bar"), None);
+        // 回归:query 内可含 @。TS `(?:^|\s)@([^\s"]*)$` 锚定空白后的首个 @,
+        // 之后的 @ 属于 query。Rust 曾锚定最右 @ 而漏匹配。
+        assert_eq!(
+            extract_at_query(" @a@b"),
+            Some(AtQueryMatch {
+                start: 1,
+                query: "a@b".to_string(),
+                quoted: false
+            })
+        );
     }
 
     #[test]
     fn extract_at_query_quoted() {
         assert_eq!(
             extract_at_query("@\"my dir/"),
-            Some(AtQueryMatch { start: 0, query: "my dir/".to_string(), quoted: true })
+            Some(AtQueryMatch {
+                start: 0,
+                query: "my dir/".to_string(),
+                quoted: true
+            })
         );
         assert_eq!(
             extract_at_query("hi @\"a b"),
-            Some(AtQueryMatch { start: 3, query: "a b".to_string(), quoted: true })
+            Some(AtQueryMatch {
+                start: 3,
+                query: "a b".to_string(),
+                quoted: true
+            })
         );
         // 空查询的引号形式
         assert_eq!(
             extract_at_query("@\""),
-            Some(AtQueryMatch { start: 0, query: String::new(), quoted: true })
+            Some(AtQueryMatch {
+                start: 0,
+                query: String::new(),
+                quoted: true
+            })
         );
         // 引号形式要求 @" 后到末尾不含 "(已闭合 → null)
         assert_eq!(extract_at_query("@\"my dir/x\""), None);
@@ -385,11 +431,17 @@ mod tests {
         // src/components(1) 前("src/App.tsx" < "src/components")。
         assert_eq!(
             entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
-            vec!["README.md", "src", "src/App.tsx", "src/components", "src/components/Chat.tsx"]
+            vec![
+                "README.md",
+                "src",
+                "src/App.tsx",
+                "src/components",
+                "src/components/Chat.tsx"
+            ]
         );
         assert_eq!(entries[0].is_dir, false); // README.md 是文件
         assert_eq!(entries[1].is_dir, true); // src 是目录
-        // 空文件跳过
+                                             // 空文件跳过
         let entries = build_entries_from_files(&["".to_string()]);
         assert!(entries.is_empty());
     }
@@ -397,8 +449,12 @@ mod tests {
     #[test]
     fn filter_empty_query_returns_slice() {
         let entries = vec![entry("a.ts", false), entry("b.ts", false)];
-        assert_eq!(filter_file_entries(&entries, "", 1), vec![entry("a.ts", false)]);
-        assert_eq!(filter_file_entries(&entries, "", 0).len(), 2);
+        assert_eq!(
+            filter_file_entries(&entries, "", 1),
+            vec![entry("a.ts", false)]
+        );
+        // 对齐 TS:显式 limit=0 → 返回空(不再被重解释为 AT_RESULT_LIMIT)。
+        assert_eq!(filter_file_entries(&entries, "", 0).len(), 0);
     }
 
     #[test]
@@ -415,7 +471,11 @@ mod tests {
         assert!(out[1].path.starts_with("src/App."));
         assert_eq!(out[2].path, "app/main.ts");
         // "src/":含 "/" → 按完整路径匹配;src 目录自身不匹配 "src/"
-        let entries = vec![entry("src", true), entry("src/App.tsx", false), entry("src/App.css", false)];
+        let entries = vec![
+            entry("src", true),
+            entry("src/App.tsx", false),
+            entry("src/App.css", false),
+        ];
         let out = filter_file_entries(&entries, "src/", 20);
         assert!(!out.iter().any(|e| e.path == "src"));
         assert_eq!(out.len(), 2);
@@ -424,10 +484,7 @@ mod tests {
     #[test]
     fn filter_dir_bonus_and_subsequence() {
         // 目录 +10:src(前缀 80+10=90)排在 src/App.tsx(前缀 80)前
-        let entries = vec![
-            entry("src/App.tsx", false),
-            entry("src", true),
-        ];
+        let entries = vec![entry("src/App.tsx", false), entry("src", true)];
         let out = filter_file_entries(&entries, "src", 20);
         assert_eq!(out[0].path, "src");
         assert_eq!(out[0].is_dir, true);
@@ -439,14 +496,20 @@ mod tests {
 
     #[test]
     fn insert_text_variants() {
-        assert_eq!(build_at_insert_text("src/App.tsx", false, false), AtInsertion {
-            text: "@src/App.tsx ".to_string(),
-            cursor_offset: 13,
-        });
-        assert_eq!(build_at_insert_text("src", true, false), AtInsertion {
-            text: "@src/".to_string(),
-            cursor_offset: 5,
-        });
+        assert_eq!(
+            build_at_insert_text("src/App.tsx", false, false),
+            AtInsertion {
+                text: "@src/App.tsx ".to_string(),
+                cursor_offset: 13,
+            }
+        );
+        assert_eq!(
+            build_at_insert_text("src", true, false),
+            AtInsertion {
+                text: "@src/".to_string(),
+                cursor_offset: 5,
+            }
+        );
         // 含空格目录 → 引号形式,caret 在闭合引号前
         let ins = build_at_insert_text("my dir", true, false);
         assert_eq!(ins.text, "@\"my dir/\"");
@@ -464,10 +527,7 @@ mod tests {
             build_file_line_mention_text("a b.ts", 3, 3),
             "@\"a b.ts\":3 "
         );
-        assert_eq!(
-            build_file_line_mention_text("c.ts", 2, 5),
-            "@c.ts:2-5 "
-        );
+        assert_eq!(build_file_line_mention_text("c.ts", 2, 5), "@c.ts:2-5 ");
         // 行范围归一化(start>end 时交换)
         assert_eq!(build_file_line_mention_text("c.ts", 5, 2), "@c.ts:2-5 ");
         // 0 归一化为 1
@@ -482,21 +542,40 @@ mod tests {
     fn locale_compare_approximation() {
         // ICU en:大小写折叠优先,折叠相等时小写在前
         assert_eq!(locale_compare_default("a", "b"), std::cmp::Ordering::Less);
-        assert_eq!(locale_compare_default("A", "a"), std::cmp::Ordering::Greater);
-        assert_eq!(locale_compare_default("B", "a"), std::cmp::Ordering::Greater);
-        assert_eq!(locale_compare_default("a-b", "ab"), std::cmp::Ordering::Less);
-        assert_eq!(locale_compare_default("src/a", "src/b"), std::cmp::Ordering::Less);
+        assert_eq!(
+            locale_compare_default("A", "a"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            locale_compare_default("B", "a"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            locale_compare_default("a-b", "ab"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            locale_compare_default("src/a", "src/b"),
+            std::cmp::Ordering::Less
+        );
         assert_eq!(locale_compare_default("a", "a"), std::cmp::Ordering::Equal);
     }
 
     #[test]
     fn serde_shapes() {
-        let m = AtQueryMatch { start: 2, query: "foo".to_string(), quoted: false };
+        let m = AtQueryMatch {
+            start: 2,
+            query: "foo".to_string(),
+            quoted: false,
+        };
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["start"], 2);
         assert_eq!(json["quoted"], false);
 
-        let e = FileIndexEntry { path: "a/b".to_string(), is_dir: true };
+        let e = FileIndexEntry {
+            path: "a/b".to_string(),
+            is_dir: true,
+        };
         let json = serde_json::to_value(&e).unwrap();
         assert_eq!(json["path"], "a/b");
         assert_eq!(json["isDir"], true);

@@ -28,6 +28,9 @@ pub struct ApiKeyProviderListing {
     pub id: String,
     pub display_name: String,
     pub configured: bool,
+    /// 对齐 TS 条件展开 `...(configured && source ? { source } : {})`:
+    /// 仅当 configured 且 source 存在时序列化,否则整个字段省略(不输出 null)。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub model_count: u64,
     pub supports_oauth: bool,
@@ -65,7 +68,9 @@ fn dedupe_by_id(providers: &[ProviderListingInput]) -> Vec<&ProviderListingInput
 }
 
 /// 对齐 `buildApiKeyProviderList`。
-pub fn build_api_key_provider_list(providers: &[ProviderListingInput]) -> Vec<ApiKeyProviderListing> {
+pub fn build_api_key_provider_list(
+    providers: &[ProviderListingInput],
+) -> Vec<ApiKeyProviderListing> {
     dedupe_by_id(providers)
         .into_iter()
         .filter(|p| {
@@ -79,7 +84,11 @@ pub fn build_api_key_provider_list(providers: &[ProviderListingInput]) -> Vec<Ap
         .map(|p| {
             let configured = p.status.configured && p.credential_type.as_deref() != Some("oauth");
             ApiKeyProviderListing {
-                source: if configured { p.status.source.clone() } else { None },
+                source: if configured {
+                    p.status.source.clone()
+                } else {
+                    None
+                },
                 id: p.id.clone(),
                 display_name: p.name.clone(),
                 configured,
@@ -116,7 +125,10 @@ mod tests {
             has_api_key_login: api_key,
             has_oauth: oauth,
             oauth_name: None,
-            status: ProviderAuthStatus { configured: false, source: None },
+            status: ProviderAuthStatus {
+                configured: false,
+                source: None,
+            },
             credential_type: None,
             model_count: 3,
         }
@@ -131,7 +143,9 @@ mod tests {
         ];
         let list = build_api_key_provider_list(&providers);
         assert_eq!(list.len(), 2);
-        assert!(list.iter().all(|p| p.supports_oauth == (p.id == "anthropic")));
+        assert!(list
+            .iter()
+            .all(|p| p.supports_oauth == (p.id == "anthropic")));
     }
 
     #[test]

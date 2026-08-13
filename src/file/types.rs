@@ -128,8 +128,14 @@ mod tests {
 
     #[test]
     fn document_kind() {
-        assert_eq!(document_preview_kind("doc.pdf"), Some(DocumentPreviewKind::Pdf));
-        assert_eq!(document_preview_kind("doc.docx"), Some(DocumentPreviewKind::Docx));
+        assert_eq!(
+            document_preview_kind("doc.pdf"),
+            Some(DocumentPreviewKind::Pdf)
+        );
+        assert_eq!(
+            document_preview_kind("doc.docx"),
+            Some(DocumentPreviewKind::Docx)
+        );
         assert_eq!(document_preview_kind("doc.txt"), None);
     }
 }

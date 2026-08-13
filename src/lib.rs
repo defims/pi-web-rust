@@ -40,8 +40,14 @@
 //! | `lib/file-fuzzy.ts` | `file::fuzzy` | ✅ |
 //! | `lib/file-dirent.ts` | `fs::file_dirent` | ✅ |
 //! | `lib/provider-listing-runtime.ts` | `models::provider_listing_runtime` | ✅ |
-//! | (其余 lib/ 文件) | — | ❌ 待改写 |
+//! | `lib/app-update.ts` | `app_update` | ✅ |
+//! | `lib/paths.ts` | `paths` | ✅ |
+//! | `lib/project-tree.ts` | `project_tree` | ✅ |
+//! | `lib/api-types.ts` | — | 🟡 纯类型(shared 请求/响应形状,待 serde 结构定义) |
+//! | `lib/agent-event-stream.ts` | — | 🟡 SSE 绑定层,留给宿主(moho-mate chat_thread)接线 |
+//! | (其余客户端 lib/ 文件) | — | ❌ 浏览器状态/纯前端,不属后端移植范围 |
 
+pub mod app_update;
 pub mod auth;
 pub mod compaction;
 pub mod diff;
@@ -51,6 +57,8 @@ pub mod git;
 pub mod http;
 pub mod image;
 pub mod models;
+pub mod paths;
+pub mod project_tree;
 pub mod security;
 pub mod session;
 pub mod settings;
