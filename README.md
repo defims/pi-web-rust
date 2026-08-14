@@ -2,7 +2,7 @@
 >
 > - **Frontend**: byte-identical to upstream (kept in sync, React + Next.js UI)
 > - **Backend**: progressively rewritten from TypeScript (Next.js API routes + Node.js lib/) to **Rust**,
->   referencing [defims/pi_agent_rust](https://github.com/defims/pi_agent_rust) as the engine
+>   referencing [defims/picrab](https://github.com/defims/picrab) as the engine
 >   (aligned with the earendil-works/pi TS SDK)
 >
 > Alignment progress is tracked in [pi-web-rust-mapping.md](docs/pi-web-rust-mapping.md)

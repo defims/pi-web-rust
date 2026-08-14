@@ -1,17 +1,17 @@
-# defims/pi-web-rust ↔ agegr/pi-web 对齐
+# defims/picrab-web ↔ agegr/pi-web 对齐
 
 > **中文版** · English (default): [pi-web-rust-mapping.md](./pi-web-rust-mapping.md)
 >
-> `defims/pi-web-rust` 是 [agegr/pi-web](https://github.com/agegr/pi-web) 的 Rust 版本,
+> `defims/picrab-web` 是 [agegr/pi-web](https://github.com/agegr/pi-web) 的 Rust 版本,
 > 持续跟随上游。
 >
 > agegr/pi-web 是 pi 引擎的 Next.js Web UI(前端 + Node.js 后端)。
-> defims/pi-web-rust 的目标:**前端保持与上游一致**(经 sync 同步),
-> **后端逐步从 TypeScript 改写为 Rust**,引用 `defims/pi_agent_rust` 作为引擎。
+> defims/picrab-web 的目标:**前端保持与上游一致**(经 sync 同步),
+> **后端逐步从 TypeScript 改写为 Rust**,引用 `defims/picrab` 作为引擎。
 >
 > - **对齐基准**:agegr/pi-web 的前端(components/hooks/lib 客户端代码)+ 后端语义(lib/ Node-only 文件 + app/api/ 路由)
-> - **被对齐对象**:defims/pi-web-rust(前端 = 上游原版;后端 = 待 Rust 改写)
-> - **引擎依赖**:defims/pi_agent_rust(对齐 earendil-works/pi,见 [defims/pi_agent_rust](https://github.com/defims/pi_agent_rust) 仓库的 `docs/sdk-mapping.md`)
+> - **被对齐对象**:defims/picrab-web(前端 = 上游原版;后端 = 待 Rust 改写)
+> - **引擎依赖**:defims/picrab(对齐 earendil-works/pi,见 [defims/picrab](https://github.com/defims/picrab) 仓库的 `docs/sdk-mapping.md`)
 
 ## 核心规则
 
@@ -20,7 +20,7 @@
 
 ## 架构对比
 
-| | agegr/pi-web(TS 原版) | defims/pi-web-rust(Rust 版) |
+| | agegr/pi-web(TS 原版) | defims/picrab-web(Rust 版) |
 |---|---|---|
 | 前端 | Next.js + React(浏览器) | **相同**(sync 同步,逐字节一致) |
 | 后端 | Next.js API routes(Node.js) | **Rust crate**(引用 pi_agent_rust) |
@@ -138,8 +138,8 @@ agegr/pi-web 后端分三层,Rust 改写逐层推进:
 
 ### 层 3:引擎引用(lib/ 里 import @earendil-works/* 的部分)
 
-后端逻辑里调 TS SDK 的部分,改写为引用 `defims/pi_agent_rust`。
-对照 defims/pi_agent_rust 仓库 `docs/sdk-mapping.md` 的 TS SDK ↔ Rust 方法映射。
+后端逻辑里调 TS SDK 的部分,改写为引用 `defims/picrab`。
+对照 defims/picrab 仓库 `docs/sdk-mapping.md` 的 TS SDK ↔ Rust 方法映射。
 
 | TS SDK 调用 | Rust 等价(pi_agent_rust) |
 |---|---|
@@ -150,7 +150,7 @@ agegr/pi-web 后端分三层,Rust 改写逐层推进:
 | `inner.compact(instructions?)` | `handle.compact_with_instructions(...)` |
 | `SessionManager.open/create/listAll` | `pi::session::Session::open` / `SessionIndex::list_sessions` |
 | `ModelRuntime.create/getAuth` | `pi::models::ModelRegistry::load` / `pi::auth::AuthStorage` |
-| (完整对照见 defims/pi_agent_rust 的 docs/sdk-mapping.md) | |
+| (完整对照见 defims/picrab 的 docs/sdk-mapping.md) | |
 
 ---
 
@@ -187,7 +187,7 @@ git diff v0.8.7..v0.9.0 -- lib/ | grep "^[+-]" | grep -v "^[+-][+-][+-]"
 # 4. 检查 app/api/ 变更(影响路由 handler)
 git diff v0.8.7..v0.9.0 -- app/api/
 
-# 5. 检查 TS SDK 调用变更(影响引擎引用,见 defims/pi_agent_rust 的 docs/sdk-mapping.md)
+# 5. 检查 TS SDK 调用变更(影响引擎引用,见 defims/picrab 的 docs/sdk-mapping.md)
 git diff v0.8.7..v0.9.0 -- lib/rpc-manager.ts | grep "inner\.\|SessionManager\.\|createAgent"
 
 # 6. Rust 侧对应改写 + 测试
@@ -197,7 +197,7 @@ git push origin main
 
 ## 相关文件
 
-- 引擎对齐:defims/pi_agent_rust 的 `docs/sdk-mapping.md`(↔ earendil-works/pi)
+- 引擎对齐:defims/picrab 的 `docs/sdk-mapping.md`(↔ earendil-works/pi)
 - 消费方 moho-mate 的文档:前端审计 `docs/frontend-fork-audit.md`、后端语义审计 `docs/port-gaps-audit.md`(moho-mate 现有 Rust 实现的语义偏差)、探针笔记 `docs/agegr-probe-notes.md` / `docs/pi-sdk-probe-notes.md`
 - 前端同步脚本(消费方):moho-mate 的 `cargo xtask sync-pi-web [--dry-run] [--include-new]`
 - English version: [pi-web-rust-mapping.md](./pi-web-rust-mapping.md)

@@ -1,18 +1,18 @@
-# defims/pi-web-rust ↔ agegr/pi-web Alignment
+# defims/picrab-web ↔ agegr/pi-web Alignment
 
 > **English (default)** · 中文版: [pi-web-rust-mapping.zh-CN.md](./pi-web-rust-mapping.zh-CN.md)
 >
-> `defims/pi-web-rust` is the Rust version of [agegr/pi-web](https://github.com/agegr/pi-web),
+> `defims/picrab-web` is the Rust version of [agegr/pi-web](https://github.com/agegr/pi-web),
 > continuously tracking upstream.
 >
 > agegr/pi-web is the Next.js web UI for the pi engine (frontend + Node.js backend).
-> defims/pi-web-rust's goal: **keep the frontend identical to upstream** (synced via sync)
+> defims/picrab-web's goal: **keep the frontend identical to upstream** (synced via sync)
 > and **progressively rewrite the backend from TypeScript to Rust**, referencing
-> `defims/pi_agent_rust` as the engine.
+> `defims/picrab` as the engine.
 >
 > - **Alignment target**: agegr/pi-web's frontend (components/hooks/lib client code) + backend semantics (lib/ Node-only files + app/api/ routes)
-> - **Aligned object**: defims/pi-web-rust (frontend = upstream original; backend = Rust rewrite in progress)
-> - **Engine dependency**: defims/pi_agent_rust (aligned with earendil-works/pi; see `docs/sdk-mapping.md` in the [defims/pi_agent_rust](https://github.com/defims/pi_agent_rust) repo)
+> - **Aligned object**: defims/picrab-web (frontend = upstream original; backend = Rust rewrite in progress)
+> - **Engine dependency**: defims/picrab (aligned with earendil-works/pi; see `docs/sdk-mapping.md` in the [defims/picrab](https://github.com/defims/picrab) repo)
 
 ## Core rules
 
@@ -21,7 +21,7 @@
 
 ## Architecture comparison
 
-| | agegr/pi-web (TS original) | defims/pi-web-rust (Rust version) |
+| | agegr/pi-web (TS original) | defims/picrab-web (Rust version) |
 |---|---|---|
 | Frontend | Next.js + React (browser) | **same** (synced, byte-identical) |
 | Backend | Next.js API routes (Node.js) | **Rust crate** (referencing pi_agent_rust) |
@@ -142,8 +142,8 @@ The agegr/pi-web backend has three layers; the Rust rewrite advances layer by la
 
 ### Layer 3: engine references (the parts of lib/ importing @earendil-works/*)
 
-Parts of the server logic calling the TS SDK are rewritten to reference `defims/pi_agent_rust`.
-Cross-check the TS SDK ↔ Rust method mapping in `docs/sdk-mapping.md` of the defims/pi_agent_rust repo.
+Parts of the server logic calling the TS SDK are rewritten to reference `defims/picrab`.
+Cross-check the TS SDK ↔ Rust method mapping in `docs/sdk-mapping.md` of the defims/picrab repo.
 
 | TS SDK call | Rust equivalent (pi_agent_rust) |
 |---|---|
@@ -154,7 +154,7 @@ Cross-check the TS SDK ↔ Rust method mapping in `docs/sdk-mapping.md` of the d
 | `inner.compact(instructions?)` | `handle.compact_with_instructions(...)` |
 | `SessionManager.open/create/listAll` | `pi::session::Session::open` / `SessionIndex::list_sessions` |
 | `ModelRuntime.create/getAuth` | `pi::models::ModelRegistry::load` / `pi::auth::AuthStorage` |
-| (full mapping in defims/pi_agent_rust's docs/sdk-mapping.md) | |
+| (full mapping in defims/picrab's docs/sdk-mapping.md) | |
 
 ---
 
@@ -191,7 +191,7 @@ git diff v0.8.7..v0.9.0 -- lib/ | grep "^[+-]" | grep -v "^[+-][+-][+-]"
 # 4. inspect app/api/ changes (affect route handlers)
 git diff v0.8.7..v0.9.0 -- app/api/
 
-# 5. inspect TS SDK call changes (affect engine references; see defims/pi_agent_rust's docs/sdk-mapping.md)
+# 5. inspect TS SDK call changes (affect engine references; see defims/picrab's docs/sdk-mapping.md)
 git diff v0.8.7..v0.9.0 -- lib/rpc-manager.ts | grep "inner\.\|SessionManager\.\|createAgent"
 
 # 6. corresponding Rust rewrites + tests
@@ -201,7 +201,7 @@ git push origin main
 
 ## Related files
 
-- Engine alignment: `docs/sdk-mapping.md` in defims/pi_agent_rust (↔ earendil-works/pi)
+- Engine alignment: `docs/sdk-mapping.md` in defims/picrab (↔ earendil-works/pi)
 - Consumer moho-mate docs: frontend audit `docs/frontend-fork-audit.md`, backend semantics audit `docs/port-gaps-audit.md` (semantic deviations of moho-mate's existing Rust code), probe notes `docs/agegr-probe-notes.md` / `docs/pi-sdk-probe-notes.md`
 - Frontend sync script (consumer): moho-mate's `cargo xtask sync-pi-web [--dry-run] [--include-new]`
 - 中文版: [pi-web-rust-mapping.zh-CN.md](./pi-web-rust-mapping.zh-CN.md)
