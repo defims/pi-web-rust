@@ -1,17 +1,17 @@
 [package]
-name = "pi-web-rust"
+name = "picrab-web"
 version = "0.8.7"
 edition = "2021"
 license = "MIT"
-description = "Rust backend for pi-web (agegr/pi-web), referencing pi_agent_rust"
+description = "Rust backend for pi-web (agegr/pi-web), referencing picrab (lib pi)"
 
 [lib]
-name = "pi_web_rust"
+name = "picrab_web"
 path = "src/lib.rs"
 
 [dependencies]
 # pi 引擎(defims fork,对齐 earendil-works/pi TS SDK)
-pi_agent_rust = { path = "../picrab" }
+picrab = { path = "../picrab" }
 # 序列化(对齐上游 JSON 形状)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,4 +32,4 @@ libc = "0.2"
 # 仅测试用 async runtime
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 
-# pi-web-rust 作为 moho-mate 的 path dependency(与 pi-agent-rust 一致,无 [workspace])
+# picrab-web 作为 moho-mate 的 path dependency(与 picrab 一致,无 [workspace])
