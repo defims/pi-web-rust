@@ -1,11 +1,12 @@
-> **Fork 定位**:这是 [agegr/pi-web](https://github.com/agegr/pi-web) 的 **Rust 版本**,持续跟随上游。
+> **Fork positioning**: this is the **Rust version** of [agegr/pi-web](https://github.com/agegr/pi-web), continuously tracking upstream.
 >
-> - **前端**:与上游逐字节一致(经 sync 同步,React + Next.js UI)
-> - **后端**:逐步从 TypeScript(Next.js API routes + Node.js lib/)改写为 **Rust**,
->   引用 [defims/pi_agent_rust](https://github.com/defims/pi_agent_rust) 作为引擎
->   (对齐 earendil-works/pi TS SDK)
+> - **Frontend**: byte-identical to upstream (kept in sync, React + Next.js UI)
+> - **Backend**: progressively rewritten from TypeScript (Next.js API routes + Node.js lib/) to **Rust**,
+>   referencing [defims/pi_agent_rust](https://github.com/defims/pi_agent_rust) as the engine
+>   (aligned with the earendil-works/pi TS SDK)
 >
-> 对齐进度详见 [pi-web-rust-mapping.md](docs/pi-web-rust-mapping.md)。
+> Alignment progress is tracked in [pi-web-rust-mapping.md](docs/pi-web-rust-mapping.md)
+> (中文版: [pi-web-rust-mapping.zh-CN.md](docs/pi-web-rust-mapping.zh-CN.md)).
 
 ---
 
