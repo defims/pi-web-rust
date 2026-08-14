@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # pi 引擎(defims fork,对齐 earendil-works/pi TS SDK)
-pi_agent_rust = { path = "../pi-agent-rust" }
+pi_agent_rust = { path = "../picrab" }
 # 序列化(对齐上游 JSON 形状)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
