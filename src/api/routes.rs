@@ -60,9 +60,14 @@ pub(crate) fn resolve(req: &http::Request<Vec<u8>>) -> Option<Dispatch> {
     let args = query_to_args(query);
 
     match (method.as_str(), path.as_str()) {
-        // ── 首批(P1)──────────────────────────────────────────────────
+        // ── 首批(P1-P2)──────────────────────────────────────────────
         ("GET", "/api/home") => Some(Dispatch {
             command: "home",
+            args,
+            timeout_class: TimeoutClass::Default,
+        }),
+        ("GET", "/api/sessions") => Some(Dispatch {
+            command: "sessions_list",
             args,
             timeout_class: TimeoutClass::Default,
         }),

@@ -43,6 +43,13 @@ pub trait HostHooks: Send + Sync {
     fn extra_tools(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// 会话根目录覆盖(moho-mate 的 AppConfig.chat.session_dir 注入面;
+    /// None = crate 默认:PI_CODING_AGENT_DIR/sessions 或 ~/.pi/agent/sessions,
+    /// 对齐上游 getAgentDir)。
+    fn sessions_root(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// 空实现。
@@ -143,12 +150,16 @@ impl PiWebApi {
             }
         };
         let timeout = self.0.cfg.timeouts.for_class(dispatch.timeout_class);
+        let ctx = commands::ExecCtx {
+            rt: self.0.rt.clone(),
+            hooks: self.0.cfg.hooks.clone(),
+        };
 
         // 派发到运行时;panic 传播在 spawn 边界截获(P0 报告:panic 任务的
         // JoinHandle 会向 await 点传播 —— 派发任务自身不允许被命令 panic 波及)。
         let now = asupersync::time::wall_now();
         let fut = async move {
-            match asupersync::time::timeout(now, timeout, commands::execute(dispatch)).await {
+            match asupersync::time::timeout(now, timeout, commands::execute(ctx, dispatch)).await {
                 Ok(result) => result,
                 Err(_) => Err(ApiError::timeout()),
             }
@@ -345,5 +356,87 @@ mod tests {
         assert_eq!(routes::normalize_path(""), "/");
         assert_eq!(routes::normalize_path("/"), "/");
         assert_eq!(routes::normalize_path("/api/home"), "/api/home");
+    }
+
+    /// P2 golden 回放(sessions_list,形状模式):与 moho-mate 旧实现录制的
+    /// fixture(host 仓库 tests/fixtures/api-golden/)比对响应形状。
+    /// fixture 不存在时跳过(子模块独立 CI 场景)。
+    /// 易变字段(modified/messageCount/firstMessage)类型比对;会话集合按 id
+    /// 交集比对;fixture 键必须在新响应中齐全(新增键允许,如真实 worktree
+    /// 解析引入的 worktreeBranch —— 属口径变化清单项)。
+    #[test]
+    fn golden_replay_sessions_list_shape() {
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/api-golden/sessions_list.json"
+        );
+        let Ok(fixture_str) = std::fs::read_to_string(fixture_path) else {
+            eprintln!("skip: golden fixture not present");
+            return;
+        };
+        let fixture: serde_json::Value = serde_json::from_str(&fixture_str).expect("fixture json");
+
+        let (rx, responder) = collector();
+        let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
+        api.handle(get("/api/sessions"), responder);
+        let resp = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("responder called")
+            .expect("sessions_list ok");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).expect("json body");
+
+        // 顶层形状
+        assert!(fixture.get("sessions").is_some(), "fixture top shape");
+        assert!(body.get("sessions").is_some(), "response top shape");
+
+        let old = session_by_id(&fixture);
+        let new = session_by_id(&body);
+        let mut compared = 0usize;
+        for (id, old_entry) in &old {
+            let Some(new_entry) = new.get(id) else { continue };
+            compared += 1;
+            for (k, old_v) in old_entry.as_object().expect("entry object") {
+                let new_v = new_entry
+                    .get(k)
+                    .unwrap_or_else(|| panic!("fixture key {k} missing in new response"));
+                let volatile = matches!(k.as_str(), "modified" | "messageCount" | "firstMessage");
+                if volatile {
+                    assert_eq!(
+                        json_type(old_v),
+                        json_type(new_v),
+                        "volatile field {k} type drift"
+                    );
+                } else {
+                    assert_eq!(old_v, new_v, "stable field {k} drifted for {id}");
+                }
+            }
+        }
+        eprintln!("golden replay: {compared} sessions shape-compared");
+        assert!(compared > 0, "no overlapping sessions to compare");
+    }
+
+    fn session_by_id(v: &serde_json::Value) -> std::collections::HashMap<String, serde_json::Value> {
+        v["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .filter_map(|s| {
+                s.get("id")
+                    .and_then(|i| i.as_str())
+                    .map(|id| (id.to_string(), s.clone()))
+            })
+            .collect()
+    }
+
+    fn json_type(v: &serde_json::Value) -> &'static str {
+        match v {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
     }
 }
