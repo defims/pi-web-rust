@@ -9,6 +9,11 @@ description = "Rust backend for pi-web (agegr/pi-web), referencing picrab (lib p
 name = "picrab_web"
 path = "src/lib.rs"
 
+[features]
+# api:嵌入契约层(src/api/,docs/api-embed-plan.md 在宿主仓库)。
+# 默认关闭 —— 纯逻辑库形态不受影响;嵌入宿主(moho-mate)启用。
+api = ["dep:http", "dep:asupersync"]
+
 [dependencies]
 # pi 引擎(defims fork,对齐 earendil-works/pi TS SDK)
 picrab = { path = "../picrab" }
@@ -27,6 +32,11 @@ regex = "1"
 uuid = { version = "1", features = ["v4"] }
 # unix 常量(O_NOFOLLOW,对齐 lib/bash-output.ts 的 openRegularFileNoFollow)
 libc = "0.2"
+# ── api feature 专用 ──
+# 传输方言(http::Request/Response;与 wry/axum 同源)
+http = { version = "1", optional = true }
+# 引擎运行时(宿主注入 Arc<Runtime>;版本与 picrab 的 asupersync 统一)
+asupersync = { version = "0.3.9", default-features = false, optional = true }
 
 [dev-dependencies]
 # 仅测试用 async runtime

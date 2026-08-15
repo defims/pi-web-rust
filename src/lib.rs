@@ -65,3 +65,8 @@ pub mod settings;
 pub mod skills;
 pub mod tools;
 pub mod ui;
+
+/// 嵌入契约层(feature = "api",见宿主仓库 docs/api-embed-plan.md)。
+/// 纯逻辑层(lib/)之上的路由/命令/事件出口;默认关闭。
+#[cfg(feature = "api")]
+pub mod api;
