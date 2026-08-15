@@ -57,7 +57,17 @@ pub(crate) fn resolve(req: &http::Request<Vec<u8>>) -> Option<Dispatch> {
     let method = req.method();
     let path = normalize_path(req.uri().path());
     let query = req.uri().query().unwrap_or("");
-    let args = query_to_args(query);
+    let mut args = query_to_args(query);
+    // POST:JSON body 字段并入 args(body 优先 —— 上游 route.ts 从 body 读 POST 参数)
+    if method == "POST" {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(req.body()) {
+            if let Some(args_map) = args.as_object_mut() {
+                for (k, v) in map {
+                    args_map.insert(k, v);
+                }
+            }
+        }
+    }
 
     match (method.as_str(), path.as_str()) {
         // ── 首批(P1-P2)──────────────────────────────────────────────
@@ -68,6 +78,31 @@ pub(crate) fn resolve(req: &http::Request<Vec<u8>>) -> Option<Dispatch> {
         }),
         ("GET", "/api/sessions") => Some(Dispatch {
             command: "sessions_list",
+            args,
+            timeout_class: TimeoutClass::Default,
+        }),
+        ("GET", "/api/cwd/browse") => Some(Dispatch {
+            command: "cwd_browse",
+            args,
+            timeout_class: TimeoutClass::Default,
+        }),
+        ("POST", "/api/cwd/validate") => Some(Dispatch {
+            command: "cwd_validate",
+            args,
+            timeout_class: TimeoutClass::Default,
+        }),
+        ("POST", "/api/default-cwd") => Some(Dispatch {
+            command: "default_cwd",
+            args,
+            timeout_class: TimeoutClass::Default,
+        }),
+        ("GET", "/api/git/status") => Some(Dispatch {
+            command: "git_status",
+            args,
+            timeout_class: TimeoutClass::Default,
+        }),
+        ("GET", "/api/git/diff") => Some(Dispatch {
+            command: "git_diff",
             args,
             timeout_class: TimeoutClass::Default,
         }),
@@ -90,8 +125,8 @@ pub(crate) fn resolve(req: &http::Request<Vec<u8>>) -> Option<Dispatch> {
             args,
             timeout_class: TimeoutClass::Default,
         }),
-        // P2:sessions / models(+config/catalog/discover[Long] / test) /
-        // files(八态)/ git / cwd / file-index / home / project-trust
+        // P2 续:sessions_get/context(路径参数提取器)、file_index、files(八态)、
+        // models(+config/catalog/discover[Long]/test,trait 接线)
         _ => None,
     }
 }

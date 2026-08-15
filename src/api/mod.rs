@@ -439,4 +439,163 @@ mod tests {
             serde_json::Value::Object(_) => "object",
         }
     }
+
+    // ── P2 批次:cwd 三件 + git 两件 ────────────────────────────────────
+
+    /// HOME 环境隔离锁(与 moho-mate 测试的 HOME_LOCK 同模式:
+    /// 任何改 HOME 的测试必须先拿锁,避免并行污染)。
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct HomeGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn new(tmp: &std::path::Path) -> Self {
+            let guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let old = std::env::var_os("HOME");
+            std::env::set_var("HOME", tmp);
+            Self { _guard: guard, old }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(old) = self.old.take() {
+                std::env::set_var("HOME", old);
+            }
+            // 失效 lib 的 roots TTL 缓存:假 HOME 时代合成的 roots 不能
+            // 泄漏给后续(HOME_LOCK 已串行化,但缓存生命周期跨锁)。
+            crate::fs::file_access::invalidate_allowed_roots_cache();
+        }
+    }
+
+    fn post_json(path: &str, body: &str) -> http::Request<Vec<u8>> {
+        http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(body.as_bytes().to_vec())
+            .unwrap()
+    }
+
+    fn run(api: &PiWebApi, req: http::Request<Vec<u8>>) -> Result<http::Response<Vec<u8>>, ApiError> {
+        let (rx, responder) = collector();
+        api.handle(req, responder);
+        rx.recv_timeout(Duration::from_secs(15)).expect("responder called")
+    }
+
+    fn body_json(resp: &http::Response<Vec<u8>>) -> serde_json::Value {
+        serde_json::from_slice(resp.body()).expect("json body")
+    }
+
+    #[test]
+    fn cwd_browse_lists_dirs_sorted_excludes_files() {
+        let tmp = tempfile_dir();
+        std::fs::create_dir_all(tmp.path().join("Beta")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("alpha")).unwrap();
+        std::fs::write(tmp.path().join("zz-file.txt"), b"x").unwrap();
+
+        let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
+        let resp = run(&api, get(&format!("/api/cwd/browse?path={}", tmp.path().display())))
+            .expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v = body_json(&resp);
+        assert_eq!(v["path"], json!(tmp.path().canonicalize().unwrap().to_string_lossy().to_string()));
+        assert!(v["parentPath"].is_string());
+        let names: Vec<&str> =
+            v["directories"].as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap()).collect();
+        // 大小写不敏感排序;文件排除
+        assert_eq!(names, vec!["alpha", "Beta"]);
+    }
+
+    #[test]
+    fn cwd_browse_404_missing_400_file() {
+        let tmp = tempfile_dir();
+        let f = tmp.path().join("f.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
+        let e = run(&api, get("/api/cwd/browse?path=/definitely/not/here")).unwrap_err();
+        assert_eq!(e.status, 404);
+        let e = run(&api, get(&format!("/api/cwd/browse?path={}", f.display()))).unwrap_err();
+        assert_eq!(e.status, 400);
+    }
+
+    #[test]
+    fn cwd_validate_post_body_merge() {
+        let tmp = tempfile_dir();
+        let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
+        // POST body 路径(验证 body 并入 args)
+        let resp = run(
+            &api,
+            post_json("/api/cwd/validate", &format!(r#"{{"cwd":"{}"}}"#, tmp.path().display())),
+        )
+        .expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v = body_json(&resp);
+        assert_eq!(v["success"], json!(true));
+        assert_eq!(v["cwd"], json!(tmp.path().canonicalize().unwrap().to_string_lossy().to_string()));
+        // 空 → 400;缺失 → 404
+        let e = run(&api, post_json("/api/cwd/validate", r#"{"cwd":"  "}"#)).unwrap_err();
+        assert_eq!(e.status, 400);
+        let e = run(&api, post_json("/api/cwd/validate", r#"{"cwd":"/nope/xx"}"#)).unwrap_err();
+        assert_eq!(e.status, 404);
+    }
+
+    #[test]
+    fn default_cwd_creates_dated_dir_in_home() {
+        let tmp = tempfile_dir();
+        let _guard = HomeGuard::new(tmp.path());
+        let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
+        let resp = run(&api, post_json("/api/default-cwd", "{}")).expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v = body_json(&resp);
+        let cwd = v["cwd"].as_str().expect("cwd");
+        assert!(cwd.contains("pi-cwd-"), "dated dir: {cwd}");
+        assert!(std::path::Path::new(cwd).is_dir(), "dir created");
+    }
+
+    #[test]
+    fn git_status_on_this_repo_and_root_gate() {
+        // 自播种 roots:不依赖 ~/.pi 真实会话扫描(同进程的 lib 测试可能并发
+        // 动 HOME/roots 全局态,本测试的锁管不到它们 —— 播种后与机器状态解耦)
+        let repo = env!("CARGO_MANIFEST_DIR");
+        crate::fs::allowed_roots::allow_file_root(repo);
+        let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
+        let resp = run(&api, get(&format!("/api/git/status?cwd={repo}"))).expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v = body_json(&resp);
+        assert_eq!(v["isGitRepository"], json!(true));
+        assert!(v["files"].is_array());
+        assert!(v["additions"].is_number() && v["deletions"].is_number());
+        // 门禁:roots 之外 → 403;cwd 缺失 → 400
+        let e = run(&api, get("/api/git/status?cwd=/etc")).unwrap_err();
+        assert_eq!(e.status, 403);
+        let e = run(&api, get("/api/git/status")).unwrap_err();
+        assert_eq!(e.status, 400);
+    }
+
+    #[test]
+    fn git_diff_lib_real_implementation() {
+        let repo = env!("CARGO_MANIFEST_DIR");
+        crate::fs::allowed_roots::allow_file_root(repo);
+        let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
+        let resp = run(
+            &api,
+            get(&format!("/api/git/diff?cwd={repo}&path=Cargo.toml")),
+        )
+        .expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v = body_json(&resp);
+        // lib 真实现(旧 moho 返回 {"supported":false} 未实现 —— 口径变化清单项)
+        assert!(v.get("supported").is_some());
+        // path 缺失 → 400
+        let e = run(&api, get(&format!("/api/git/diff?cwd={repo}"))).unwrap_err();
+        assert_eq!(e.status, 400);
+    }
+
+    fn tempfile_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
 }

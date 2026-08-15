@@ -41,5 +41,7 @@ asupersync = { version = "0.3.9", default-features = false, optional = true }
 [dev-dependencies]
 # 仅测试用 async runtime
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+# 仅测试用临时目录(cwd/default-cwd 命令测试)
+tempfile = "3"
 
 # picrab-web 作为 moho-mate 的 path dependency(与 picrab 一致,无 [workspace])
