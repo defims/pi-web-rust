@@ -13,11 +13,16 @@
 //!   asupersync 运行时(`rt.handle().spawn`)
 //! - 已验证平台 = macOS(P0 报告;异步协议在 webkitgtk 未验证)
 
+/// HOME 环境切换的全局互斥锁(所有改 HOME 的测试必须先拿;读 HOME 的
+/// 测试同样拿锁避免并行漂移 —— 跨模块共享)。
+pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 mod commands;
 pub mod events;
 mod file_index;
 mod files;
 mod models;
+mod session_runtime;
 pub mod routes;
 mod sessions;
 
@@ -105,6 +110,8 @@ pub struct ApiConfig {
     pub sink: EventSink,
     pub hooks: Arc<dyn HostHooks>,
     pub timeouts: TimeoutConfig,
+    /// 会话注册表容量(默认 1;溢出 = 关旧建新)。
+    pub max_sessions: usize,
 }
 
 impl ApiConfig {
@@ -113,6 +120,7 @@ impl ApiConfig {
             sink,
             hooks: Arc::new(NoopHooks),
             timeouts: TimeoutConfig::default(),
+            max_sessions: 1,
         }
     }
 }
@@ -127,11 +135,13 @@ struct Inner {
     rt: Arc<Runtime>,
     cfg: ApiConfig,
     shutdown: AtomicBool,
+    sessions: Arc<session_runtime::SessionRuntime>,
 }
 
 impl PiWebApi {
     pub fn new(rt: Arc<Runtime>, cfg: ApiConfig) -> Self {
-        Self(Arc::new(Inner { rt, cfg, shutdown: AtomicBool::new(false) }))
+        let sessions = Arc::new(session_runtime::SessionRuntime::new(cfg.max_sessions));
+        Self(Arc::new(Inner { rt, cfg, shutdown: AtomicBool::new(false), sessions }))
     }
 
     /// 唯一请求入口。查表 + 派发到注入运行时;responder 恰好调用一次。
@@ -157,6 +167,7 @@ impl PiWebApi {
         let ctx = commands::ExecCtx {
             rt: self.0.rt.clone(),
             hooks: self.0.cfg.hooks.clone(),
+            sessions: self.0.sessions.clone(),
         };
 
         // 派发到运行时;panic 传播在 spawn 边界截获(P0 报告:panic 任务的
@@ -370,6 +381,8 @@ mod tests {
     /// 解析引入的 worktreeBranch —— 属口径变化清单项)。
     #[test]
     fn golden_replay_sessions_list_shape() {
+        // sessions 扫描读 HOME(经 default_sessions_root),与 HomeGuard 类测试互斥
+        let _home = super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../tests/fixtures/api-golden/sessions_list.json"
@@ -448,7 +461,7 @@ mod tests {
 
     /// HOME 环境隔离锁(与 moho-mate 测试的 HOME_LOCK 同模式:
     /// 任何改 HOME 的测试必须先拿锁,避免并行污染)。
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    
 
     struct HomeGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -457,7 +470,7 @@ mod tests {
 
     impl HomeGuard {
         fn new(tmp: &std::path::Path) -> Self {
-            let guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let old = std::env::var_os("HOME");
             std::env::set_var("HOME", tmp);
             Self { _guard: guard, old }

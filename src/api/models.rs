@@ -153,12 +153,10 @@ mod tests {
     use crate::api::{ApiConfig, EventSink, HostHooks, PiWebApi};
     use std::sync::Arc;
 
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct HomeGuard(std::sync::MutexGuard<'static, ()>, Option<std::ffi::OsString>);
     impl HomeGuard {
         fn new(tmp: &std::path::Path) -> Self {
-            let g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let old = std::env::var_os("HOME");
             std::env::set_var("HOME", tmp);
             Self(g, old)

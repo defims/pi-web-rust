@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [features]
 # api:嵌入契约层(src/api/,docs/api-embed-plan.md 在宿主仓库)。
 # 默认关闭 —— 纯逻辑库形态不受影响;嵌入宿主(moho-mate)启用。
-api = ["dep:http", "dep:asupersync"]
+api = ["dep:http", "dep:asupersync", "dep:tokio"]
 
 [dependencies]
 # pi 引擎(defims fork,对齐 earendil-works/pi TS SDK)
@@ -37,6 +37,9 @@ libc = "0.2"
 http = { version = "1", optional = true }
 # 引擎运行时(宿主注入 Arc<Runtime>;版本与 picrab 的 asupersync 统一)
 asupersync = { version = "0.3.9", default-features = false, optional = true }
+# 仅 sync 原语(oneshot/mpsc,运行时无关 —— chat_thread 已验证可在 asupersync
+# 任务内 await);不引入 tokio runtime(计划"无 tokio"指运行时,非原语)
+tokio = { version = "1", features = ["sync"], optional = true }
 
 [dev-dependencies]
 # 仅测试用 async runtime

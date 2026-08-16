@@ -58,6 +58,10 @@ impl TimeoutConfig {
 
 /// 路由表:(方法, 模式, 命令, 超时档)。模式段 `:name` 捕获路径参数入 args。
 const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
+    ("POST", "/api/agent/new", "agent_new", TimeoutClass::Default),
+    ("GET", "/api/agent/running", "agent_running", TimeoutClass::Default),
+    ("GET", "/api/agent/:id", "agent_get_state", TimeoutClass::Default),
+    ("POST", "/api/agent/:id", "agent_rpc", TimeoutClass::Default),
     ("GET", "/api/home", "home", TimeoutClass::Default),
     ("GET", "/api/sessions", "sessions_list", TimeoutClass::Default),
     ("GET", "/api/sessions/:id", "sessions_get", TimeoutClass::Default),

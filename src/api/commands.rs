@@ -20,6 +20,7 @@ use super::{ApiError, HostHooks};
 pub(crate) struct ExecCtx {
     pub rt: Arc<Runtime>,
     pub hooks: Arc<dyn HostHooks>,
+    pub sessions: Arc<super::session_runtime::SessionRuntime>,
 }/// 命令执行结果统一为 http::Response(传输方言直通;JSON/字节由命令自定)。
 pub(crate) async fn execute(
     ctx: ExecCtx,
@@ -46,6 +47,10 @@ pub(crate) async fn execute(
         "models_list" => super::models::models_list(&ctx, dispatch).await,
         "models_config_get" => super::models::models_config_get(&ctx).await,
         "models_config_put" => super::models::models_config_put(&ctx, dispatch).await,
+        "agent_new" => agent_new(&ctx, dispatch).await,
+        "agent_running" => agent_running(&ctx),
+        "agent_get_state" => agent_get_state(&ctx, dispatch),
+        "agent_rpc" => agent_rpc(&ctx, dispatch).await,
         #[cfg(test)]
         "test_sleep" => test_sleep(dispatch).await,
         #[cfg(test)]
@@ -295,4 +300,116 @@ async fn test_bytes() -> Result<http::Response<Vec<u8>>, ApiError> {
         .header(http::header::CONTENT_TYPE, "application/octet-stream")
         .body(vec![0u8, 1, 2, 250, 255])
         .expect("static response builder"))
+}
+
+// ── agent 面(P3:会话 runtime 接线) ─────────────────────────────────────
+
+/// POST /api/agent/new —— 建会话(溢出 = 关旧建新)。
+/// body: {cwd, provider?, modelId?, thinkingLevel?, toolNames?}
+async fn agent_new(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let cwd = str_arg(&dispatch, "cwd");
+    let cwd = if cwd.is_empty() {
+        crate::paths::home_dir()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string())
+    } else {
+        cwd
+    };
+    let provider = dispatch.args.get("provider").and_then(|v| v.as_str()).map(String::from);
+    let model = dispatch.args.get("modelId").and_then(|v| v.as_str()).map(String::from);
+    let thinking = dispatch.args.get("thinkingLevel").and_then(|v| v.as_str()).map(String::from);
+    let tools = dispatch.args.get("toolNames").and_then(|v| v.as_array()).map(|a| {
+        a.iter().filter_map(|t| t.as_str().map(String::from)).collect::<Vec<_>>()
+    });
+    let session_id = ctx
+        .sessions
+        .create(ctx, &cwd, provider, model, thinking, tools)
+        .await?;
+    json_response(json!({ "sessionId": session_id }))
+}
+
+/// GET /api/agent/running —— {runningSessionIds}(侧栏轮询面)。
+fn agent_running(ctx: &ExecCtx) -> Result<http::Response<Vec<u8>>, ApiError> {
+    json_response(json!({ "runningSessionIds": ctx.sessions.running_ids() }))
+}
+
+/// GET /api/agent/:id —— {running, state}(挂载恢复/对账切片)。
+fn agent_get_state(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let id = str_arg(&dispatch, "id");
+    let Some(h) = ctx.sessions.get(&id) else {
+        return Err(ApiError::not_found(format!("session not found: {id}")));
+    };
+    let snap = h.snap.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let running = snap.is_streaming || snap.is_prompt_running || snap.is_compacting;
+    json_response(json!({ "running": running, "state": snap.to_state_json() }))
+}
+
+/// POST /api/agent/:id —— 25-case RPC(body {type: ...})。
+/// 信封:{success:true,data} / 500 {error}(对齐上游 route.ts)。
+async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let id = str_arg(&dispatch, "id");
+    let Some(h) = ctx.sessions.get(&id) else {
+        return Err(ApiError::not_found(format!("session not found: {id}")));
+    };
+    let ty = dispatch
+        .args
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let message = dispatch.args.get("message").and_then(|v| v.as_str()).map(String::from);
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    use super::session_runtime::SessionCmd as C;
+    let cmd = match ty.as_str() {
+        "prompt" => C::Prompt { message: dispatch.args.clone(), reply: reply_tx },
+        "steer" => C::Steer { message: message.unwrap_or_default(), reply: reply_tx },
+        "follow_up" => C::FollowUp { message: message.unwrap_or_default(), reply: reply_tx },
+        "abort" => {
+            // abort 无回执语义(fire-and-forget;对齐上游 immediate {})
+            let _ = h.tx.try_send(C::Abort);
+            return json_response(json!({}));
+        }
+        "clear_queue" => C::ClearQueue { reply: reply_tx },
+        "set_model" => C::SetModel {
+            provider: str_arg(&dispatch, "provider"),
+            model: str_arg(&dispatch, "modelId"),
+            reply: reply_tx,
+        },
+        "set_thinking_level" => C::SetThinking {
+            level: str_arg(&dispatch, "level"),
+            reply: reply_tx,
+        },
+        "set_session_name" => C::SetSessionName {
+            name: str_arg(&dispatch, "name"),
+            reply: reply_tx,
+        },
+        "compact" | "abort_compaction" | "set_tools" | "fork" | "navigate_tree" | "reload"
+        | "extension_ui_response" | "extension_ui_input" | "get_tools" | "get_commands" => {
+            // P3-2:随完整 turn 循环接线(what 用 type 名便于诊断)
+            C::Deferred { what: "", reply: reply_tx }
+        }
+        "get_session_stats" => C::GetStats { reply: reply_tx },
+        "get_last_assistant_text" => C::GetLastText { reply: reply_tx },
+        other => {
+            return Err(ApiError::new(400, format!("unknown rpc type: {other}")));
+        }
+    };
+    h.tx
+        .send(cmd)
+        .await
+        .map_err(|_| ApiError::not_found(format!("session task gone: {id}")))?;
+    match reply_rx.await {
+        Ok(Ok(data)) => json_response(json!({ "success": true, "data": data })),
+        Ok(Err(e)) => {
+            let body = json!({ "error": e });
+            let body = serde_json::to_vec(&body).map_err(|e2| ApiError::internal(e2.to_string()))?;
+            Ok(http::Response::builder()
+                .status(500)
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .expect("static builder"))
+        }
+        Err(_) => Err(ApiError::not_found(format!("session task dropped reply: {id}"))),
+    }
 }
