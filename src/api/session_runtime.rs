@@ -45,6 +45,10 @@ pub(crate) enum SessionCmd {
     Reload { reply: oneshot::Sender<Result<Value, String>> },
     /// 重建 handle(ReBuild 到指定文件/None=全新);fork/reload 的内部机制。
     Rebuild { path: Option<std::path::PathBuf>, reply: oneshot::Sender<Result<Value, String>> },
+    /// bash 执行(spawn 子进程 + JSONL 落盘;运行期也允许 —— 不借 handle)
+    Bash { command: String, reply: oneshot::Sender<Result<Value, String>> },
+    /// abort bash(kill 子进程;运行期也允许)
+    AbortBash { reply: oneshot::Sender<Result<Value, String>> },
     /// set_tools / extension 面:P4 后接线,当前统一占位。
     Deferred { what: &'static str, reply: oneshot::Sender<Result<Value, String>> },
     GetStats { reply: oneshot::Sender<Result<Value, String>> },
@@ -69,6 +73,10 @@ pub(crate) struct SessionSnap {
     pub session_path: Option<std::path::PathBuf>,
     /// 会话 cwd(重建 handle 时保留;create 时注入)
     pub cwd: Option<String>,
+    /// bash 执行中(app 自有:子进程由本 runtime spawn)
+    pub is_bash_running: bool,
+    /// bash 子进程 pid(abort kill 用)
+    pub bash_child_pid: Option<u32>,
 }
 
 impl SessionSnap {
@@ -86,7 +94,7 @@ impl SessionSnap {
             "isStreaming": self.is_streaming,
             "isPromptRunning": self.is_prompt_running,
             "isCompacting": self.is_compacting,
-            "isBashRunning": false,
+            "isBashRunning": self.is_bash_running,
             "model": model,
             "queuedMessages": {
                 "steering": self.queued_steering.iter().cloned().collect::<Vec<_>>(),
@@ -395,6 +403,33 @@ async fn idle_cmd(
             let r = handle.set_session_name(&name).await.map(|_| json!({})).map_err(|e| format!("{e}"));
             let _ = reply.send(r);
         }
+        SessionCmd::Bash { command, reply } => {
+            // 定位会话文件:优先快照;缺失时按 id 扫描(root 经 hooks)。
+            // 不借 handle force save —— AgentCx 的 raw 指针不能跨 Send 任务
+            // await(save 场景)。已知缺口:全新未落盘会话(引擎 write-behind,
+            // 首个 mutation 前无文件)的 bash 输出不持久化;prompt 后引擎自动
+            // 落盘,该缺口仅影响"首条 bash 先于首条 prompt"的罕见序列。
+            {
+                let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                if s.session_path.is_none()
+                    && s.session_id.as_deref().is_some_and(|sid| !sid.is_empty())
+                {
+                    let root = hooks
+                        .sessions_root()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(super::commands::default_sessions_root_pub);
+                    let sid = s.session_id.clone().unwrap();
+                    if let Some(p) = super::sessions::find_session_file(&root, &sid) {
+                        s.session_path = Some(p);
+                    }
+                }
+            }
+            run_bash(command, snap.clone(), reply);
+        }
+        SessionCmd::AbortBash { reply } => {
+            abort_bash_kill(snap);
+            let _ = reply.send(Ok(json!({})));
+        }
         SessionCmd::NavigateTree { target_id, reply } => {
             // 移动引擎 current leaf(参考 chat_thread NavigateTree / rpc-manager)。
             // pi Session 锁需 Cx:空闲期无 run 持锁,可安全获取;navigate_to
@@ -582,6 +617,15 @@ fn handle_running_cmd(
         SessionCmd::GetLastText { reply } => {
             let t = snap.lock().unwrap_or_else(|e| e.into_inner()).last_assistant_text.clone();
             let _ = reply.send(Ok(json!(t)));
+        }
+        SessionCmd::Bash { command, reply } => {
+            // 运行期 Bash:不借 handle(prompt future 占用);无 ensure ——
+            // 文件未落盘时输出返回但不持久化(moho 运行期同语义)
+            run_bash(command, snap.clone(), reply);
+        }
+        SessionCmd::AbortBash { reply } => {
+            abort_bash_kill(snap);
+            let _ = reply.send(Ok(json!({})));
         }
         // 借 handle 的重命令运行期 busy(沿用 chat_thread 语义)
         SessionCmd::SetModel { reply, .. }
@@ -1052,3 +1096,308 @@ async fn rebuild_session(
     Ok(())
 }
 
+
+// ============================================================================
+// bash 执行(自 moho chat_thread::run_bash 移植;§1.1 #24)
+// ============================================================================
+
+/// 输出截断上限(对齐上游 BASH_OUTPUT_MAX_BYTES = 5MB)。
+const BASH_OUTPUT_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// 后台执行 `bash -c <command>`:spawn std child(pid 入快照供 abort kill),
+/// 独立线程 wait_with_output → 截断 → BashExecution JSONL 追加 → reply
+/// {output, exitCode, cancelled, truncated, fullOutputPath}。
+/// 不借 handle(线程只用 Arc 快照)—— 空闲/运行期均可调。
+fn run_bash(
+    command: String,
+    snap: Arc<Mutex<SessionSnap>>,
+    reply: oneshot::Sender<Result<Value, String>>,
+) {
+    let cwd = snap.lock().unwrap_or_else(|e| e.into_inner()).cwd.clone();
+    let session_id =
+        snap.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone().unwrap_or_default();
+    let session_path = snap.lock().unwrap_or_else(|e| e.into_inner()).session_path.clone();
+
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c").arg(&command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(c) = cwd.filter(|s| !s.is_empty()) {
+        cmd.current_dir(c);
+    }
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = reply.send(Err(e.to_string()));
+            return;
+        }
+    };
+    let pid = child.id();
+    {
+        let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+        s.is_bash_running = true;
+        s.bash_child_pid = Some(pid);
+    }
+    std::thread::spawn(move || {
+        // ExitStatus::signal 是 unix 扩展
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        let output = child.wait_with_output();
+        let (mut buf, exit_code, cancelled) = match output {
+            Ok(o) => {
+                let mut b = o.stdout;
+                if !o.stderr.is_empty() {
+                    b.extend_from_slice(&o.stderr);
+                }
+                // 被信号终止(status.code() None)→ cancelled;退出码取负信号值
+                let (code, cancelled) = match o.status.code() {
+                    Some(c) => (c, false),
+                    None => (o.status.signal().map(|s| -s).unwrap_or(-1), true),
+                };
+                (b, code, cancelled)
+            }
+            Err(_) => (Vec::new(), -1, true),
+        };
+        let truncated = buf.len() > BASH_OUTPUT_MAX_BYTES;
+        buf.truncate(BASH_OUTPUT_MAX_BYTES);
+        let out_str = String::from_utf8_lossy(&buf).to_string();
+        // 写 BashExecution 条目(文件级 append;§1.1 #24 persistBashOnlySession)
+        if !session_id.is_empty() {
+            if let Some(p) = session_path.as_ref() {
+                append_bash_execution(p, &command, &out_str, exit_code, cancelled, truncated);
+            }
+        }
+        // 回落快照
+        {
+            let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+            s.is_bash_running = false;
+            s.bash_child_pid = None;
+        }
+        let _ = reply.send(Ok(json!({
+            "output": out_str,
+            "exitCode": exit_code,
+            "cancelled": cancelled,
+            "truncated": truncated,
+            "fullOutputPath": Value::Null,
+        })));
+    });
+}
+
+/// kill bash 子进程(pid 从快照取;无在飞 bash 时 no-op)。
+fn abort_bash_kill(snap: &Arc<Mutex<SessionSnap>>) {
+    let pid = snap.lock().unwrap_or_else(|e| e.into_inner()).bash_child_pid.take();
+    if let Some(pid) = pid {
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).spawn();
+    }
+}
+
+/// 追加 BashExecution JSONL 条目(文件级;parentId = 文件内最后一条 entry 的 id)。
+fn append_bash_execution(
+    file_path: &std::path::Path,
+    command: &str,
+    output: &str,
+    exit_code: i32,
+    cancelled: bool,
+    truncated: bool,
+) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(file_path) else {
+        return;
+    };
+    // parentId = 当前叶(最后一条 entry 的 id;线性会话即文件尾)
+    let parent_id = {
+        let content = std::fs::read_to_string(file_path).unwrap_or_default();
+        content
+            .lines()
+            .rev()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find_map(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
+    };
+    let entry = json!({
+        "type": "message",
+        "id": uuid::Uuid::new_v4().to_string(),
+        "parentId": parent_id,
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "message": {
+            "role": "bashExecution",
+            "command": command,
+            "output": output,
+            "exitCode": exit_code,
+            "cancelled": cancelled,
+            "truncated": truncated,
+            "fullOutputPath": Value::Null,
+            "timestamp": chrono::Utc::now().timestamp_millis(),
+        },
+    });
+    let line = serde_json::to_string(&entry).unwrap_or_default();
+    let _ = writeln!(f, "{line}");
+}
+
+#[cfg(test)]
+mod bash_tests {
+    use crate::api::{ApiConfig, EventSink, HostHooks, PiWebApi};
+    use std::sync::Arc;
+
+    struct Hooks(std::path::PathBuf);
+    impl HostHooks for Hooks {
+        fn sessions_root(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.join("sessions"))
+        }
+    }
+
+    fn real_home() -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("bash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn api_for(tmp: &std::path::Path) -> PiWebApi {
+        let pi = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("models.json"),
+            r#"{"providers":{"probe":{"baseUrl":"https://probe.invalid","api":"openai-completions","apiKey":"k","models":[{"id":"p1"}]}}}}"#,
+        )
+        .unwrap();
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 2)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let mut cfg = ApiConfig::new(Arc::new(|_: crate::api::ApiEvent| {}) as EventSink);
+        cfg.hooks = Arc::new(Hooks(tmp.to_path_buf()));
+        PiWebApi::new(rt, cfg)
+    }
+
+    fn call(api: &PiWebApi, req: ::http::Request<Vec<u8>>) -> Result<::http::Response<Vec<u8>>, crate::api::ApiError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        api.handle(req, Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("responder called")
+    }
+
+    fn post(uri: &str, body: &str) -> ::http::Request<Vec<u8>> {
+        ::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(::http::header::CONTENT_TYPE, "application/json")
+            .body(body.as_bytes().to_vec())
+            .unwrap()
+    }
+
+    fn get(uri: &str) -> ::http::Request<Vec<u8>> {
+        ::http::Request::builder().method("GET").uri(uri).body(Vec::new()).unwrap()
+    }
+
+    fn body(resp: &::http::Response<Vec<u8>>) -> serde_json::Value {
+        serde_json::from_slice(resp.body()).expect("json")
+    }
+
+    #[test]
+    fn bash_rpc_executes_echo() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = real_home();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let api = api_for(&tmp);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create ok");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // bash echo → 输出 + exitCode 0
+        let resp = call(
+            &api,
+            post(&format!("/api/agent/{sid}"), r#"{"type":"bash","command":"echo hello-bash-spike"}"#),
+        )
+        .expect("bash ok");
+        assert_eq!(resp.status(), 200);
+        let v = body(&resp);
+        assert_eq!(v["success"], serde_json::json!(true));
+        let data = &v["data"];
+        assert!(
+            data["output"].as_str().is_some_and(|o| o.contains("hello-bash-spike")),
+            "output: {data}"
+        );
+        assert_eq!(data["exitCode"], serde_json::json!(0));
+        assert_eq!(data["cancelled"], serde_json::json!(false));
+        // 回落:get_state isBashRunning=false
+        let resp = call(&api, get(&format!("/api/agent/{sid}"))).expect("state ok");
+        assert_eq!(body(&resp)["state"]["isBashRunning"], serde_json::json!(false));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    #[test]
+    fn bash_abort_cancels_long_running() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = real_home();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let api = api_for(&tmp);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create ok");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // 长 bash:fire(responder 挂起) → 等 isBashRunning → abort → 收 cancelled
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        api.handle(
+            post(&format!("/api/agent/{sid}"), r#"{"type":"bash","command":"sleep 30"}"#),
+            Box::new(move |r| {
+                let _ = tx1.send(r);
+            }),
+        );
+        // 等 bash 起跑(spawn 后 is_bash_running=true)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let resp = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+            if body(&resp)["state"]["isBashRunning"] == serde_json::json!(true) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "bash never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // abort
+        let resp = call(
+            &api,
+            post(&format!("/api/agent/{sid}"), r#"{"type":"abort_bash"}"#),
+        )
+        .expect("abort ok");
+        assert_eq!(resp.status(), 200);
+        // bash 回执:kill 后 sleep 立即死 → cancelled:true(负信号码)
+        let resp = rx1.recv_timeout(std::time::Duration::from_secs(10)).expect("bash reply after kill");
+        let v = body(&resp.expect("bash ok"));
+        let data = &v["data"];
+        assert_eq!(data["cancelled"], serde_json::json!(true), "data: {data}");
+        assert!(data["exitCode"].as_i64().is_some_and(|c| c < 0), "signal exit: {data}");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+}

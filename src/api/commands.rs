@@ -446,12 +446,8 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
             reply: reply_tx,
         },
         "reload" => C::Reload { reply: reply_tx },
-        "bash" | "abort_bash" => {
-            // bash:moho 的 run_bash(JSONL 落盘/截断/kill 子进程)尚未移植到
-            // picrab-web —— 显式未接线(避免静默断裂误导);移植为待办
-            let what = ty.clone();
-            C::Deferred { what: Box::leak(what.into_boxed_str()), reply: reply_tx }
-        }
+        "bash" => C::Bash { command: str_arg(&dispatch, "command"), reply: reply_tx },
+        "abort_bash" => C::AbortBash { reply: reply_tx },
         "get_tools" | "get_commands" | "extension_ui_response" | "extension_ui_input" => {
             // 扩展面:随扩展接线补全
             C::Deferred { what: "", reply: reply_tx }
