@@ -41,6 +41,7 @@ pub(crate) async fn execute(
         "default_cwd" => default_cwd(&ctx).await,
         "git_status" => git_status(&ctx, dispatch).await,
         "git_diff" => git_diff(&ctx, dispatch).await,
+        "files" => super::files::files_command(&ctx, dispatch).await,
         #[cfg(test)]
         "test_sleep" => test_sleep(dispatch).await,
         #[cfg(test)]
@@ -176,7 +177,7 @@ async fn default_cwd(ctx: &ExecCtx) -> Result<http::Response<Vec<u8>>, ApiError>
 /// roots 门禁(git/files 类命令),对齐上游 getAllowedFileRoots:
 /// 全部会话的 cwd+projectRoot + ~/pi-cwd-* + 动态 additional。
 /// 会话扫描经 blocking(文件 IO);roots 合成有 lib 侧 TTL 缓存(上游同款 5s)。
-async fn gate_roots(ctx: &ExecCtx, cwd: &str) -> Result<(), ApiError> {
+pub(crate) async fn gate_roots(ctx: &ExecCtx, cwd: &str) -> Result<(), ApiError> {
     let root = ctx
         .hooks
         .sessions_root()

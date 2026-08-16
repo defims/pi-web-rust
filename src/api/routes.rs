@@ -25,6 +25,10 @@ pub struct Dispatch {
     pub command: &'static str,
     pub args: Value,
     pub timeout_class: TimeoutClass,
+    /// 原始请求体(upload multipart 等字节形态命令用)。
+    pub body: Vec<u8>,
+    /// 请求 Content-Type(multipart boundary 提取用)。
+    pub content_type: Option<String>,
 }
 
 /// 超时配置(经 ApiConfig 注入;测试可缩短)。
@@ -63,6 +67,9 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("POST", "/api/default-cwd", "default_cwd", TimeoutClass::Default),
     ("GET", "/api/git/status", "git_status", TimeoutClass::Default),
     ("GET", "/api/git/diff", "git_diff", TimeoutClass::Default),
+    // files 八态:GET(读侧)+ POST(上传);*path 通配捕获文件路径
+    ("GET", "/api/files/*path", "files", TimeoutClass::Default),
+    ("POST", "/api/files/*path", "files", TimeoutClass::Default),
 ];
 
 /// 路由解析:http 方言请求 → 派发描述;未命中 → None(调用方回 404)。
@@ -98,7 +105,18 @@ pub(crate) fn resolve(req: &http::Request<Vec<u8>>) -> Option<Dispatch> {
                     args_map.insert(k, v);
                 }
             }
-            return Some(Dispatch { command, args, timeout_class: *class });
+            let content_type = req
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            return Some(Dispatch {
+                command,
+                args,
+                timeout_class: *class,
+                body: req.body().clone(),
+                content_type,
+            });
         }
     }
     #[cfg(test)]
@@ -108,20 +126,35 @@ pub(crate) fn resolve(req: &http::Request<Vec<u8>>) -> Option<Dispatch> {
     None
 }
 
-/// 模式匹配:`:name` 段捕获(单段);字面段精确相等。命中返回参数表。
+/// 模式匹配:`:name` 捕获单段;`*name` 捕获剩余多段(逐段解码后以 / 重连,
+/// 保留路径内斜杠);字面段精确相等。命中返回参数表。
 fn match_pattern(pattern: &str, path: &str) -> Option<serde_json::Map<String, Value>> {
     let p_segs: Vec<&str> = pattern.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
-    if p_segs.len() != segs.len() {
-        return None;
-    }
     let mut params = serde_json::Map::new();
-    for (p, s) in p_segs.iter().zip(segs.iter()) {
+    let mut si = 0usize;
+    for (pi, p) in p_segs.iter().enumerate() {
+        if let Some(name) = p.strip_prefix('*') {
+            // 通配:剩余所有段(逐段解码,防 %2F 被误展开)
+            let rest: Vec<String> = segs[si..].iter().map(|s| url_decode(s)).collect();
+            if rest.is_empty() && pi != p_segs.len() - 1 {
+                return None;
+            }
+            params.insert(name.to_string(), Value::from(rest.join("/")));
+            return Some(params);
+        }
+        let Some(seg) = segs.get(si) else {
+            return None;
+        };
         if let Some(name) = p.strip_prefix(':') {
-            params.insert(name.to_string(), Value::from(url_decode(s)));
-        } else if p != s {
+            params.insert(name.to_string(), Value::from(url_decode(seg)));
+        } else if p != seg {
             return None;
         }
+        si += 1;
+    }
+    if si != segs.len() {
+        return None;
     }
     Some(params)
 }
@@ -135,7 +168,13 @@ fn resolve_test(method: &str, path: &str, args: Value) -> Option<Dispatch> {
     ];
     for (m, pat, command, class) in table {
         if method == *m && match_pattern(pat, path).is_some() {
-            return Some(Dispatch { command, args, timeout_class: *class });
+            return Some(Dispatch {
+                command,
+                args,
+                timeout_class: *class,
+                body: Vec::new(),
+                content_type: None,
+            });
         }
     }
     None
