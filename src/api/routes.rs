@@ -52,6 +52,19 @@ impl TimeoutConfig {
     }
 }
 
+/// 路由表:(方法, 模式, 命令, 超时档)。模式段 `:name` 捕获路径参数入 args。
+const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
+    ("GET", "/api/home", "home", TimeoutClass::Default),
+    ("GET", "/api/sessions", "sessions_list", TimeoutClass::Default),
+    ("GET", "/api/sessions/:id", "sessions_get", TimeoutClass::Default),
+    ("GET", "/api/sessions/:id/context", "sessions_context", TimeoutClass::Default),
+    ("GET", "/api/cwd/browse", "cwd_browse", TimeoutClass::Default),
+    ("POST", "/api/cwd/validate", "cwd_validate", TimeoutClass::Default),
+    ("POST", "/api/default-cwd", "default_cwd", TimeoutClass::Default),
+    ("GET", "/api/git/status", "git_status", TimeoutClass::Default),
+    ("GET", "/api/git/diff", "git_diff", TimeoutClass::Default),
+];
+
 /// 路由解析:http 方言请求 → 派发描述;未命中 → None(调用方回 404)。
 pub(crate) fn resolve(req: &http::Request<Vec<u8>>) -> Option<Dispatch> {
     let method = req.method();
@@ -69,66 +82,63 @@ pub(crate) fn resolve(req: &http::Request<Vec<u8>>) -> Option<Dispatch> {
         }
     }
 
-    match (method.as_str(), path.as_str()) {
-        // ── 首批(P1-P2)──────────────────────────────────────────────
-        ("GET", "/api/home") => Some(Dispatch {
-            command: "home",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        ("GET", "/api/sessions") => Some(Dispatch {
-            command: "sessions_list",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        ("GET", "/api/cwd/browse") => Some(Dispatch {
-            command: "cwd_browse",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        ("POST", "/api/cwd/validate") => Some(Dispatch {
-            command: "cwd_validate",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        ("POST", "/api/default-cwd") => Some(Dispatch {
-            command: "default_cwd",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        ("GET", "/api/git/status") => Some(Dispatch {
-            command: "git_status",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        ("GET", "/api/git/diff") => Some(Dispatch {
-            command: "git_diff",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        // ── 测试靶(P1 契约验证)──────────────────────────────────────
-        #[cfg(test)]
-        ("GET", "/api/test-sleep") => Some(Dispatch {
-            command: "test_sleep",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        #[cfg(test)]
-        ("GET", "/api/test-panic") => Some(Dispatch {
-            command: "test_panic",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        #[cfg(test)]
-        ("GET", "/api/test-bytes") => Some(Dispatch {
-            command: "test_bytes",
-            args,
-            timeout_class: TimeoutClass::Default,
-        }),
-        // P2 续:sessions_get/context(路径参数提取器)、file_index、files(八态)、
-        // models(+config/catalog/discover[Long]/test,trait 接线)
-        _ => None,
+    for (m, pattern, command, class) in ROUTES {
+        if method.as_str() != *m {
+            continue;
+        }
+        if let Some(params) = match_pattern(pattern, &path) {
+            // :id 保留字(前端契约:字面量 new/running 走专属路由,不作会话 id)
+            if let Some(id) = params.get("id") {
+                if id == "new" || id == "running" {
+                    return None;
+                }
+            }
+            if let (Some(args_map), Some(param_map)) = (args.as_object_mut(), Some(params)) {
+                for (k, v) in param_map {
+                    args_map.insert(k, v);
+                }
+            }
+            return Some(Dispatch { command, args, timeout_class: *class });
+        }
     }
+    #[cfg(test)]
+    if let Some(d) = resolve_test(method.as_str(), &path, args) {
+        return Some(d);
+    }
+    None
+}
+
+/// 模式匹配:`:name` 段捕获(单段);字面段精确相等。命中返回参数表。
+fn match_pattern(pattern: &str, path: &str) -> Option<serde_json::Map<String, Value>> {
+    let p_segs: Vec<&str> = pattern.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    if p_segs.len() != segs.len() {
+        return None;
+    }
+    let mut params = serde_json::Map::new();
+    for (p, s) in p_segs.iter().zip(segs.iter()) {
+        if let Some(name) = p.strip_prefix(':') {
+            params.insert(name.to_string(), Value::from(url_decode(s)));
+        } else if p != s {
+            return None;
+        }
+    }
+    Some(params)
+}
+
+#[cfg(test)]
+fn resolve_test(method: &str, path: &str, args: Value) -> Option<Dispatch> {
+    let table: &[(&str, &str, &str, TimeoutClass)] = &[
+        ("GET", "/api/test-sleep", "test_sleep", TimeoutClass::Default),
+        ("GET", "/api/test-panic", "test_panic", TimeoutClass::Default),
+        ("GET", "/api/test-bytes", "test_bytes", TimeoutClass::Default),
+    ];
+    for (m, pat, command, class) in table {
+        if method == *m && match_pattern(pat, path).is_some() {
+            return Some(Dispatch { command, args, timeout_class: *class });
+        }
+    }
+    None
 }
 
 /// 路径归一:去尾部斜杠(根除外);空路径视为根。

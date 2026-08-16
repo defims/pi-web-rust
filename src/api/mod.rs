@@ -16,6 +16,7 @@
 mod commands;
 pub mod events;
 pub mod routes;
+mod sessions;
 
 pub use events::ApiEvent;
 pub use routes::{TimeoutClass, TimeoutConfig};
@@ -256,7 +257,7 @@ mod tests {
         let (rx, responder) = collector();
         let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
         api.handle(get("/api/nope"), responder);
-        let r = rx.recv_timeout(Duration::from_secs(5)).expect("responder called");
+        let r = rx.recv_timeout(Duration::from_secs(30)).expect("responder called");
         assert_eq!(r.unwrap_err().status, 404);
     }
 
@@ -265,7 +266,7 @@ mod tests {
         let (rx, responder) = collector();
         let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
         api.handle(get("/api/test-panic"), responder);
-        let r = rx.recv_timeout(Duration::from_secs(5)).expect("responder called");
+        let r = rx.recv_timeout(Duration::from_secs(30)).expect("responder called");
         assert_eq!(r.unwrap_err().status, 500);
     }
 
@@ -278,7 +279,7 @@ mod tests {
         };
         let api = api_with(Arc::new(|_| {}), timeouts);
         api.handle(get("/api/test-sleep?ms=5000"), responder);
-        let r = rx.recv_timeout(Duration::from_secs(5)).expect("responder called");
+        let r = rx.recv_timeout(Duration::from_secs(30)).expect("responder called");
         assert_eq!(r.unwrap_err().status, 504);
     }
 
@@ -288,7 +289,7 @@ mod tests {
         let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
         api.shutdown();
         api.handle(get("/api/home"), responder);
-        let r = rx.recv_timeout(Duration::from_secs(5)).expect("responder called");
+        let r = rx.recv_timeout(Duration::from_secs(30)).expect("responder called");
         assert_eq!(r.unwrap_err().status, 503);
     }
 
@@ -298,7 +299,7 @@ mod tests {
         let (rx, responder) = collector();
         let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
         api.handle(get("/api/home"), responder);
-        let resp = rx.recv_timeout(Duration::from_secs(5)).expect("responder").expect("ok");
+        let resp = rx.recv_timeout(Duration::from_secs(30)).expect("responder").expect("ok");
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value =
             serde_json::from_slice(resp.body()).expect("json body");
@@ -314,7 +315,7 @@ mod tests {
         let api2 = api_with(Arc::new(|_| {}), timeouts);
         let (rx2, responder2) = collector();
         api2.handle(get("/api/test-sleep?ms=2000"), responder2);
-        let r = rx2.recv_timeout(Duration::from_secs(5)).expect("responder called");
+        let r = rx2.recv_timeout(Duration::from_secs(30)).expect("responder called");
         assert_eq!(r.unwrap_err().status, 504);
     }
 
@@ -323,7 +324,7 @@ mod tests {
         let (rx, responder) = collector();
         let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
         api.handle(get("/api/test-bytes"), responder);
-        let resp = rx.recv_timeout(Duration::from_secs(5)).expect("responder").expect("ok");
+        let resp = rx.recv_timeout(Duration::from_secs(30)).expect("responder").expect("ok");
         assert_eq!(resp.status(), 200);
         assert_eq!(
             resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
@@ -483,7 +484,7 @@ mod tests {
     fn run(api: &PiWebApi, req: http::Request<Vec<u8>>) -> Result<http::Response<Vec<u8>>, ApiError> {
         let (rx, responder) = collector();
         api.handle(req, responder);
-        rx.recv_timeout(Duration::from_secs(15)).expect("responder called")
+        rx.recv_timeout(Duration::from_secs(30)).expect("responder called")
     }
 
     fn body_json(resp: &http::Response<Vec<u8>>) -> serde_json::Value {

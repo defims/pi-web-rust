@@ -20,9 +20,7 @@ use super::{ApiError, HostHooks};
 pub(crate) struct ExecCtx {
     pub rt: Arc<Runtime>,
     pub hooks: Arc<dyn HostHooks>,
-}
-
-/// 命令执行结果统一为 http::Response(传输方言直通;JSON/字节由命令自定)。
+}/// 命令执行结果统一为 http::Response(传输方言直通;JSON/字节由命令自定)。
 pub(crate) async fn execute(
     ctx: ExecCtx,
     dispatch: Dispatch,
@@ -30,6 +28,14 @@ pub(crate) async fn execute(
     match dispatch.command {
         "home" => home().await,
         "sessions_list" => sessions_list(&ctx).await,
+        "sessions_get" => {
+            let v = super::sessions::get_command(&ctx, dispatch).await?;
+            json_response(v)
+        }
+        "sessions_context" => {
+            let v = super::sessions::context_command(&ctx, dispatch).await?;
+            json_response(v)
+        }
         "cwd_browse" => cwd_browse(dispatch).await,
         "cwd_validate" => cwd_validate(dispatch).await,
         "default_cwd" => default_cwd(&ctx).await,
@@ -79,6 +85,10 @@ async fn sessions_list(ctx: &ExecCtx) -> Result<http::Response<Vec<u8>>, ApiErro
 
 /// 会话根目录默认值(对齐上游 getAgentDir):PI_CODING_AGENT_DIR/sessions
 /// 或 ~/.pi/agent/sessions。宿主覆盖走 HostHooks::sessions_root。
+pub(crate) fn default_sessions_root_pub() -> String {
+    default_sessions_root()
+}
+
 fn default_sessions_root() -> String {
     if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
         let dir = dir.trim_end_matches('/');
@@ -235,7 +245,7 @@ fn str_arg(dispatch: &Dispatch, key: &str) -> String {
 
 /// 阻塞派发:把闭包丢到注入运行时的 blocking pool,异步侧 await 结果。
 /// asupersync 的 spawn_blocking 闭包无返回值(FnOnce()),经 futures oneshot 回收。
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     ctx: &ExecCtx,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, ApiError> {
