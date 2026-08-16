@@ -26,7 +26,7 @@
 | Frontend | Next.js + React (browser) | **same** (synced, byte-identical) |
 | Backend | Next.js API routes (Node.js) | **Rust crate** (referencing pi_agent_rust) |
 | Engine | @earendil-works/pi-coding-agent (TS SDK) | pi_agent_rust (Rust, aligned with the TS SDK) |
-| Transport | HTTP fetch + EventSource | TBD (axum server / Tauri IPC / other) |
+| Transport | HTTP fetch + EventSource | **in-process API layer (`api` feature, docs in consumer moho-mate's `docs/api-embed-plan.md`)** — `PiWebApi::handle(http::Request, Responder)` with host-injected asupersync runtime; host transports: wry async custom protocol (Wire B) + invoke forward bridge. SSE binding = event sink callbacks (no connection; frontend EventSource shim retains the wire shape). |
 | Session storage | SessionManager (TS) | pi_agent_rust Session (Rust) |
 | Model registry | ModelRuntime (TS) | pi_agent_rust ModelRegistry (Rust) |
 
@@ -76,17 +76,17 @@ The agegr/pi-web backend has three layers; the Rust rewrite advances layer by la
 
 | upstream route | method | core logic | Rust rewrite status |
 |---|---|---|---|
-| `/api/agent/[id]` | POST | rpc-manager command dispatch (25 cases) | ❌ to rewrite |
-| `/api/agent/[id]/events` | GET | SSE event stream | ❌ to rewrite |
-| `/api/agent/new` | POST | create session | ❌ to rewrite |
-| `/api/sessions` | GET | listAllSessions | ❌ to rewrite |
-| `/api/sessions/[id]` | GET/PATCH/DELETE | session CRUD | ❌ to rewrite |
-| `/api/sessions/[id]/context` | GET | buildSessionContext | ❌ to rewrite |
-| `/api/models` | GET | model list + scopes | ❌ to rewrite |
-| `/api/models-config` | GET/PUT | models.json read/write | ❌ to rewrite |
-| `/api/files/[...path]` | GET/POST | file read/write/upload | ❌ to rewrite |
-| `/api/git/status` `/api/git/diff` | GET | git operations | ❌ to rewrite |
-| `/api/cwd/browse` | GET | directory browsing | ❌ to rewrite |
+| `/api/agent/[id]` | POST | rpc-manager command dispatch (25 cases) | ✅ `src/api/session_runtime.rs` (prompt/steer/follow_up/abort/clear_queue/set_model/set_thinking_level/set_session_name/compact/set_tools/get_stats/get_last_text; fork/navigate_tree/reload/extension_* await host wiring) |
+| `/api/agent/[id]/events` | GET | SSE event stream | ✅ **event-sink binding** (`src/api/events.rs` ApiEvent; engine on_event → `to_client_event` wire filter → EventSink; synthesized prompt_done/prompt_error/agent_settled/queue_update/compaction_*) |
+| `/api/agent/new` | POST | create session | ✅ `src/api/session_runtime.rs` (capacity + close-old-open-new) |
+| `/api/sessions` | GET | listAllSessions | ✅ `src/api/commands.rs` (lib chain + runningSessionIds) |
+| `/api/sessions/[id]` | GET/PATCH/DELETE | session CRUD | ✅ get/context via `src/api/sessions.rs`; rename/delete via host proxy (route-level file ops, moho parity) |
+| `/api/sessions/[id]/context` | GET | buildSessionContext | ✅ `src/api/sessions.rs` (lib engine chain) |
+| `/api/models` | GET | model list + scopes | ✅ `src/api/models.rs` |
+| `/api/models-config` | GET/PUT | models.json read/write | ✅ `src/api/models.rs` (lib models_config_store) |
+| `/api/files/[...path]` | GET/POST | file read/write/upload | ✅ `src/api/files.rs` (eight states incl. multipart upload) |
+| `/api/git/status` `/api/git/diff` | GET | git operations | ✅ `src/api/commands.rs` (lib git::changes) |
+| `/api/cwd/browse` | GET | directory browsing | ✅ `src/api/commands.rs` (lib directory_browser) |
 | ... | | | (39 total; full list in the consumer moho-mate's `docs/port-gaps-audit.md`) |
 
 ### Layer 2: `lib/` server logic (28 Node-only .ts → Rust modules)
