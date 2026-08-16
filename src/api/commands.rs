@@ -559,27 +559,44 @@ fn catalog_cache_path() -> std::path::PathBuf {
     std::env::temp_dir().join("moho-mate-models-dev-catalog.json")
 }
 
-fn fetch_catalog_cached(hooks: &Arc<dyn HostHooks>) -> Result<Value, String> {
+/// 磁盘缓存命中(TTL 内)返回 payload;未命中返回 None。纯本地 IO,
+/// 可安全跑在共享 blocking 池线程上。
+fn catalog_from_cache() -> Option<Value> {
     let cache_path = catalog_cache_path();
-    if let Ok(meta) = std::fs::metadata(&cache_path) {
-        if let Ok(modified) = meta.modified() {
-            if modified
-                .elapsed()
-                .unwrap_or(std::time::Duration::from_secs(CATALOG_TTL_SECS))
-                < std::time::Duration::from_secs(CATALOG_TTL_SECS)
-            {
-                if let Ok(content) = std::fs::read_to_string(&cache_path) {
-                    if let Ok(v) = serde_json::from_str::<Value>(&content) {
-                        return Ok(v);
-                    }
-                }
-            }
-        }
+    let meta = std::fs::metadata(&cache_path).ok()?;
+    let modified = meta.modified().ok()?;
+    if modified
+        .elapsed()
+        .unwrap_or(std::time::Duration::from_secs(CATALOG_TTL_SECS))
+        >= std::time::Duration::from_secs(CATALOG_TTL_SECS)
+    {
+        return None;
     }
-    let text = hooks.fetch_text(CATALOG_URL)?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("catalog parse: {e}"))?;
-    let _ = std::fs::write(&cache_path, &text);
-    Ok(v)
+    let content = std::fs::read_to_string(&cache_path).ok()?;
+    serde_json::from_str::<Value>(&content).ok()
+}
+
+/// catalog 获取:缓存快路径 + 未命中时**专用线程**网络抓取。
+/// 网络经 HostHooks::fetch_text(阻塞,宿主侧 15s 超时)—— 不得占用共享
+/// blocking 池:池线程被数秒级网络等待独占时,sessions_list 等本地 IO
+/// 命令会在池上排队饿死(宿主过渡代理 2s 收包超时 → 侧栏 HTTP 500,
+/// 网络不可达机型上 100% 复现)。等待在 async 上下文(oneshot),池零占用。
+async fn fetch_catalog(hooks: Arc<dyn HostHooks>) -> Result<Value, String> {
+    if let Some(v) = catalog_from_cache() {
+        return Ok(v);
+    }
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let fetched = (|| {
+            let text = hooks.fetch_text(CATALOG_URL)?;
+            let v: Value =
+                serde_json::from_str(&text).map_err(|e| format!("catalog parse: {e}"))?;
+            let _ = std::fs::write(catalog_cache_path(), &text);
+            Ok(v)
+        })();
+        let _ = tx.send(fetched);
+    });
+    rx.await.map_err(|_| "catalog fetch thread crashed".to_string())?
 }
 
 /// ModelCatalogEntry → camelCase Value(lib 无 Serialize derive,手工转;
@@ -638,10 +655,7 @@ async fn models_config_catalog(
         .clamp(1, 100) as usize;
 
     let hooks = ctx.hooks.clone();
-    let payload = super::commands::blocking(ctx, move || fetch_catalog_cached(&hooks))
-        .await
-        .map_err(|e| ApiError::new(500, e.message))?
-        .map_err(|e| ApiError::new(502, e))?;
+    let payload = fetch_catalog(hooks).await.map_err(|e| ApiError::new(502, e))?;
     let entries = crate::models::catalog::flatten_models_dev_catalog(&payload);
     if entries.is_empty() {
         return Err(ApiError::new(502, "models.dev returned an empty catalog"));
