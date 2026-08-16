@@ -67,6 +67,7 @@ pub(crate) async fn execute(
         "agent_new" => agent_new(&ctx, dispatch).await,
         "agent_running" => agent_running(&ctx),
         "agent_get_state" => agent_get_state(&ctx, dispatch),
+        "agent_bash_output" => agent_bash_output(dispatch).await,
         "agent_rpc" => agent_rpc(&ctx, dispatch).await,
         #[cfg(test)]
         "test_sleep" => test_sleep(dispatch).await,
@@ -474,5 +475,40 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
                 .expect("static builder"))
         }
         Err(_) => Err(ApiError::not_found(format!("session task dropped reply: {id}"))),
+    }
+}
+
+/// GET /api/agent/:id/bash-output?path= —— bash 全量输出读取
+/// (lib fs::bash_output:O_NOFOLLOW + tempRoot 下 pi-bash-*.log 校验 +
+/// 限字节)。本 runtime 的 run_bash 内联返回输出(fullOutputPath:null,
+/// moho 同款)不写全量文件 —— 此端点为截断场景的防御性完备:
+/// 前端对截断输出请求此端点,无文件 → 404 优雅降级。
+async fn agent_bash_output(dispatch: Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let path = dispatch
+        .args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if path.is_empty() {
+        return Err(ApiError::new(400, "path is required"));
+    }
+    // temp root 校验(防目录穿越;lib resolve_bash_output_path)
+    let temp_root = std::env::temp_dir().to_string_lossy().into_owned();
+    let Some(resolved) = crate::fs::bash_output::resolve_bash_output_path(&path, &temp_root) else {
+        return Err(ApiError::new(400, "invalid bash output path"));
+    };
+    match crate::fs::bash_output::read_utf8_file_within_limit(&resolved, None).await {
+        Ok(crate::fs::bash_output::ReadResult::Content { content, .. }) => {
+            json_response(json!({ "output": content }))
+        }
+        Ok(crate::fs::bash_output::ReadResult::TooLarge { size }) => Err(ApiError::new(
+            413,
+            format!("bash output too large ({size} bytes); use download"),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(ApiError::not_found("bash output file not found"))
+        }
+        Err(e) => Err(ApiError::internal(format!("read bash output: {e}"))),
     }
 }

@@ -61,6 +61,7 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("POST", "/api/agent/new", "agent_new", TimeoutClass::Default),
     ("GET", "/api/agent/running", "agent_running", TimeoutClass::Default),
     ("GET", "/api/agent/:id", "agent_get_state", TimeoutClass::Default),
+    ("GET", "/api/agent/:id/bash-output", "agent_bash_output", TimeoutClass::Default),
     ("POST", "/api/agent/:id", "agent_rpc", TimeoutClass::Default),
     ("GET", "/api/home", "home", TimeoutClass::Default),
     ("GET", "/api/sessions", "sessions_list", TimeoutClass::Default),
