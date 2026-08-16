@@ -68,6 +68,9 @@ pub(crate) async fn execute(
         "agent_running" => agent_running(&ctx),
         "agent_get_state" => agent_get_state(&ctx, dispatch),
         "agent_bash_output" => agent_bash_output(dispatch).await,
+        "project_trust_get" => project_trust_get(dispatch).await,
+        "project_trust_set" => project_trust_set(dispatch).await,
+        "models_config_catalog" => models_config_catalog(&ctx, dispatch).await,
         "agent_rpc" => agent_rpc(&ctx, dispatch).await,
         #[cfg(test)]
         "test_sleep" => test_sleep(dispatch).await,
@@ -511,4 +514,144 @@ async fn agent_bash_output(dispatch: Dispatch) -> Result<http::Response<Vec<u8>>
         }
         Err(e) => Err(ApiError::internal(format!("read bash output: {e}"))),
     }
+}
+
+// ── project_trust + models catalog(P4 遗留面补全) ──────────────────────
+
+/// GET /api/project-trust?cwd= —— 恒信任 stub(lib security,引擎无扩展系统)。
+async fn project_trust_get(dispatch: Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let cwd = dispatch
+        .args
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if cwd.is_empty() {
+        return Err(ApiError::new(400, "cwd is required"));
+    }
+    let st = crate::security::project_trust::get_project_trust_status(&cwd, "");
+    json_response(json!({ "requiresTrust": st.requires_trust, "trusted": st.trusted }))
+}
+
+/// POST /api/project-trust?cwd= —— trust(stub 同上,无副作用)。
+async fn project_trust_set(dispatch: Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let cwd = dispatch
+        .args
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if cwd.is_empty() {
+        return Err(ApiError::new(400, "cwd is required"));
+    }
+    let st = crate::security::project_trust::trust_project(&cwd, "");
+    json_response(json!({ "requiresTrust": st.requires_trust, "trusted": st.trusted }))
+}
+
+/// catalog 缓存(1h TTL,文件级:temp/moho-mate-models-dev-catalog.json ——
+/// 与旧 moho handler 同路径同 TTL,两实现共享缓存)。
+const CATALOG_URL: &str = "https://models.dev/api.json";
+const CATALOG_TTL_SECS: u64 = 3600;
+
+fn catalog_cache_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("moho-mate-models-dev-catalog.json")
+}
+
+fn fetch_catalog_cached(hooks: &Arc<dyn HostHooks>) -> Result<Value, String> {
+    let cache_path = catalog_cache_path();
+    if let Ok(meta) = std::fs::metadata(&cache_path) {
+        if let Ok(modified) = meta.modified() {
+            if modified
+                .elapsed()
+                .unwrap_or(std::time::Duration::from_secs(CATALOG_TTL_SECS))
+                < std::time::Duration::from_secs(CATALOG_TTL_SECS)
+            {
+                if let Ok(content) = std::fs::read_to_string(&cache_path) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&content) {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
+    }
+    let text = hooks.fetch_text(CATALOG_URL)?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("catalog parse: {e}"))?;
+    let _ = std::fs::write(&cache_path, &text);
+    Ok(v)
+}
+
+/// ModelCatalogEntry → camelCase Value(lib 无 Serialize derive,手工转;
+/// 字段对齐旧 moho handler 的展平形状)。
+fn catalog_entry_value(e: &crate::models::catalog::ModelCatalogEntry) -> Value {
+    json!({
+        "key": e.key,
+        "providerId": e.provider_id,
+        "providerName": e.provider_name,
+        "providerBaseUrl": e.provider_base_url,
+        "id": e.id,
+        "name": e.name,
+        "reasoning": e.reasoning,
+        "input": e.input,
+        "contextWindow": e.context_window,
+        "maxTokens": e.max_tokens,
+        "cost": serde_json::to_value(&e.cost).unwrap_or(Value::Null),
+    })
+}
+
+/// GET /api/models-config/catalog?q=&provider=&limit=&baseUrl=
+/// (网络经 HostHooks::fetch_text;展平/搜索/推荐用 lib 纯函数)。
+async fn models_config_catalog(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let q: String = dispatch
+        .args
+        .get("q")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect();
+    let provider: String = dispatch
+        .args
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect();
+    let base_url: String = dispatch
+        .args
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(500)
+        .collect();
+    let limit = dispatch
+        .args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .clamp(1, 100) as usize;
+
+    let hooks = ctx.hooks.clone();
+    let payload = super::commands::blocking(ctx, move || fetch_catalog_cached(&hooks))
+        .await
+        .map_err(|e| ApiError::new(500, e.message))?
+        .map_err(|e| ApiError::new(502, e))?;
+    let entries = crate::models::catalog::flatten_models_dev_catalog(&payload);
+    if entries.is_empty() {
+        return Err(ApiError::new(502, "models.dev returned an empty catalog"));
+    }
+    let found = crate::models::catalog::search_model_catalog(&entries, &q, &provider, limit);
+    let recommendation =
+        crate::models::catalog::recommend_model_catalog_preset(&entries, &q, &provider, &base_url);
+    json_response(json!({
+        "models": found.iter().map(catalog_entry_value).collect::<Vec<_>>(),
+        "recommendation": serde_json::to_value(&recommendation).unwrap_or(Value::Null),
+        "source": CATALOG_URL,
+    }))
 }

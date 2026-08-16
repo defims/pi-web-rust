@@ -59,6 +59,12 @@ pub trait HostHooks: Send + Sync {
     fn sessions_root(&self) -> Option<std::path::PathBuf> {
         None
     }
+
+    /// 网络文本抓取(models.dev catalog 等;picrab-web 保持零 HTTP 客户端,
+    /// 宿主注入 reqwest/其他)。默认不支持 → 依赖它的命令返回 502。
+    fn fetch_text(&self, url: &str) -> Result<String, String> {
+        Err(format!("fetch not supported by this host: {url}"))
+    }
 }
 
 /// 空实现。
