@@ -91,7 +91,12 @@ async fn sessions_list(ctx: &ExecCtx) -> Result<http::Response<Vec<u8>>, ApiErro
         .iter()
         .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
         .collect();
-    json_response(json!({ "sessions": sessions }))
+    // runningSessionIds:前端 SessionSidebar 消费(列表 + running 轮询双处);
+    // P2 首版遗漏,calibration golden 对拍抓出 —— 与 agent_running 同源
+    json_response(json!({
+        "sessions": sessions,
+        "runningSessionIds": ctx.sessions.running_ids(),
+    }))
 }
 
 /// system prompt 构造(SetTools 非空列表时重建带工具描述的 prompt;
