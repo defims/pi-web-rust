@@ -420,14 +420,17 @@ pub fn build_session_context_from_json(
     defer_tool_result_images: bool,
 ) -> SessionContext {
     // 1. 反序列化为 pi::SessionEntry
+    // 注意:by_id 的下标必须对应 pi_entries(过滤坏行后的列表),而非原始
+    // entries —— 否则任何坏行都会让后续成功条目的下标错位,引擎沿 path
+    // 索引时越界 panic(实测:坏行 + 有效链 = index out of bounds)。
     let mut pi_entries: Vec<pi::session::SessionEntry> = Vec::with_capacity(entries.len());
     let mut entry_ids: Vec<String> = Vec::with_capacity(entries.len());
     let mut by_id: std::collections::HashMap<String, usize> = HashMap::new();
 
-    for (idx, raw) in entries.iter().enumerate() {
+    for raw in entries.iter() {
         if let Ok(entry) = serde_json::from_value::<pi::session::SessionEntry>(raw.clone()) {
             if let Some(id) = entry.base().id.as_ref() {
-                by_id.insert(id.clone(), idx);
+                by_id.insert(id.clone(), pi_entries.len());
                 entry_ids.push(id.clone());
             } else {
                 entry_ids.push(String::new());
