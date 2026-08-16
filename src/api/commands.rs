@@ -421,9 +421,17 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
                 .unwrap_or_default();
             C::SetTools { names, reply: reply_tx }
         }
-        "fork" | "navigate_tree" | "reload" | "get_tools" | "get_commands"
-        | "extension_ui_response" | "extension_ui_input" => {
-            // 会话重建/树导航/扩展面:P4 随宿主接线补全
+        "navigate_tree" => C::NavigateTree {
+            target_id: str_arg(&dispatch, "targetId"),
+            reply: reply_tx,
+        },
+        "fork" => C::Fork {
+            entry_id: dispatch.args.get("entryId").and_then(|v| v.as_str()).map(String::from),
+            reply: reply_tx,
+        },
+        "reload" => C::Reload { reply: reply_tx },
+        "get_tools" | "get_commands" | "extension_ui_response" | "extension_ui_input" => {
+            // 扩展面:随扩展接线补全
             C::Deferred { what: "", reply: reply_tx }
         }
         "get_session_stats" => C::GetStats { reply: reply_tx },

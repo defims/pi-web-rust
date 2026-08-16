@@ -37,8 +37,15 @@ pub(crate) enum SessionCmd {
     SetSessionName { name: String, reply: oneshot::Sender<Result<Value, String>> },
     Compact { reply: oneshot::Sender<Result<Value, String>> },
     SetTools { names: Vec<String>, reply: oneshot::Sender<Result<Value, String>> },
-    /// set_tools / fork / reload / navigate 等需要完整 turn 循环或重建的命令:
-    /// P3-2 接线,当前统一占位。
+    /// 树导航(移动引擎 current leaf;空闲期借 handle 实现)。
+    NavigateTree { target_id: String, reply: oneshot::Sender<Result<Value, String>> },
+    /// fork:创建分支会话文件 + 重建 handle 到新文件。
+    Fork { entry_id: Option<String>, reply: oneshot::Sender<Result<Value, String>> },
+    /// reload:保留会话文件重建 handle(上游 reload 语义)。
+    Reload { reply: oneshot::Sender<Result<Value, String>> },
+    /// 重建 handle(ReBuild 到指定文件/None=全新);fork/reload 的内部机制。
+    Rebuild { path: Option<std::path::PathBuf>, reply: oneshot::Sender<Result<Value, String>> },
+    /// set_tools / extension 面:P4 后接线,当前统一占位。
     Deferred { what: &'static str, reply: oneshot::Sender<Result<Value, String>> },
     GetStats { reply: oneshot::Sender<Result<Value, String>> },
     GetLastText { reply: oneshot::Sender<Result<Value, String>> },
@@ -58,6 +65,10 @@ pub(crate) struct SessionSnap {
     pub model_provider: Option<String>,
     pub model_id: Option<String>,
     pub thinking_level: Option<String>,
+    /// 会话文件路径(重建 fork/reload 用;首次落盘后回填或重建时显式传入)
+    pub session_path: Option<std::path::PathBuf>,
+    /// 会话 cwd(重建 handle 时保留;create 时注入)
+    pub cwd: Option<String>,
 }
 
 impl SessionSnap {
@@ -197,18 +208,22 @@ impl SessionRuntime {
             model_provider: eng_provider.or(provider),
             model_id: eng_model.or(model),
             thinking_level,
+            cwd: Some(cwd.to_string()),
             ..Default::default()
         }));
+        // 注:路径回填 —— 引擎 AgentSessionState 无 session_file 字段;fork/reload
+        // 重建时 session_path 显式传入(rebuild_session),首次落盘由引擎 save 触发
         let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dead_c = dead.clone();
         let snap_task = snap.clone();
         let rt = ctx.rt.clone();
         let sink = ctx.sink.clone();
+        let hooks = ctx.hooks.clone();
         let _joined = rt.handle().spawn(async move {
             // panic 纪律:mid-await panic 经 FutureExt::catch_unwind 截获(P0 报告:
             // panic 会向 await 点传播,监督任务不得被波及)
             let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                session_loop(handle, rx, snap_task, sink),
+                session_loop(handle, rx, snap_task, sink, rt.clone(), hooks),
             ))
             .await;
             if result.is_err() {
@@ -255,6 +270,8 @@ async fn session_loop(
     mut rx: mpsc::Receiver<SessionCmd>,
     snap: Arc<Mutex<SessionSnap>>,
     sink: super::EventSink,
+    rt: Arc<asupersync::runtime::Runtime>,
+    hooks: Arc<dyn super::HostHooks>,
 ) {
     let mut abort_handle: Option<AbortHandle> = None;
     loop {
@@ -270,7 +287,7 @@ async fn session_loop(
                         .await;
                 }
                 other => {
-                    idle_cmd(other, &mut handle, &snap, &sink).await;
+                    idle_cmd(other, &mut handle, &snap, &sink, &rt, &hooks).await;
                 }
             },
         }
@@ -316,9 +333,11 @@ type PinBoxPromptFut<'a> = std::pin::Pin<
 /// 空闲命令处理(非 prompt;借 handle 的命令在此正常执行)。
 async fn idle_cmd(
     cmd: SessionCmd,
-    handle: &mut AgentSessionHandle,
+    mut handle: &mut AgentSessionHandle,
     snap: &Arc<Mutex<SessionSnap>>,
     sink: &super::EventSink,
+    rt: &Arc<asupersync::runtime::Runtime>,
+    hooks: &Arc<dyn super::HostHooks>,
 ) {
     match cmd {
         SessionCmd::Steer { message, reply } => {
@@ -376,6 +395,73 @@ async fn idle_cmd(
             let r = handle.set_session_name(&name).await.map(|_| json!({})).map_err(|e| format!("{e}"));
             let _ = reply.send(r);
         }
+        SessionCmd::NavigateTree { target_id, reply } => {
+            // 移动引擎 current leaf(参考 chat_thread NavigateTree / rpc-manager)。
+            // pi Session 锁需 Cx:空闲期无 run 持锁,可安全获取;navigate_to
+            // 不存在返回 false → cancelled:true。
+            let cx = pi::agent_cx::AgentCx::for_current_or_request();
+            let ok = handle
+                .session_mut()
+                .session
+                .lock(cx.cx())
+                .await
+                .map(|mut g| g.navigate_to(&target_id))
+                .unwrap_or(false);
+            let _ = reply.send(Ok(json!({ "cancelled": !ok })));
+        }
+        SessionCmd::Fork { entry_id, reply } => {
+            // fork:创建分支文件(到 fork 点不含) + 重建 handle 到新文件。
+            // 文件手术复制自 moho session_scanner::fork_session(纯 JSONL 操作)。
+            let path = snap.lock().unwrap_or_else(|e| e.into_inner()).session_path.clone();
+            match path {
+                Some(source) => match fork_file(&source, entry_id.as_deref()) {
+                    Ok(new_path) => {
+                        let cwd = snap.lock().unwrap_or_else(|e| e.into_inner()).cwd.clone().unwrap_or_default();
+                        match rebuild_session(&mut handle, snap.clone(), Some(new_path.clone()), cwd, sink, rt, hooks).await {
+                            Ok(()) => {
+                                let new_id = new_path
+                                    .file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
+                                let _ = reply.send(Ok(json!({ "cancelled": false, "newSessionId": new_id })));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(format!("fork switch failed: {}", e.message)));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(format!("fork file failed: {e}")));
+                    }
+                },
+                None => {
+                    let _ = reply.send(Err("session has no file path (not persisted)".into()));
+                }
+            }
+        }
+        SessionCmd::Reload { reply } => {
+            // reload:保留会话文件重建(上游 reload 语义;扩展面清理在 P4 后)
+            let path = snap.lock().unwrap_or_else(|e| e.into_inner()).session_path.clone();
+            let cwd = snap.lock().unwrap_or_else(|e| e.into_inner()).cwd.clone().unwrap_or_default();
+            match rebuild_session(&mut handle, snap.clone(), path, cwd, sink, rt, hooks).await {
+                Ok(()) => {
+                    let _ = reply.send(Ok(json!({ "success": true })));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(format!("reload failed: {}", e.message)));
+                }
+            }
+        }
+        SessionCmd::Rebuild { path, reply } => {
+            // 显式路径重建(测试/宿主重试用)
+            let cwd = snap.lock().unwrap_or_else(|e| e.into_inner()).cwd.clone().unwrap_or_default();
+            match rebuild_session(&mut handle, snap.clone(), path, cwd, sink, rt, hooks).await {
+                Ok(()) => {
+                    let _ = reply.send(Ok(json!({ "success": true })));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(format!("rebuild failed: {}", e.message)));
+                }
+            }
+        }
         SessionCmd::Compact { reply } => {
             // compact:借 handle 的完整实现 + compaction_start/end 合成
             emit_agent(sink, json!({ "type": "compaction_start" }));
@@ -413,7 +499,8 @@ async fn idle_cmd(
             let _ = reply.send(Ok(json!({ "success": true })));
         }
         SessionCmd::Deferred { what, reply } => {
-            let _ = reply.send(Err(format!("{what}: full loop wiring pending")));
+            // 剩余:extension_ui_*/get_commands 等扩展面(随扩展接线)
+            let _ = reply.send(Err(format!("{what}: extension wiring pending")));
         }
         SessionCmd::GetStats { reply } => {
             let stats = handle.get_session_stats().await.unwrap_or_else(|_| json!({}));
@@ -502,6 +589,10 @@ fn handle_running_cmd(
         | SessionCmd::SetSessionName { reply, .. }
         | SessionCmd::Compact { reply }
         | SessionCmd::SetTools { reply, .. }
+        | SessionCmd::NavigateTree { reply, .. }
+        | SessionCmd::Fork { reply, .. }
+        | SessionCmd::Reload { reply }
+        | SessionCmd::Rebuild { reply, .. }
         | SessionCmd::Deferred { reply, .. }
         | SessionCmd::GetStats { reply }
         | SessionCmd::Prompt { reply, .. } => {
@@ -839,3 +930,125 @@ mod runtime_drop_tests {
         let _ = jh;
     }
 }
+
+// ============================================================================
+// fork / rebuild helpers(P4 遗留接线)
+// ============================================================================
+
+/// fork 文件手术(复制自 moho session_scanner::fork_session,纯 JSONL):
+/// 拷贝源到 entry_id(不含)之前的 entry,header 置 branchedFrom,
+/// 新文件同目录 uuid.jsonl。
+pub(crate) fn fork_file(source: &std::path::Path, entry_id: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let content = std::fs::read_to_string(source)
+        .map_err(|e| format!("cannot read source: {e}"))?;
+    let mut lines: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let Some(header) = lines.first().cloned() else {
+        return Err("empty source header".into());
+    };
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let parent_dir = source.parent().ok_or("source has no parent dir")?;
+    let new_path = parent_dir.join(format!("{new_id}.jsonl"));
+
+    // header:branchedFrom = 源文件路径
+    let mut new_header = header;
+    if let Some(obj) = new_header.as_object_mut() {
+        obj.insert("branchedFrom".to_string(), serde_json::json!(source.to_string_lossy()));
+    }
+
+    let mut out = Vec::new();
+    out.push(new_header);
+    // entry_id=None → 空分支(首条消息前 fork);Some → 拷贝到该 entry(不含)
+    if let Some(eid) = entry_id {
+        for v in lines.iter().skip(1) {
+            if v.get("id").and_then(|i| i.as_str()) == Some(eid) {
+                break;
+            }
+            out.push(v.clone());
+        }
+    }
+    let mut body = String::new();
+    for v in &out {
+        body.push_str(&serde_json::to_string(v).map_err(|e| format!("serialize: {e}"))?);
+        body.push('\n');
+    }
+    std::fs::write(&new_path, body).map_err(|e| format!("write fork: {e}"))?;
+    Ok(new_path)
+}
+
+/// 重建会话 handle(fork/reload 用):以既有文件打开新句柄,替换旧 handle。
+/// `path=None` 表示全新会话;Some 表示 open 该文件(header 从文件读)。
+async fn rebuild_session(
+    handle: &mut AgentSessionHandle,
+    snap: Arc<Mutex<SessionSnap>>,
+    path: Option<std::path::PathBuf>,
+    cwd: String,
+    sink: &super::EventSink,
+    rt: &Arc<asupersync::runtime::Runtime>,
+    hooks: &Arc<dyn super::HostHooks>,
+) -> Result<(), ApiError> {
+    let sink_c = sink.clone();
+    let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |ev: AgentEvent| {
+        let ev_value = serde_json::to_value(&ev).unwrap_or(serde_json::Value::Null);
+        if let Some(payload) = to_client_event(&ev_value) {
+            let sink = sink_c.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                sink(super::events::ApiEvent::Agent { payload });
+            }));
+        }
+    });
+    let path_c = path.clone();
+    let options = pi::sdk::SessionOptions {
+        system_prompt: hooks.system_prompt(),
+        no_session: false,
+        session_dir: Some(std::path::PathBuf::from(super::commands::default_sessions_root_pub())),
+        working_directory: Some(std::path::PathBuf::from(cwd)),
+        session_path: path_c,
+        on_event: Some(on_event),
+        ..Default::default()
+    };
+    let new_handle = super::commands::blocking(
+        &super::commands::ExecCtx {
+            rt: rt.clone(),
+            hooks: hooks.clone(),
+            sessions: Arc::new(SessionRuntime::new(1)),
+            sink: sink.clone(),
+        },
+        move || {
+            futures::executor::block_on(pi::sdk::create_agent_session(options))
+                .map_err(|e| ApiError::internal(format!("create_agent_session: {e}")))
+        },
+    )
+    .await??;
+
+    let new_state = new_handle.state().await.ok();
+    let (new_sid, eng_provider, eng_model) = new_state
+        .as_ref()
+        .map(|st| {
+            (
+                st.session_id.clone().unwrap_or_default(),
+                Some(st.provider.clone()),
+                Some(st.model_id.clone()),
+            )
+        })
+        .unwrap_or_default();
+    {
+        let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+        if !new_sid.is_empty() {
+            s.session_id = Some(new_sid);
+        }
+        if let Some(p) = &path {
+            s.session_path = Some(p.clone());
+        }
+        if let (Some(p), Some(m)) = (eng_provider, eng_model) {
+            s.model_provider = Some(p);
+            s.model_id = Some(m);
+        }
+    }
+    *handle = new_handle;
+    Ok(())
+}
+
