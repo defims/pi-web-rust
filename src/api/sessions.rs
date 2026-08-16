@@ -500,3 +500,281 @@ mod tests {
         assert_eq!(msgs.len(), 1);
     }
 }
+
+// ============================================================================
+// PATCH /api/sessions/:id — rename(追加 session_info entry,纯文件手术)
+// ============================================================================
+
+pub(crate) async fn rename_command(
+    ctx: &super::commands::ExecCtx,
+    dispatch: super::routes::Dispatch,
+) -> Result<Value, ApiError> {
+    use std::io::Write;
+    let id = dispatch
+        .args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return Err(ApiError::new(400, "id is required"));
+    }
+    let name = dispatch
+        .args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let root = session_root(ctx);
+    let path = find_session_file(&root, &id)
+        .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
+
+    super::commands::blocking(ctx, move || -> Result<(), ApiError> {
+        let first_line = read_first_line(&path)
+            .ok_or_else(|| ApiError::internal(format!("cannot read session header: {}", path.display())))?;
+        let header = parse_header(&first_line)
+            .ok_or_else(|| ApiError::internal(format!("invalid session header: {}", path.display())))?;
+        let entry_id = uuid::Uuid::new_v4().to_string();
+        let parent_id = header.leaf_id.clone().unwrap_or_else(|| header.id.clone());
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let entry = json!({
+            "type": "session_info",
+            "id": entry_id,
+            "parentId": parent_id,
+            "timestamp": timestamp,
+            "name": name,
+        });
+        let line = serde_json::to_string(&entry).map_err(|e| ApiError::internal(e.to_string()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(false)
+            .open(&path)
+            .map_err(|e| ApiError::internal(format!("open session append: {e}")))?;
+        file.write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| ApiError::internal(format!("append session_info: {e}")))?;
+        Ok(())
+    })
+    .await??;
+    Ok(json!({ "success": true }))
+}
+
+// ============================================================================
+// DELETE /api/sessions/:id — 删文件 + 重挂子会话 + 活跃会话重建
+// ============================================================================
+
+pub(crate) async fn delete_command(
+    ctx: &super::commands::ExecCtx,
+    dispatch: super::routes::Dispatch,
+) -> Result<Value, ApiError> {
+    let id = dispatch
+        .args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return Err(ApiError::new(400, "id is required"));
+    }
+    let root = session_root(ctx);
+    let path = find_session_file(&root, &id)
+        .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
+
+    // 文件手术(blocking):删文件 + 重挂直接子会话(branchedFrom 改指祖父)
+    let was_active = ctx.sessions.get(&id).is_some();
+    super::commands::blocking(ctx, move || -> Result<(), ApiError> {
+        // 1. 本文件 header 的父(branchedFrom)作为子会话的新祖父
+        let grandparent = read_first_line(&path)
+            .and_then(|l| parse_header(&l))
+            .and_then(|h| h.branched_from);
+        // 2. 重挂直接子会话(首行 branchedFrom == 本文件 → 改指祖父)
+        if let Some(dir) = path.parent() {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if p == path {
+                        continue;
+                    }
+                    if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    if let Some(line) = read_first_line(&p) {
+                        if let Some(h) = parse_header(&line) {
+                            if h.branched_from.as_deref() == Some(path.to_string_lossy().as_ref()) {
+                                // 重写首行 branchedFrom(若祖父存在)
+                                let mut v: serde_json::Value =
+                                    serde_json::from_str(&line).unwrap_or_default();
+                                if let Some(obj) = v.as_object_mut() {
+                                    match &grandparent {
+                                        Some(gp) => {
+                                            obj.insert(
+                                                "branchedFrom".to_string(),
+                                                serde_json::json!(gp),
+                                            );
+                                        }
+                                        None => {
+                                            obj.remove("branchedFrom");
+                                        }
+                                    }
+                                    let new_line =
+                                        serde_json::to_string(&v).map_err(|e| ApiError::internal(e.to_string()))?;
+                                    let content = std::fs::read_to_string(&p)
+                                        .map_err(|e| ApiError::internal(e.to_string()))?;
+                                    let rest = content
+                                        .lines()
+                                        .skip(1)
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    std::fs::write(
+                                        &p,
+                                        format!("{new_line}\n{}\n", rest.trim_end_matches('\n')),
+                                    )
+                                    .map_err(|e| ApiError::internal(format!("rewrite child: {e}")))?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 3. 删文件
+        std::fs::remove_file(&path).map_err(|e| ApiError::internal(format!("delete: {e}")))?;
+        Ok(())
+    })
+    .await??;
+
+    // 4. 删除的是活跃会话 → 重建全新会话(防引擎 autosave 复活已删文件)
+    if was_active {
+        let h = ctx.sessions.get(&id).expect("active session present");
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        h.tx
+            .send(super::session_runtime::SessionCmd::Rebuild {
+                path: None,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ApiError::internal("session task gone during delete"))?;
+        let _ = reply_rx
+            .await
+            .map_err(|_| ApiError::internal("delete rebuild reply dropped"))?;
+    }
+    Ok(json!({ "success": true }))
+}
+
+// ============================================================================
+// POST /api/sessions/:id/auto-name — 退化:首条 user 消息截断(~60 字符)
+// (上游调模型生成标题;无 API key 时不可行,与 moho 同款退化。usage:null)
+// ============================================================================
+
+pub(crate) async fn auto_name_command(
+    ctx: &super::commands::ExecCtx,
+    dispatch: super::routes::Dispatch,
+) -> Result<Value, ApiError> {
+    let id = dispatch
+        .args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return Err(ApiError::new(400, "id is required"));
+    }
+    let root = session_root(ctx);
+    let path = find_session_file(&root, &id)
+        .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
+
+    super::commands::blocking(ctx, move || -> Result<Value, ApiError> {
+        let entries = read_entries(&path);
+        let first_user_text = entries
+            .iter()
+            .find_map(|v| {
+                if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+                    return None;
+                }
+                let msg = v.get("message")?;
+                if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+                    return None;
+                }
+                msg.get("content").map(user_first_text)
+            })
+            .unwrap_or_default();
+        let title = if first_user_text.chars().count() > 60 {
+            first_user_text.chars().take(60).collect::<String>()
+        } else {
+            first_user_text
+        };
+        Ok(json!({ "title": title, "usage": Value::Null }))
+    })
+    .await?
+}
+
+// ============================================================================
+// GET /api/sessions/:id/entries/:entryId/thinking — 惰性加载 thinking 块
+// ============================================================================
+
+pub(crate) async fn thinking_command(
+    ctx: &super::commands::ExecCtx,
+    dispatch: super::routes::Dispatch,
+) -> Result<Value, ApiError> {
+    let id = dispatch
+        .args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let entry_id = dispatch
+        .args
+        .get("entryId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // blockIndex 缺失/非安全整数/负数 → 400(对齐 thinking/route.ts:10-12)
+    let block_index = match dispatch.args.get("blockIndex").and_then(|v| v.as_u64()) {
+        Some(b) => b,
+        None => return Err(ApiError::new(400, "Valid blockIndex is required")),
+    };
+    if id.is_empty() || entry_id.is_empty() {
+        return Err(ApiError::new(400, "id and entryId are required"));
+    }
+    let root = session_root(ctx);
+    let path = find_session_file(&root, &id)
+        .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
+
+    super::commands::blocking(ctx, move || -> Result<Value, ApiError> {
+        let entries = read_entries(&path);
+        let entry = entries
+            .into_iter()
+            .find(|v| v.get("id").and_then(|i| i.as_str()) == Some(entry_id.as_str()))
+            .ok_or_else(|| ApiError::not_found(format!("entry not found: {entry_id}")))?;
+        // 参考 thinking/route.ts:18-33:entry 必须是 assistant message
+        let msg = entry
+            .get("message")
+            .ok_or_else(|| ApiError::not_found("entry has no message".to_string()))?;
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            return Err(ApiError::not_found(format!("entry {entry_id} is not an assistant message")));
+        }
+        let content = msg
+            .get("content")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| ApiError::not_found("entry has no content array".to_string()))?;
+        // blockIndex 是 content 数组原始下标(客户端传 originalIndex);块非 thinking → 404
+        let block = content
+            .get(block_index as usize)
+            .ok_or_else(|| ApiError::not_found(format!("block {block_index} out of range in entry {entry_id}")))?;
+        if block.get("type").and_then(|t| t.as_str()) != Some("thinking") {
+            return Err(ApiError::not_found(format!("block {block_index} is not a thinking block")));
+        }
+        let thinking = block
+            .get("thinking")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(json!({ "thinking": thinking }))
+    })
+    .await?
+}

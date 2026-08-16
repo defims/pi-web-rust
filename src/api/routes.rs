@@ -65,6 +65,10 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("GET", "/api/home", "home", TimeoutClass::Default),
     ("GET", "/api/sessions", "sessions_list", TimeoutClass::Default),
     ("GET", "/api/sessions/:id", "sessions_get", TimeoutClass::Default),
+    ("PATCH", "/api/sessions/:id", "sessions_rename", TimeoutClass::Default),
+    ("DELETE", "/api/sessions/:id", "sessions_delete", TimeoutClass::Default),
+    ("POST", "/api/sessions/:id/auto-name", "sessions_auto_name", TimeoutClass::Default),
+    ("GET", "/api/sessions/:id/entries/:entryId/thinking", "sessions_thinking", TimeoutClass::Default),
     ("GET", "/api/sessions/:id/context", "sessions_context", TimeoutClass::Default),
     ("GET", "/api/cwd/browse", "cwd_browse", TimeoutClass::Default),
     ("POST", "/api/cwd/validate", "cwd_validate", TimeoutClass::Default),
@@ -165,6 +169,11 @@ fn match_pattern(pattern: &str, path: &str) -> Option<serde_json::Map<String, Va
         return None;
     }
     Some(params)
+}
+
+/// 供宿主/测试判定 URI 是否命中路由(api_proxy 一致性测试防路由漂移)。
+pub fn is_routed(req: &http::Request<Vec<u8>>) -> bool {
+    resolve(req).is_some()
 }
 
 #[cfg(test)]
