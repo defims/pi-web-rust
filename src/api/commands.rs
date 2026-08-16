@@ -43,6 +43,9 @@ pub(crate) async fn execute(
         "git_diff" => git_diff(&ctx, dispatch).await,
         "files" => super::files::files_command(&ctx, dispatch).await,
         "file_index" => super::file_index::file_index_command(&ctx, dispatch).await,
+        "models_list" => super::models::models_list(&ctx, dispatch).await,
+        "models_config_get" => super::models::models_config_get(&ctx).await,
+        "models_config_put" => super::models::models_config_put(&ctx, dispatch).await,
         #[cfg(test)]
         "test_sleep" => test_sleep(dispatch).await,
         #[cfg(test)]
