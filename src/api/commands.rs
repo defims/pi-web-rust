@@ -94,6 +94,13 @@ async fn sessions_list(ctx: &ExecCtx) -> Result<http::Response<Vec<u8>>, ApiErro
     json_response(json!({ "sessions": sessions }))
 }
 
+/// system prompt 构造(SetTools 非空列表时重建带工具描述的 prompt;
+/// 宿主经 HostHooks::system_prompt 定制,会话参数留位)。
+pub(crate) fn system_prompt_pub(_session_id: Option<&str>) -> String {
+    // 默认空 —— 宿主(P4)moho 经 HostHooks::system_prompt 注入 skills prompt
+    String::new()
+}
+
 /// 会话根目录默认值(对齐上游 getAgentDir):PI_CODING_AGENT_DIR/sessions
 /// 或 ~/.pi/agent/sessions。宿主覆盖走 HostHooks::sessions_root。
 pub(crate) fn default_sessions_root_pub() -> String {
@@ -393,9 +400,25 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
             name: str_arg(&dispatch, "name"),
             reply: reply_tx,
         },
-        "compact" | "abort_compaction" | "set_tools" | "fork" | "navigate_tree" | "reload"
-        | "extension_ui_response" | "extension_ui_input" | "get_tools" | "get_commands" => {
-            // P3-2:随完整 turn 循环接线(what 用 type 名便于诊断)
+        "compact" => C::Compact { reply: reply_tx },
+        "abort_compaction" => {
+            // 空闲无压缩可 abort;运行期 compact 阻塞在 idle(引擎 compact 同步
+            // 完成) —— 无 in-flight 压缩,no-op 对齐上游
+            let _ = reply_tx.send(Ok(json!({})));
+            return json_response(json!({ "success": true, "data": {} }));
+        }
+        "set_tools" => {
+            let names = dispatch
+                .args
+                .get("toolNames")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            C::SetTools { names, reply: reply_tx }
+        }
+        "fork" | "navigate_tree" | "reload" | "get_tools" | "get_commands"
+        | "extension_ui_response" | "extension_ui_input" => {
+            // 会话重建/树导航/扩展面:P4 随宿主接线补全
             C::Deferred { what: "", reply: reply_tx }
         }
         "get_session_stats" => C::GetStats { reply: reply_tx },

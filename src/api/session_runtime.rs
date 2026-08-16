@@ -36,6 +36,7 @@ pub(crate) enum SessionCmd {
     SetThinking { level: String, reply: oneshot::Sender<Result<Value, String>> },
     SetSessionName { name: String, reply: oneshot::Sender<Result<Value, String>> },
     Compact { reply: oneshot::Sender<Result<Value, String>> },
+    SetTools { names: Vec<String>, reply: oneshot::Sender<Result<Value, String>> },
     /// set_tools / fork / reload / navigate 等需要完整 turn 循环或重建的命令:
     /// P3-2 接线,当前统一占位。
     Deferred { what: &'static str, reply: oneshot::Sender<Result<Value, String>> },
@@ -376,9 +377,40 @@ async fn idle_cmd(
             let _ = reply.send(r);
         }
         SessionCmd::Compact { reply } => {
-            // compact:借 handle 的完整实现(含 compaction_start/end 合成)在
-            // P3-2 补;当前占位(避免错误语义)
-            let _ = reply.send(Err("compact: full loop wiring pending".into()));
+            // compact:借 handle 的完整实现 + compaction_start/end 合成
+            emit_agent(sink, json!({ "type": "compaction_start" }));
+            {
+                let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                s.is_compacting = true;
+            }
+            let r = handle
+                .compact(|_| {}) // 事件经 session 级 on_event 透传(避免双发)
+                .await
+                .map(|_| json!({ "result": "ok" }))
+                .map_err(|e| format!("{e}"));
+            {
+                let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                s.is_compacting = false;
+            }
+            let reason = if r.is_ok() { "manual" } else { "error" };
+            emit_agent(sink, json!({ "type": "compaction_end", "reason": reason }));
+            let _ = reply.send(r);
+        }
+        SessionCmd::SetTools { names, reply } => {
+            // pi 无 set_active_tools_by_name → set_system_prompt 近似
+            // (对齐 rpc-manager set_tools 与 moho chat_thread 同款手段);
+            // 空列表 → 清空 prompt(禁用工具)
+            if names.is_empty() {
+                handle.session_mut().agent.set_system_prompt(None);
+            } else {
+                handle
+                    .session_mut()
+                    .agent
+                    .set_system_prompt(Some(super::commands::system_prompt_pub(
+                        snap.lock().unwrap_or_else(|e| e.into_inner()).session_id.as_deref(),
+                    )));
+            }
+            let _ = reply.send(Ok(json!({ "success": true })));
         }
         SessionCmd::Deferred { what, reply } => {
             let _ = reply.send(Err(format!("{what}: full loop wiring pending")));
@@ -469,6 +501,7 @@ fn handle_running_cmd(
         | SessionCmd::SetThinking { reply, .. }
         | SessionCmd::SetSessionName { reply, .. }
         | SessionCmd::Compact { reply }
+        | SessionCmd::SetTools { reply, .. }
         | SessionCmd::Deferred { reply, .. }
         | SessionCmd::GetStats { reply }
         | SessionCmd::Prompt { reply, .. } => {
@@ -630,5 +663,144 @@ mod wire_tests {
         assert_eq!(v["queuedMessages"]["steering"], serde_json::json!(["a"]));
         assert_eq!(v["model"]["id"], serde_json::json!("m"));
         assert_eq!(v["thinkingLevel"], serde_json::json!("off"));
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use crate::api::{ApiConfig, EventSink, HostHooks, PiWebApi, TimeoutConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Hooks(std::path::PathBuf);
+    impl HostHooks for Hooks {
+        fn sessions_root(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.join("sessions"))
+        }
+    }
+
+    fn real_home() -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("sink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn api_for(tmp: &std::path::Path, sink: EventSink) -> PiWebApi {
+        let pi = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("models.json"),
+            r#"{"providers":{"probe":{"baseUrl":"https://probe.invalid","api":"openai-completions","apiKey":"k","models":[{"id":"p1"}]}}}}"#,
+        )
+        .unwrap();
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 2)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let mut cfg = ApiConfig::new(sink);
+        cfg.hooks = Arc::new(Hooks(tmp.to_path_buf()));
+        cfg.timeouts = TimeoutConfig::default();
+        PiWebApi::new(rt, cfg)
+    }
+
+    fn call(api: &PiWebApi, req: http::Request<Vec<u8>>) -> Result<http::Response<Vec<u8>>, crate::api::ApiError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        api.handle(req, Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        rx.recv_timeout(std::time::Duration::from_secs(60)).expect("responder called")
+    }
+
+    fn post(uri: &str, body: &str) -> http::Request<Vec<u8>> {
+        http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(body.as_bytes().to_vec())
+            .unwrap()
+    }
+
+    #[test]
+    fn event_line_end_to_end_mock_sink() {
+        // 共享 HOME 锁(api::HOME_LOCK):与 golden/models/lifecycle 测试互斥
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = real_home();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let events: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let panic_count = Arc::new(AtomicUsize::new(0));
+        let ev_c = events.clone();
+        let sink: EventSink = Arc::new(move |ev: crate::api::ApiEvent| {
+            match &ev {
+                crate::api::ApiEvent::Agent { payload } => {
+                    ev_c.lock().unwrap_or_else(|e| e.into_inner()).push(payload.clone());
+                }
+                _ => {}
+            }
+        });
+        let api = api_for(&tmp, sink);
+
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create ok");
+        let sid = serde_json::from_slice::<serde_json::Value>(resp.body()).unwrap()["sessionId"]
+            .as_str()
+            .expect("sid")
+            .to_string();
+
+        // steer → queue_update 事件(镜像 + sink)
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"steer","message":"s1"}"#))
+            .expect("steer ok");
+        assert_eq!(resp.status(), 200);
+        let seen = {
+            let v = events.lock().unwrap_or_else(|e| e.into_inner());
+            v.iter().any(|e| e["type"] == serde_json::json!("queue_update"))
+        };
+        assert!(seen, "queue_update emitted");
+
+        // prompt → 假 provider 快速失败 → 合成 prompt_error/prompt_done/agent_settled
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"hello"}"#))
+            .expect("prompt envelope ok");
+        // envelope 200;turn 结果经事件(前端语义)
+        assert_eq!(resp.status(), 200);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        loop {
+            let types: Vec<String> = {
+                let v = events.lock().unwrap_or_else(|e| e.into_inner());
+                v.iter().filter(|e| e["type"].as_str().is_some()).map(|e| e["type"].as_str().unwrap().to_string()).collect()
+            };
+            if types.iter().any(|t| t == "prompt_error" || t == "prompt_done") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "synthesis timeout, got: {types:?}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let types = {
+            let v = events.lock().unwrap_or_else(|e| e.into_inner());
+            v.iter().filter(|e| e["type"].as_str().is_some()).map(|e| e["type"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+        };
+        assert!(types.iter().any(|t| t == "prompt_error" || t == "prompt_done"), "synthesis: {types:?}");
+        // agent_settled 在完成序列中
+        assert!(types.iter().any(|t| t == "agent_settled"), "settled: {types:?}");
+
+        // 收尾:恢复 env
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+        let _ = panic_count;
     }
 }
