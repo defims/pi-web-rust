@@ -168,6 +168,7 @@ impl PiWebApi {
             rt: self.0.rt.clone(),
             hooks: self.0.cfg.hooks.clone(),
             sessions: self.0.sessions.clone(),
+            sink: self.0.cfg.sink.clone(),
         };
 
         // 派发到运行时;panic 传播在 spawn 边界截获(P0 报告:panic 任务的

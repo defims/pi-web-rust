@@ -22,9 +22,13 @@ use serde_json::Value;
 /// P1 仅含宿主注入通道与测试面;P3 扩充会话事件(Agent 透传/合成事件,
 /// 对齐上游 `toClientAgentEvent` 服务端过滤语义)。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApiEvent {
     /// 宿主侧事件注入(moho_action 进度 / 日志上传回执等 legacy 链路的归宿)。
     /// `event` 为宿主自定义事件名,`payload` 透传。
     Host { event: String, payload: Value },
+    /// 引擎/合成事件(agent_event 通道)。`payload` 为已过滤的 wire 形状
+    /// (toClientAgentEvent 语义;前端 MohoEventSource 消费,connected 首帧
+    /// 由前端 shim 合成 —— 事件线无连接概念,对齐现状机制)。
+    Agent { payload: Value },
 }

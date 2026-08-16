@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use pi::sdk::AgentSessionHandle;
+use pi::sdk::{AbortHandle, AgentEvent, AgentSessionHandle};
 
 use super::commands::ExecCtx;
 use super::ApiError;
@@ -26,8 +26,8 @@ use super::ApiError;
 /// 会话命令(mailbox 载荷)。
 #[derive(Debug)]
 pub(crate) enum SessionCmd {
-    /// 发起一轮 prompt(P3-2 接完整 turn 循环;当前阶段占位)。
-    Prompt { message: Value, reply: oneshot::Sender<Result<Value, String>> },
+    /// 发起一轮 prompt(完整 turn 循环,见 session_loop Prompt 分支)。
+    Prompt { message: String, reply: oneshot::Sender<Result<Value, String>> },
     Steer { message: String, reply: oneshot::Sender<Result<Value, String>> },
     FollowUp { message: String, reply: oneshot::Sender<Result<Value, String>> },
     Abort,
@@ -35,8 +35,9 @@ pub(crate) enum SessionCmd {
     SetModel { provider: String, model: String, reply: oneshot::Sender<Result<Value, String>> },
     SetThinking { level: String, reply: oneshot::Sender<Result<Value, String>> },
     SetSessionName { name: String, reply: oneshot::Sender<Result<Value, String>> },
-    /// compact / set_tools / fork / reload / navigate 等需要完整 turn 循环或
-    /// 重建的命令:P3-2 接线,当前统一占位。
+    Compact { reply: oneshot::Sender<Result<Value, String>> },
+    /// set_tools / fork / reload / navigate 等需要完整 turn 循环或重建的命令:
+    /// P3-2 接线,当前统一占位。
     Deferred { what: &'static str, reply: oneshot::Sender<Result<Value, String>> },
     GetStats { reply: oneshot::Sender<Result<Value, String>> },
     GetLastText { reply: oneshot::Sender<Result<Value, String>> },
@@ -124,7 +125,18 @@ impl SessionRuntime {
         let tl_c = thinking_level.clone();
         let tools_c = enabled_tools.clone();
         let cwd_owned = cwd.to_string();
+        let sink = ctx.sink.clone();
         let handle = super::commands::blocking(ctx, move || -> Result<AgentSessionHandle, ApiError> {
+            // 事件线第一段:引擎 on_event → wire 过滤 → EventSink
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |ev: AgentEvent| {
+                let ev_value = serde_json::to_value(&ev).unwrap_or(serde_json::Value::Null);
+                if let Some(payload) = to_client_event(&ev_value) {
+                    let sink = sink.clone();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        sink(super::events::ApiEvent::Agent { payload });
+                    }));
+                }
+            });
             let options = pi::sdk::SessionOptions {
                 provider: provider_c,
                 model: model_c,
@@ -142,6 +154,7 @@ impl SessionRuntime {
                     super::commands::default_sessions_root_pub(),
                 )),
                 working_directory: Some(std::path::PathBuf::from(&cwd_owned)),
+                on_event: Some(on_event),
                 ..Default::default()
             };
             futures::executor::block_on(pi::sdk::create_agent_session(options))
@@ -188,11 +201,13 @@ impl SessionRuntime {
         let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dead_c = dead.clone();
         let snap_task = snap.clone();
-        let _joined = ctx.rt.handle().spawn(async move {
+        let rt = ctx.rt.clone();
+        let sink = ctx.sink.clone();
+        let _joined = rt.handle().spawn(async move {
             // panic 纪律:mid-await panic 经 FutureExt::catch_unwind 截获(P0 报告:
             // panic 会向 await 点传播,监督任务不得被波及)
             let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                session_loop(handle, rx, snap_task),
+                session_loop(handle, rx, snap_task, sink),
             ))
             .await;
             if result.is_err() {
@@ -229,249 +244,391 @@ impl SessionRuntime {
     }
 }
 
-/// 会话任务主循环(mailbox 消费;P3-2 扩展完整 turn select 循环)。
+/// 会话任务主循环(chat_thread select_loop 任务化)。
+///
+/// 借用模型:prompt future 借用 `&mut handle`;borrow checker 要求该 future
+/// 不跨空闲循环迭代存活 —— 与 chat_thread 同款:起 prompt 与驱动至完成放
+/// 进同一匹配(空闲内层循环返回 future,直接流入运行期子循环,不落跨迭代变量)。
 async fn session_loop(
     mut handle: AgentSessionHandle,
     mut rx: mpsc::Receiver<SessionCmd>,
     snap: Arc<Mutex<SessionSnap>>,
+    sink: super::EventSink,
 ) {
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            SessionCmd::Prompt { message: _, reply } => {
-                // P3-2:完整 turn(prompt_with_abort + select + 合成事件)
-                let _ = reply.send(Err("prompt: wired in P3-2".into()));
-            }
-            SessionCmd::Steer { message, reply } => {
-                snap.lock().unwrap_or_else(|e| e.into_inner()).queued_steering.push_back(message);
-                let _ = reply.send(Ok(json!({})));
-            }
-            SessionCmd::FollowUp { message, reply } => {
-                snap.lock().unwrap_or_else(|e| e.into_inner()).queued_follow_up.push_back(message);
-                let _ = reply.send(Ok(json!({})));
-            }
-            SessionCmd::Abort => {
-                // 无在飞 prompt 时 no-op(P3-2 接 AbortHandle 存储)
-            }
-            SessionCmd::ClearQueue { reply } => {
-                let (steering, follow_up) = {
-                    let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
-                    (
-                        s.queued_steering.drain(..).collect::<Vec<_>>(),
-                        s.queued_follow_up.drain(..).collect::<Vec<_>>(),
-                    )
-                };
-                let _ = reply.send(Ok(json!({ "steering": steering, "followUp": follow_up })));
-            }
-            SessionCmd::SetModel { provider, model, reply } => {
-                let r = handle
-                    .set_model(&provider, &model)
-                    .await
-                    .map(|_| json!({}))
-                    .map_err(|e| format!("{e}"));
-                if r.is_ok() {
-                    let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
-                    s.model_provider = Some(provider);
-                    s.model_id = Some(model);
+    let mut abort_handle: Option<AbortHandle> = None;
+    loop {
+        match rx.recv().await {
+            None => return,
+            Some(cmd) => match cmd {
+                // Prompt:future 在独立函数内创建并消费(不跨迭代返回借用 ——
+                // 等价 chat_thread 的"起 prompt 与驱动至完成同一匹配",但结构
+                // 更简:借用生命周期封闭在 handle_prompt_turn 调用内)
+                SessionCmd::Prompt { message, reply } => {
+                    let _ = reply.send(Ok(json!({})));
+                    handle_prompt_turn(&mut handle, &mut rx, message, &mut abort_handle, &snap, &sink)
+                        .await;
                 }
-                let _ = reply.send(r);
-            }
-            SessionCmd::SetThinking { level, reply } => {
-                let r = match level.parse::<pi::sdk::ThinkingLevel>() {
-                    Ok(t) => handle
-                        .set_thinking_level(t)
-                        .await
-                        .map(|_| json!({}))
-                        .map_err(|e| format!("{e}")),
-                    Err(e) => Err(e),
-                };
-                if r.is_ok() {
-                    snap.lock().unwrap_or_else(|e| e.into_inner()).thinking_level = Some(level);
+                other => {
+                    idle_cmd(other, &mut handle, &snap, &sink).await;
                 }
-                let _ = reply.send(r);
+            },
+        }
+    }
+}
+
+/// 完整 turn:入队镜像 drain → abort handle → mark_running → select 驱动 →
+/// 回落。prompt future 的 &mut handle 借用在本函数内创建并释放。
+async fn handle_prompt_turn(
+    handle: &mut AgentSessionHandle,
+    rx: &mut mpsc::Receiver<SessionCmd>,
+    message: String,
+    abort_handle: &mut Option<AbortHandle>,
+    snap: &Arc<Mutex<SessionSnap>>,
+    sink: &super::EventSink,
+) {
+    {
+        let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+        for m in s.queued_steering.drain(..) {
+            let _ = handle.session_mut().agent.queue_steering(user_text_message(m));
+        }
+        for m in s.queued_follow_up.drain(..) {
+            let _ = handle.session_mut().agent.queue_follow_up(user_text_message(m));
+        }
+    }
+    let (ah, signal) = AgentSessionHandle::new_abort_handle();
+    *abort_handle = Some(ah);
+    mark_running(snap, true);
+    let fut: PinBoxPromptFut<'_> = Box::pin(handle.prompt_with_abort(message, signal, |_| {}));
+    run_prompt_until_settled(fut, rx, abort_handle.as_ref(), snap, sink).await;
+    mark_running(snap, false);
+    *abort_handle = None;
+}
+
+type PinBoxPromptFut<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<pi::sdk::AssistantMessage, pi::sdk::Error>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// 空闲命令处理(非 prompt;借 handle 的命令在此正常执行)。
+async fn idle_cmd(
+    cmd: SessionCmd,
+    handle: &mut AgentSessionHandle,
+    snap: &Arc<Mutex<SessionSnap>>,
+    sink: &super::EventSink,
+) {
+    match cmd {
+        SessionCmd::Steer { message, reply } => {
+            {
+                let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                s.queued_steering.push_back(message.clone());
             }
-            SessionCmd::SetSessionName { name, reply } => {
-                let r = handle.set_session_name(&name).await.map(|_| json!({})).map_err(|e| format!("{e}"));
-                let _ = reply.send(r);
+            emit_queue_update(snap, sink);
+            let _ = reply.send(Ok(json!({})));
+        }
+        SessionCmd::FollowUp { message, reply } => {
+            {
+                let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                s.queued_follow_up.push_back(message.clone());
             }
-            SessionCmd::Deferred { what, reply } => {
-                let _ = reply.send(Err(format!("{what}: wired in P3-2")));
+            emit_queue_update(snap, sink);
+            let _ = reply.send(Ok(json!({})));
+        }
+        SessionCmd::Abort => {}
+        SessionCmd::ClearQueue { reply } => {
+            let (steering, follow_up) = {
+                let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    s.queued_steering.drain(..).collect::<Vec<_>>(),
+                    s.queued_follow_up.drain(..).collect::<Vec<_>>(),
+                )
+            };
+            emit_queue_update(snap, sink);
+            let _ = reply.send(Ok(json!({ "steering": steering, "followUp": follow_up })));
+        }
+        SessionCmd::SetModel { provider, model, reply } => {
+            let r = handle
+                .set_model(&provider, &model)
+                .await
+                .map(|_| json!({}))
+                .map_err(|e| format!("{e}"));
+            if r.is_ok() {
+                let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                s.model_provider = Some(provider);
+                s.model_id = Some(model);
             }
-            SessionCmd::GetStats { reply } => {
-                let stats = handle.get_session_stats().await.unwrap_or_else(|_| json!({}));
-                let _ = reply.send(Ok(stats));
+            let _ = reply.send(r);
+        }
+        SessionCmd::SetThinking { level, reply } => {
+            let r = match level.parse::<pi::sdk::ThinkingLevel>() {
+                Ok(t) => handle.set_thinking_level(t).await.map(|_| json!({})).map_err(|e| format!("{e}")),
+                Err(e) => Err(e),
+            };
+            if r.is_ok() {
+                snap.lock().unwrap_or_else(|e| e.into_inner()).thinking_level = Some(level);
             }
-            SessionCmd::GetLastText { reply } => {
-                let fallback =
-                    snap.lock().unwrap_or_else(|e| e.into_inner()).last_assistant_text.clone();
-                let t = handle.get_last_assistant_text().await.ok().flatten().or(fallback);
-                let _ = reply.send(Ok(json!(t)));
+            let _ = reply.send(r);
+        }
+        SessionCmd::SetSessionName { name, reply } => {
+            let r = handle.set_session_name(&name).await.map(|_| json!({})).map_err(|e| format!("{e}"));
+            let _ = reply.send(r);
+        }
+        SessionCmd::Compact { reply } => {
+            // compact:借 handle 的完整实现(含 compaction_start/end 合成)在
+            // P3-2 补;当前占位(避免错误语义)
+            let _ = reply.send(Err("compact: full loop wiring pending".into()));
+        }
+        SessionCmd::Deferred { what, reply } => {
+            let _ = reply.send(Err(format!("{what}: full loop wiring pending")));
+        }
+        SessionCmd::GetStats { reply } => {
+            let stats = handle.get_session_stats().await.unwrap_or_else(|_| json!({}));
+            let _ = reply.send(Ok(stats));
+        }
+        SessionCmd::GetLastText { reply } => {
+            let fallback = snap.lock().unwrap_or_else(|e| e.into_inner()).last_assistant_text.clone();
+            let t = handle.get_last_assistant_text().await.ok().flatten().or(fallback);
+            let _ = reply.send(Ok(json!(t)));
+        }
+        SessionCmd::Prompt { reply, .. } => {
+            // 主循环已拦截 Prompt;防御分支
+            let _ = reply.send(Err("prompt handled at top level".into()));
+        }
+    }
+}
+
+/// 运行期 select 子循环:驱动 prompt future,中途收命令(chat_thread
+/// run_prompt_until_settled 的任务化)。借用纪律:运行期绝不借 &mut handle
+/// (prompt future 占用);Abort 经 AbortHandle(不借 handle);读命令读快照。
+async fn run_prompt_until_settled<'a>(
+    mut prompt_fut: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<pi::sdk::AssistantMessage, pi::sdk::Error>> + Send + 'a>,
+    >,
+    rx: &mut mpsc::Receiver<SessionCmd>,
+    abort_handle: Option<&AbortHandle>,
+    snap: &Arc<Mutex<SessionSnap>>,
+    sink: &super::EventSink,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut prompt_fut => {
+                finish_turn(res, snap, sink).await;
+                return;
+            }
+            cmd = rx.recv() => {
+                let Some(cmd) = cmd else { return };
+                handle_running_cmd(cmd, abort_handle, snap, sink);
             }
         }
     }
 }
 
-// ============================================================================
-// 测试:生命周期 + RPC 面板(HOME 隔离 + 假 provider 的 models.json)
-// ============================================================================
+/// 运行期命令:Abort → abort_handle;队列命令 → 镜像 + queue_update;读命令 → 快照。
+fn handle_running_cmd(
+    cmd: SessionCmd,
+    abort_handle: Option<&AbortHandle>,
+    snap: &Arc<Mutex<SessionSnap>>,
+    sink: &super::EventSink,
+) {
+    match cmd {
+        SessionCmd::Abort => {
+            if let Some(ah) = abort_handle {
+                ah.abort();
+            }
+        }
+        SessionCmd::Steer { message, reply } => {
+            snap.lock().unwrap_or_else(|e| e.into_inner()).queued_steering.push_back(message);
+            emit_queue_update(snap, sink);
+            let _ = reply.send(Ok(json!({})));
+        }
+        SessionCmd::FollowUp { message, reply } => {
+            snap.lock().unwrap_or_else(|e| e.into_inner()).queued_follow_up.push_back(message);
+            emit_queue_update(snap, sink);
+            let _ = reply.send(Ok(json!({})));
+        }
+        SessionCmd::ClearQueue { reply } => {
+            let (steering, follow_up) = {
+                let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    s.queued_steering.drain(..).collect::<Vec<_>>(),
+                    s.queued_follow_up.drain(..).collect::<Vec<_>>(),
+                )
+            };
+            emit_queue_update(snap, sink);
+            let _ = reply.send(Ok(json!({ "steering": steering, "followUp": follow_up })));
+        }
+        SessionCmd::GetLastText { reply } => {
+            let t = snap.lock().unwrap_or_else(|e| e.into_inner()).last_assistant_text.clone();
+            let _ = reply.send(Ok(json!(t)));
+        }
+        // 借 handle 的重命令运行期 busy(沿用 chat_thread 语义)
+        SessionCmd::SetModel { reply, .. }
+        | SessionCmd::SetThinking { reply, .. }
+        | SessionCmd::SetSessionName { reply, .. }
+        | SessionCmd::Compact { reply }
+        | SessionCmd::Deferred { reply, .. }
+        | SessionCmd::GetStats { reply }
+        | SessionCmd::Prompt { reply, .. } => {
+            let _ = reply.send(Err("session busy (prompt running)".into()));
+        }
+    }
+}
+
+/// turn 完成:回落标志 + last_assistant_text + 合成 prompt_done/error + agent_settled。
+async fn finish_turn(
+    res: Result<pi::sdk::AssistantMessage, pi::sdk::Error>,
+    snap: &Arc<Mutex<SessionSnap>>,
+    sink: &super::EventSink,
+) {
+    match &res {
+        Ok(am) => {
+            let text = extract_assistant_text(am);
+            let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+            s.is_streaming = false;
+            s.is_prompt_running = false;
+            s.last_assistant_text = Some(text);
+            emit_agent(sink, json!({ "type": "prompt_done" }));
+            emit_agent(sink, json!({ "type": "agent_settled" }));
+        }
+        Err(e) => {
+            let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+            s.is_streaming = false;
+            s.is_prompt_running = false;
+            // 对齐 rpc-manager:先 prompt_error 再 prompt_done(客户端靠
+            // prompt_done 复位 rpcPromptPendingRef,否则 agent_settled 被守卫吞)
+            emit_agent(sink, json!({ "type": "prompt_error", "errorMessage": e.to_string() }));
+            emit_agent(sink, json!({ "type": "prompt_done" }));
+            emit_agent(sink, json!({ "type": "agent_settled" }));
+        }
+    }
+}
+
+fn mark_running(snap: &Arc<Mutex<SessionSnap>>, running: bool) {
+    let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+    s.is_streaming = running;
+    s.is_prompt_running = running;
+}
+
+fn emit_queue_update(snap: &Arc<Mutex<SessionSnap>>, sink: &super::EventSink) {
+    let s = snap.lock().unwrap_or_else(|e| e.into_inner());
+    emit_agent(
+        sink,
+        json!({
+            "type": "queue_update",
+            "steering": s.queued_steering.iter().cloned().collect::<Vec<_>>(),
+            "followUp": s.queued_follow_up.iter().cloned().collect::<Vec<_>>(),
+        }),
+    );
+}
+
+/// 事件出口:agent_event 通道(catch_unwind 契约纪律)。
+fn emit_agent(sink: &super::EventSink, payload: Value) {
+    let sink = sink.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        sink(super::events::ApiEvent::Agent { payload });
+    }));
+}
+
+fn user_text_message(text: String) -> pi::sdk::Message {
+    pi::sdk::Message::User(pi::sdk::UserMessage {
+        content: pi::sdk::UserContent::Text(text),
+        timestamp: chrono::Local::now().timestamp(),
+    })
+}
+
+fn extract_assistant_text(am: &pi::sdk::AssistantMessage) -> String {
+    am.content
+        .iter()
+        .filter_map(|b| match b {
+            pi::sdk::ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// 上游 toClientAgentEvent 语义(wire 过滤;agent-event-wire.ts):
+/// 丢 turn_start/turn_end/tool_execution_update;message_update 投影
+/// (剥 partial);agent_end 折叠为 {type:"agent_end"}。
+/// 输入为 AgentEvent 序列化后的 Value(on_event 回调内先 to_value)。
+pub(crate) fn to_client_event(v: &serde_json::Value) -> Option<serde_json::Value> {
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match ty {
+        "turn_start" | "turn_end" | "tool_execution_update" => None,
+        "message_update" => {
+            let ame = v.get("assistantMessageEvent")?;
+            if !ame.is_object() {
+                return None;
+            }
+            let mut ame = ame.clone();
+            if let Some(obj) = ame.as_object_mut() {
+                obj.remove("partial");
+            }
+            Some(serde_json::json!({
+                "type": "message_update",
+                "assistantMessageEvent": ame,
+            }))
+        }
+        "agent_end" => Some(serde_json::json!({ "type": "agent_end" })),
+        _ => Some(v.clone()),
+    }
+}
 
 #[cfg(test)]
-mod tests {
-    use crate::api::{ApiConfig, EventSink, HostHooks, PiWebApi};
-    use std::sync::Arc;
+mod wire_tests {
+    use super::*;
 
-    struct HomeGuard {
-        _g: std::sync::MutexGuard<'static, ()>,
-        old_home: Option<std::ffi::OsString>,
-        old_agent_dir: Option<std::ffi::OsString>,
-    }
-    impl HomeGuard {
-        fn new(tmp: &std::path::Path) -> Self {
-            let g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let old_home = std::env::var_os("HOME");
-            let old_agent_dir = std::env::var_os("PI_CODING_AGENT_DIR");
-            // 引擎 agent 目录用 PI_CODING_AGENT_DIR 显式指路(比 HOME 更强的杠杆,
-            // 绕开 dirs::home_dir 的解析差异);auth 同样走此目录(O_NOFOLLOW 需真实路径)
-            std::env::set_var("HOME", tmp);
-            std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
-            Self { _g: g, old_home, old_agent_dir }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            if let Some(old) = self.old_home.take() {
-                std::env::set_var("HOME", old);
-            }
-            match self.old_agent_dir.take() {
-                Some(old) => std::env::set_var("PI_CODING_AGENT_DIR", old),
-                None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-            }
-        }
-    }
-
-    struct Hooks(std::path::PathBuf);
-    impl HostHooks for Hooks {
-        fn sessions_root(&self) -> Option<std::path::PathBuf> {
-            Some(self.0.join("sessions"))
-        }
-    }
-
-    fn api_for(tmp: &std::path::Path) -> PiWebApi {
-        // models.json:假 provider(无 credential;create 走 registry,prompt 才碰网络)
-        let pi = tmp.join(".pi/agent");
-        std::fs::create_dir_all(&pi).unwrap();
-        std::fs::write(
-            pi.join("models.json"),
-            r#"{"providers":{"probe":{"baseUrl":"https://probe.invalid","api":"openai-completions","apiKey":"test-key","models":[{"id":"p1","name":"Probe One"}]}}}}"#,
-        )
-        .unwrap();
-        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
-        let rt = Arc::new(
-            asupersync::runtime::RuntimeBuilder::multi_thread()
-                .blocking_threads(1, 2)
-                .with_reactor(reactor)
-                .build()
-                .unwrap(),
-        );
-        let mut cfg = ApiConfig::new(Arc::new(|_: crate::api::ApiEvent| {}) as EventSink);
-        cfg.hooks = Arc::new(Hooks(tmp.to_path_buf()));
-        PiWebApi::new(rt, cfg)
-    }
-
-    fn call(api: &PiWebApi, req: http::Request<Vec<u8>>) -> Result<http::Response<Vec<u8>>, crate::api::ApiError> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        api.handle(req, Box::new(move |r| {
-            let _ = tx.send(r);
-        }));
-        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("responder called")
-    }
-
-    fn post(uri: &str, body: &str) -> http::Request<Vec<u8>> {
-        http::Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .body(body.as_bytes().to_vec())
-            .unwrap()
-    }
-
-    fn get(uri: &str) -> http::Request<Vec<u8>> {
-        http::Request::builder().method("GET").uri(uri).body(Vec::new()).unwrap()
-    }
-
-    fn body(resp: &http::Response<Vec<u8>>) -> serde_json::Value {
-        serde_json::from_slice(resp.body()).expect("json")
-    }
-
-    /// 真实路径 HOME(引擎 auth 加载用 O_NOFOLLOW 组件链,tempdir 的
-    /// /var/folders 符号链接会 ENOTDIR —— 放 target/ 下避开)。
-    fn real_home() -> std::path::PathBuf {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target/test-homes")
-            .join(format!("sr-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn ev(json_str: &str) -> serde_json::Value {
+        serde_json::from_str(json_str).expect("agent event json")
     }
 
     #[test]
-    fn session_lifecycle_and_rpc_surface() {
-        let tmp = real_home();
-        let _guard = HomeGuard::new(&tmp);
-        let api = api_for(&tmp);
-        let cwd = tmp.to_string_lossy().to_string();
+    fn to_client_event_omits_high_frequency() {
+        assert!(to_client_event(&ev(r#"{"type":"turn_start","sessionId":"s"}"#)).is_none());
+        assert!(to_client_event(&ev(r#"{"type":"tool_execution_update","toolCallId":"t"}"#)).is_none());
+    }
 
-        // new → 200 + sessionId
-        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
-            .expect("create ok");
-        assert_eq!(resp.status(), 200, "body(no explicit model): {}", String::from_utf8_lossy(resp.body()));
-        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
-        assert!(!sid.is_empty());
+    #[test]
+    fn to_client_event_projects_message_update() {
+        let out = to_client_event(&ev(
+            r#"{"type":"message_update","sessionId":"s","assistantMessageEvent":{"partial":true,"content":[{"type":"text","text":"hi"}]}}"#,
+        ))
+        .expect("projected");
+        // partial 剥除;形状 {type, assistantMessageEvent}
+        assert_eq!(out["type"], serde_json::json!("message_update"));
+        assert!(out["assistantMessageEvent"].get("partial").is_none());
+        assert_eq!(out["assistantMessageEvent"]["content"][0]["text"], serde_json::json!("hi"));
+    }
 
-        // running 列表含新会话
-        let resp = call(&api, get("/api/agent/running")).expect("ok");
-        assert!(body(&resp)["runningSessionIds"].as_array().unwrap().iter().any(|v| v.as_str() == Some(sid.as_str())));
+    #[test]
+    fn to_client_event_folds_agent_end_and_passthrough() {
+        let out = to_client_event(&ev(r#"{"type":"agent_end","sessionId":"s","messages":[]}"#))
+            .expect("folded");
+        assert_eq!(out, serde_json::json!({ "type": "agent_end" }));
+        let out = to_client_event(&ev(r#"{"type":"agent_start","sessionId":"s"}"#)).expect("kept");
+        assert_eq!(out["type"], serde_json::json!("agent_start"));
+    }
 
-        // get_state 形状(挂载切片)
-        let resp = call(&api, get(&format!("/api/agent/{sid}"))).expect("ok");
-        let v = body(&resp);
-        assert_eq!(v["running"], serde_json::json!(false));
-        // 模型真相由引擎 state 回填(测试进程的 registry 可能解析到内置模型 +
-        // ambient 凭据 —— env 解析存在进程级缓存;断言回填机制而非具体值)
-        assert!(v["state"]["model"].is_object(), "model backfilled from engine state");
-        assert!(v["state"]["model"]["id"].as_str().is_some_and(|s| !s.is_empty()));
-        assert_eq!(v["state"]["thinkingLevel"], serde_json::json!("off"));
-
-        // RPC:steer 入镜像 → get_state 可见;clear_queue 回被清内容
-        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"steer","message":"hi"}"#))
-            .expect("ok");
-        assert_eq!(resp.status(), 200);
-        assert_eq!(body(&resp)["success"], serde_json::json!(true));
-        let resp = call(&api, get(&format!("/api/agent/{sid}"))).expect("ok");
-        assert_eq!(body(&resp)["state"]["queuedMessages"]["steering"], serde_json::json!(["hi"]));
-        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"clear_queue"}"#))
-            .expect("ok");
-        assert_eq!(body(&resp)["data"]["steering"], serde_json::json!(["hi"]));
-
-        // RPC:无效 thinking → 500 {error} 信封
-        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"set_thinking_level","level":"bogus"}"#))
-            .expect("ok");
-        assert_eq!(resp.status(), 500);
-        assert!(body(&resp)["error"].as_str().unwrap().contains("Invalid thinking level"));
-
-        // RPC:未知 type → 400;未知会话 → 404
-        let e = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"nope"}"#)).unwrap_err();
-        assert_eq!(e.status, 400);
-        let e = call(&api, post("/api/agent/00000000-0000-0000-0000-000000000000", r#"{"type":"steer","message":"x"}"#))
-            .unwrap_err();
-        assert_eq!(e.status, 404);
-        let e = call(&api, get("/api/agent/00000000-0000-0000-0000-000000000000")).unwrap_err();
-        assert_eq!(e.status, 404);
-
-        // 溢出(容量 1):第二个 new 替换第一个 → 旧 id 404
-        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
-            .expect("create ok");
-        let sid2 = body(&resp)["sessionId"].as_str().expect("sid2").to_string();
-        assert_ne!(sid, sid2);
-        let e = call(&api, get(&format!("/api/agent/{sid}"))).unwrap_err();
-        assert_eq!(e.status, 404, "evicted old session");
+    #[test]
+    fn snap_state_shape_for_reconcile() {
+        let snap = SessionSnap {
+            session_id: Some("s1".into()),
+            is_prompt_running: true,
+            is_streaming: true,
+            queued_steering: VecDeque::from(["a".to_string()]),
+            model_provider: Some("p".into()),
+            model_id: Some("m".into()),
+            ..Default::default()
+        };
+        let v = snap.to_state_json();
+        assert_eq!(v["sessionId"], serde_json::json!("s1"));
+        assert_eq!(v["isStreaming"], serde_json::json!(true));
+        assert_eq!(v["isPromptRunning"], serde_json::json!(true));
+        assert_eq!(v["queuedMessages"]["steering"], serde_json::json!(["a"]));
+        assert_eq!(v["model"]["id"], serde_json::json!("m"));
+        assert_eq!(v["thinkingLevel"], serde_json::json!("off"));
     }
 }

@@ -21,6 +21,7 @@ pub(crate) struct ExecCtx {
     pub rt: Arc<Runtime>,
     pub hooks: Arc<dyn HostHooks>,
     pub sessions: Arc<super::session_runtime::SessionRuntime>,
+    pub sink: super::EventSink,
 }/// 命令执行结果统一为 http::Response(传输方言直通;JSON/字节由命令自定)。
 pub(crate) async fn execute(
     ctx: ExecCtx,
@@ -362,7 +363,15 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     use super::session_runtime::SessionCmd as C;
     let cmd = match ty.as_str() {
-        "prompt" => C::Prompt { message: dispatch.args.clone(), reply: reply_tx },
+        // streamingBehavior:"steer" → 等价 steer 队列语义(对齐 rpc-manager;
+        // 运行期 steer 入镜像,turn 结束被消费)
+        "prompt" if dispatch.args.get("streamingBehavior").and_then(|v| v.as_str()) == Some("steer") => {
+            C::Steer { message: message.unwrap_or_default(), reply: reply_tx }
+        }
+        "prompt" => C::Prompt {
+            message: message.unwrap_or_default(),
+            reply: reply_tx,
+        },
         "steer" => C::Steer { message: message.unwrap_or_default(), reply: reply_tx },
         "follow_up" => C::FollowUp { message: message.unwrap_or_default(), reply: reply_tx },
         "abort" => {
