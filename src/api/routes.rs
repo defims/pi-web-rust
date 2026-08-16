@@ -65,6 +65,7 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("GET", "/api/cwd/browse", "cwd_browse", TimeoutClass::Default),
     ("POST", "/api/cwd/validate", "cwd_validate", TimeoutClass::Default),
     ("POST", "/api/default-cwd", "default_cwd", TimeoutClass::Default),
+    ("GET", "/api/file-index", "file_index", TimeoutClass::Default),
     ("GET", "/api/git/status", "git_status", TimeoutClass::Default),
     ("GET", "/api/git/diff", "git_diff", TimeoutClass::Default),
     // files 八态:GET(读侧)+ POST(上传);*path 通配捕获文件路径

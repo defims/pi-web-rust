@@ -42,6 +42,7 @@ pub(crate) async fn execute(
         "git_status" => git_status(&ctx, dispatch).await,
         "git_diff" => git_diff(&ctx, dispatch).await,
         "files" => super::files::files_command(&ctx, dispatch).await,
+        "file_index" => super::file_index::file_index_command(&ctx, dispatch).await,
         #[cfg(test)]
         "test_sleep" => test_sleep(dispatch).await,
         #[cfg(test)]

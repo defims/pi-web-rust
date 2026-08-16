@@ -15,6 +15,7 @@
 
 mod commands;
 pub mod events;
+mod file_index;
 mod files;
 pub mod routes;
 mod sessions;

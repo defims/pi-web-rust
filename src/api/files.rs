@@ -15,7 +15,7 @@ use super::routes::Dispatch;
 use super::ApiError;
 
 const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
-const IGNORED_NAMES: &[&str] = &[
+pub(crate) const IGNORED_NAMES_PUB: &[&str] = &[
     "node_modules", ".git", ".next", "dist", "build", "__pycache__",
 ];
 
@@ -41,7 +41,7 @@ pub(crate) async fn files_command(
     }
     // 通配捕获丢绝对路径的前导斜杠(normalize/trim 所致)—— 前端恒传绝对路径,恢复之
     let raw_path = if raw_path.starts_with('/') { raw_path } else { format!("/{raw_path}") };
-    let path = resolve_path(&raw_path);
+    let path = resolve_path_pub(&raw_path);
 
     match ty.as_str() {
         "list" => {
@@ -94,7 +94,7 @@ fn list(path: &Path) -> Result<http::Response<Vec<u8>>, ApiError> {
             Some(n) => n.to_string(),
             None => continue,
         };
-        if IGNORED_NAMES.contains(&name.as_str()) || name.ends_with(".pyc") {
+        if IGNORED_NAMES_PUB.contains(&name.as_str()) || name.ends_with(".pyc") {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -348,7 +348,7 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 // ── 类型/语言助手(moho files_handler 下沉) ─────────────────────────────
 
-fn resolve_path(raw: &str) -> PathBuf {
+pub(crate) fn resolve_path_pub(raw: &str) -> PathBuf {
     let expanded = if raw == "~" {
         crate::paths::home_dir().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default()
     } else if let Some(rest) = raw.strip_prefix("~/") {
