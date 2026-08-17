@@ -383,10 +383,12 @@ fn agent_running(ctx: &ExecCtx) -> Result<http::Response<Vec<u8>>, ApiError> {
 }
 
 /// GET /api/agent/:id —— {running, state}(挂载恢复/对账切片)。
+/// 死会话回 {running:false}(对齐上游 route.ts:64-67:wrapper 不存在/已死
+/// 直接 running:false,不 404 —— 前端 15s 对账靠它收敛,否则 loading 永转)。
 fn agent_get_state(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
     let id = str_arg(&dispatch, "id");
     let Some(h) = ctx.sessions.get(&id) else {
-        return Err(ApiError::not_found(format!("session not found: {id}")));
+        return json_response(json!({ "running": false }));
     };
     let snap = h.snap.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let running = snap.is_streaming || snap.is_prompt_running || snap.is_compacting;
@@ -397,8 +399,18 @@ fn agent_get_state(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
 /// 信封:{success:true,data} / 500 {error}(对齐上游 route.ts)。
 async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
     let id = str_arg(&dispatch, "id");
-    let Some(h) = ctx.sessions.get(&id) else {
-        return Err(ApiError::not_found(format!("session not found: {id}")));
+    // 死会话惰性恢复(对齐上游 route.ts:19-32:resolveSessionPath →
+    // startRpcSession(id, path) 后再执行命令;磁盘也找不到才 404)
+    let mut h = match ctx.sessions.get(&id) {
+        Some(h) => h,
+        None => {
+            if !ctx.sessions.restore(ctx, &id).await {
+                return Err(ApiError::not_found("Session not found"));
+            }
+            ctx.sessions
+                .get(&id)
+                .ok_or_else(|| ApiError::not_found("Session not found"))?
+        }
     };
     let ty = dispatch
         .args

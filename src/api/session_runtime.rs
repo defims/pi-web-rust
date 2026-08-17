@@ -129,6 +129,122 @@ impl SessionRuntime {
     }
 
     /// 创建并注册会话(溢出 = 关旧建新,对齐 moho Clear/rebuild 语义)。
+    /// 历史会话惰性恢复(对齐上游 rpc-manager:POST /api/agent/:id 对不在
+    /// 内存 registry 的会话先 resolveSessionPath 再 startRpcSession(id, path))。
+    /// 场景:app 重开后前端恢复旧会话视图继续发消息 —— registry 为空,没有
+    /// 这条路径时 RPC 404,前端乐观 agentRunning 永不收敛(loading 永转)。
+    /// 返回 false = 磁盘也找不到(调用方回 404)。
+    pub async fn restore(&self, ctx: &ExecCtx, id: &str) -> bool {
+        // 与 create 传给引擎的 session_dir 同根(引擎落盘位置);hooks 根仅当
+        // 宿主覆写了 sessions_root 且引擎仍写默认根时兜底扫描。
+        let root = super::commands::default_sessions_root_pub();
+        // 文件名为 <timestamp>_<id前8位>.jsonl(lib 落盘约定),前缀候选 +
+        // header 精确校验(短前缀有碰撞可能)
+        let prefix = id.split('-').next().unwrap_or("").to_string();
+        let full_id = id.to_string();
+        let found = super::commands::blocking(ctx, move || {
+            let dirs = std::fs::read_dir(&root).ok()?;
+            let suffix = format!("_{prefix}.jsonl");
+            for d in dirs.filter_map(|e| e.ok()) {
+                let files = std::fs::read_dir(d.path()).ok()?;
+                for f in files.filter_map(|e| e.ok()) {
+                    let name = f.file_name().to_string_lossy().into_owned();
+                    if !name.ends_with(&suffix) {
+                        continue;
+                    }
+                    let path_s = f.path().to_string_lossy().into_owned();
+                    if crate::session::reader::read_session_header(&path_s)
+                        .is_some_and(|h| h.id == full_id)
+                    {
+                        return Some(f.path());
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(path) = found else { return false };
+        let path_for_snap = path.clone();
+        let header = crate::session::reader::read_session_header(&path.to_string_lossy());
+        let cwd = header
+            .as_ref()
+            .map(|h| h.cwd.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "/".to_string());
+
+        let hooks = ctx.hooks.clone();
+        let sink = ctx.sink.clone();
+        let cwd_owned = cwd.clone();
+        let handle = super::commands::blocking(ctx, move || -> Result<AgentSessionHandle, ApiError> {
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |ev: AgentEvent| {
+                let ev_value = serde_json::to_value(&ev).unwrap_or(serde_json::Value::Null);
+                if let Some(payload) = to_client_event(&ev_value) {
+                    let sink = sink.clone();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        sink(super::events::ApiEvent::Agent { payload });
+                    }));
+                }
+            });
+            let options = pi::sdk::SessionOptions {
+                system_prompt: hooks.system_prompt(),
+                no_session: false,
+                session_dir: Some(std::path::PathBuf::from(
+                    super::commands::default_sessions_root_pub(),
+                )),
+                working_directory: Some(std::path::PathBuf::from(&cwd_owned)),
+                session_path: Some(path),
+                on_event: Some(on_event),
+                ..Default::default()
+            };
+            futures::executor::block_on(pi::sdk::create_agent_session(options))
+                .map_err(|e| ApiError::internal(format!("restore_agent_session: {e}")))
+        })
+        .await;
+        let handle = match handle {
+            Ok(Ok(h)) => h,
+            _ => {
+                eprintln!("session {id}: disk restore failed");
+                return false;
+            }
+        };
+
+        let engine_state = handle.state().await.ok();
+        let restored_id = engine_state
+            .as_ref()
+            .and_then(|s| s.session_id.clone())
+            .unwrap_or_else(|| id.to_string());
+        let (tx, rx) = mpsc::channel::<SessionCmd>(64);
+        let snap = Arc::new(Mutex::new(SessionSnap {
+            session_id: Some(restored_id.clone()),
+            session_path: Some(path_for_snap),
+            cwd: Some(cwd.clone()),
+            ..Default::default()
+        }));
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dead_c = dead.clone();
+        let snap_task = snap.clone();
+        let rt = ctx.rt.clone();
+        let sink = ctx.sink.clone();
+        let hooks = ctx.hooks.clone();
+        let _joined = rt.handle().spawn(async move {
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                session_loop(handle, rx, snap_task, sink, rt.clone(), hooks),
+            ))
+            .await;
+            if result.is_err() {
+                dead_c.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(restored_id.clone(), SessionHandle { tx, snap, dead });
+        eprintln!("session {restored_id}: restored from disk");
+        true
+    }
+
     /// 返回 (session_id, 引擎 provider, 引擎 model, 引擎 thinking)——后三者
     /// 供 agent_new 响应回传(对齐上游 route.ts:70-84,前端据此同步选中态)。
     pub async fn create(
@@ -1478,5 +1594,319 @@ mod bash_tests {
             Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
+    }
+}
+
+/// 成功路径 settle 扫描:极简本地 SSE server 逐形态验证引擎 prompt future
+/// 收尾(用户症状:回复完整送达但 loading 永转 = future 不 settle)。
+#[cfg(test)]
+mod success_settle_tests {
+    use crate::api::{ApiConfig, EventSink, HostHooks, PiWebApi};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    struct Hooks(std::path::PathBuf);
+    impl HostHooks for Hooks {
+        fn sessions_root(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.join("sessions"))
+        }
+    }
+
+    /// 形态开关:模拟不同网关收尾行为。
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum StreamShape {
+        /// 标准:delta + finish_reason=stop + [DONE]
+        Standard,
+        /// 无 [DONE] 哨兵,连接直接关闭(EOF)
+        EofOnly,
+        /// finish_reason=length(截断)
+        Length,
+        /// delta 带 reasoning_content(deepseek 风格推理字段)
+        ReasoningContent,
+        /// [DONE] 之后还发一帧注释/心跳(网关 keep-alive 尾巴)
+        TrailingComment,
+        /// chunked 编码 + 帧间注释心跳 + usage 帧(真网关形态)
+        ChunkedInterleaved,
+    }
+
+    /// 起一个单请求 SSE server,返回 (port, handle)。按 shape 生成响应体。
+    fn spawn_sse_server(shape: StreamShape) -> (u16, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf); // 请求头+体(读一次即可)
+                let body = sse_body(shape);
+                if shape == StreamShape::ChunkedInterleaved {
+                    // 真 SSE 形态:无 Content-Length,chunked 编码,分块+帧间注释心跳
+                    let _ = write_all(&mut stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                    for piece in body.split_once("\n\n").map(|(a, b)| vec![a.to_string() + "\n\n", b.to_string()]).unwrap_or_default().iter().flat_map(|s| s.split("\n\n").map(|x| x.to_string()).collect::<Vec<_>>()) {
+                        if piece.trim().is_empty() { continue; }
+                        let frame = format!(": ka\n\n{}", piece);
+                        let _ = write_all(&mut stream, format!("{:X}\r\n{}\r\n", frame.len(), frame).as_bytes());
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    let _ = write_all(&mut stream, b"0\r\n\r\n");
+                } else {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = write_all(&mut stream, resp.as_bytes());
+                }
+                let _ = stream.flush();
+                use std::net::Shutdown;
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+        (port, rx)
+    }
+
+    fn write_all<S: Write>(s: &mut S, buf: &[u8]) -> std::io::Result<()> {
+        s.write_all(buf)
+    }
+
+    fn sse_body(shape: StreamShape) -> String {
+        let chunk = |delta: &str, finish: &str| {
+            format!(
+                "data: {{\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{delta},\"finish_reason\":{finish}}}]}}\n\n"
+            )
+        };
+        let mut body = String::new();
+        match shape {
+            StreamShape::Standard | StreamShape::TrailingComment => {
+                body.push_str(&chunk("{\"role\":\"assistant\",\"content\":\"Hello from fake\"}", "null"));
+                body.push_str(&chunk("{}", "\"stop\""));
+                body.push_str("data: [DONE]\n\n");
+                if shape == StreamShape::TrailingComment {
+                    body.push_str(": keepalive\n\n");
+                }
+            }
+            StreamShape::EofOnly => {
+                body.push_str(&chunk("{\"role\":\"assistant\",\"content\":\"Hello from fake\"}", "null"));
+                body.push_str(&chunk("{}", "\"stop\""));
+                // 无 [DONE],Content-Length 边界即 EOF
+            }
+            StreamShape::Length => {
+                body.push_str(&chunk("{\"role\":\"assistant\",\"content\":\"Hello from fake\"}", "null"));
+                body.push_str(&chunk("{}", "\"length\""));
+                body.push_str("data: [DONE]\n\n");
+            }
+            StreamShape::ChunkedInterleaved => {
+                body.push_str(&chunk("{\"role\":\"assistant\",\"content\":\"Hello from fake\"}", "null"));
+                body.push_str("data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n");
+                body.push_str(&chunk("{}", "\"stop\""));
+                body.push_str("data: [DONE]\n\n");
+            }
+            StreamShape::ReasoningContent => {
+                body.push_str(&chunk(
+                    "{\"role\":\"assistant\",\"reasoning_content\":\"thinking hard\",\"content\":\"Hello\"}",
+                    "null",
+                ));
+                body.push_str(&chunk("{}", "\"stop\""));
+                body.push_str("data: [DONE]\n\n");
+            }
+        }
+        body
+    }
+
+    fn api_with_provider(tmp: &std::path::Path, port: u16) -> PiWebApi {
+        let pi = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("models.json"),
+            format!(
+                r#"{{"providers":{{"fake":{{"baseUrl":"http://127.0.0.1:{port}/v1","api":"openai-completions","apiKey":"k","models":[{{"id":"f1","name":"f1"}}]}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(2, 4)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let mut cfg = ApiConfig::new(Arc::new(|_: crate::api::ApiEvent| {}) as EventSink);
+        cfg.hooks = Arc::new(Hooks(tmp.to_path_buf()));
+        PiWebApi::new(rt, cfg)
+    }
+
+    fn call(api: &PiWebApi, req: ::http::Request<Vec<u8>>) -> Result<::http::Response<Vec<u8>>, crate::api::ApiError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        api.handle(req, Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        rx.recv_timeout(std::time::Duration::from_secs(60)).expect("responder called")
+    }
+
+    fn post(uri: &str, body: &str) -> ::http::Request<Vec<u8>> {
+        ::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.as_bytes().to_vec())
+            .unwrap()
+    }
+
+    fn get(uri: &str) -> ::http::Request<Vec<u8>> {
+        ::http::Request::builder().method("GET").uri(uri).body(Vec::new()).unwrap()
+    }
+
+    fn body(v: &::http::Response<Vec<u8>>) -> serde_json::Value {
+        serde_json::from_slice(v.body()).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// 单形态全链路:建会话(无显式 thinking)→ prompt → 限时等待 settled。
+    /// 返回 (settled?, 耗时, get_state running)。
+    fn run_shape(shape: StreamShape) -> (bool, std::time::Duration, bool) {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("settle-{}-{:?}", std::process::id(), shape));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(shape);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#))).expect("create");
+            let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+            let t0 = std::time::Instant::now();
+            // prompt(fire;responder 挂起至完成)
+            let (tx, rx) = std::sync::mpsc::channel();
+            api.handle(
+                post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"hi"}"#),
+                Box::new(move |r| {
+                    let _ = tx.send(r);
+                }),
+            );
+            // 轮询 get_state 至 idle 或 20s 超时
+            let mut running = true;
+            while t0.elapsed() < std::time::Duration::from_secs(20) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+                running = body(&st)["running"].as_bool().unwrap_or(true);
+                if !running {
+                    break;
+                }
+            }
+            let settled = !running;
+            // prompt responder 最终应有回执(成功或错误均可)
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
+            (settled, t0.elapsed(), running)
+        }));
+        let out = result.unwrap_or((false, std::time::Duration::from_secs(999), true));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+        out
+    }
+
+    /// 死会话(进程重启等价:磁盘有上次会话、registry 空)对齐上游:
+    /// GET → {running:false}(不 404,reconcile 可收敛);POST prompt →
+    /// 自动从磁盘恢复会话并执行(route.ts:19-32);磁盘也无 → 404。
+    /// 注:引擎落盘发生在进程退出,同进程无法依赖"prompt 后文件已写",
+    /// 故直接手写磁盘会话文件模拟"上次进程留下的会话"。
+    #[test]
+    fn dead_session_reports_idle_and_rpc_restores_from_disk() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("restore2-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+
+        // 手写磁盘会话:header + 一条 user 消息(真实前置 = 上次进程正常退出)
+        let sid = "cafe1234-1111-2222-3333-444455556666".to_string();
+        let slug = "restore-fixture";
+        let dir = tmp.join(".pi/agent/sessions").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = tmp.to_string_lossy().to_string();
+        let jsonl = format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"{cwd}\"}}\n"
+        );
+        std::fs::write(dir.join("2026-01-01T00:00:00.000Z_cafe1234.jsonl"), jsonl).unwrap();
+
+        let api = api_with_provider(&tmp, port);
+
+        // GET 死会话 → running:false(修复前 404)
+        let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("get on dead");
+        assert_eq!(body(&st)["running"], serde_json::json!(false), "dead session must report idle");
+
+        // POST prompt → 磁盘恢复 + 执行成功(fake SSE 回 200)
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"hi"}"#))
+            .expect("prompt on dead must restore from disk");
+        assert_eq!(resp.status(), 200);
+
+        // 完全不存在的 id → 404
+        let e = call(&api, post("/api/agent/00000000-0000-0000-0000-000000000000", r#"{"type":"get_state"}"#))
+            .expect_err("unknown id");
+        assert_eq!(e.status, 404);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    #[test]
+    fn settle_shape_standard() {
+        let (settled, dt, running) = run_shape(StreamShape::Standard);
+        assert!(settled, "standard stream must settle (running={running}, {:?})", dt);
+    }
+
+    #[test]
+    fn settle_shape_eof_only() {
+        let (settled, dt, running) = run_shape(StreamShape::EofOnly);
+        assert!(settled, "EOF-without-DONE must settle (running={running}, {:?})", dt);
+    }
+
+    #[test]
+    fn settle_shape_length() {
+        let (settled, dt, running) = run_shape(StreamShape::Length);
+        assert!(settled, "length stop must settle (running={running}, {:?})", dt);
+    }
+
+    #[test]
+    fn settle_shape_reasoning_content() {
+        let (settled, dt, running) = run_shape(StreamShape::ReasoningContent);
+        assert!(settled, "reasoning_content stream must settle (running={running}, {:?})", dt);
+    }
+
+    #[test]
+    fn settle_shape_chunked_interleaved() {
+        let (settled, dt, running) = run_shape(StreamShape::ChunkedInterleaved);
+        assert!(settled, "chunked+heartbeat+usage stream must settle (running={running}, {:?})", dt);
+    }
+
+    #[test]
+    fn settle_shape_trailing_comment() {
+        let (settled, dt, running) = run_shape(StreamShape::TrailingComment);
+        assert!(settled, "trailing keepalive must settle (running={running}, {:?})", dt);
     }
 }

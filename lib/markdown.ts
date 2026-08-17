@@ -309,9 +309,12 @@ function normalizeInlineLatexMath(line: string): string {
     return line;
   }
 
+  // WKWebView 兼容:lookbehind(?<!\\) 需 Safari 16.4+,esbuild 不转译正则,
+  // 老系统直接 SyntaxError 崩渲染(fork 差异,上游目标现代浏览器)。
+  // 等价改写:前缀捕获组回填。
   return line.replace(
-    /(?<!\\)\\\(([^`\r\n$]+?)(?<!\\)\\\)/g,
-    (match, math: string) => (math.trim() ? `$${math}$` : match),
+    /(^|[^\\])\\\(([^`\r\n$]+?)\\\)/g,
+    (match, prefix: string, math: string) => (math.trim() ? `${prefix}$${math}$` : match),
   );
 }
 
