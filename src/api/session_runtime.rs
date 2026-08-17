@@ -129,6 +129,8 @@ impl SessionRuntime {
     }
 
     /// 创建并注册会话(溢出 = 关旧建新,对齐 moho Clear/rebuild 语义)。
+    /// 返回 (session_id, 引擎 provider, 引擎 model, 引擎 thinking)——后三者
+    /// 供 agent_new 响应回传(对齐上游 route.ts:70-84,前端据此同步选中态)。
     pub async fn create(
         &self,
         ctx: &ExecCtx,
@@ -137,7 +139,7 @@ impl SessionRuntime {
         model: Option<String>,
         thinking_level: Option<String>,
         enabled_tools: Option<Vec<String>>,
-    ) -> Result<String, ApiError> {
+    ) -> Result<(String, Option<String>, Option<String>, Option<String>), ApiError> {
         // 引擎会话创建(重、同步外壳)走 blocking pool
         let hooks = ctx.hooks.clone();
         let provider_c = provider.clone();
@@ -160,13 +162,11 @@ impl SessionRuntime {
             let options = pi::sdk::SessionOptions {
                 provider: provider_c,
                 model: model_c,
-                // 默认 off(对齐 moho build_session_options;agent_new 可覆盖)
-                thinking: Some(
-                    tl_c
-                        .as_deref()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(pi::sdk::ThinkingLevel::Off),
-                ),
+                // 仅显式传值(行级对齐上游 route.ts:61):未指定时交引擎解析
+                // (scoped pin → 会话恢复 → settings default_thinking_level →
+                // 引擎默认经 clamp,app.rs:620-637)。此前强制 Off 会覆盖
+                // settings 默认与 enabledModels 的 pin。
+                thinking: tl_c.as_deref().and_then(|s| s.parse().ok()),
                 system_prompt: hooks.system_prompt(),
                 enabled_tools: tools_c,
                 no_session: false,
@@ -191,10 +191,16 @@ impl SessionRuntime {
         // registry 对 models.json 键名与 entry.provider 字段的映射在显式
         // find 路径上存在口径差 —— 自动选择路径已验证可用,显式路径待上游
         // 追踪核实后放开)
-        let (eng_provider, eng_model) = engine_state
+        let (eng_provider, eng_model, eng_thinking) = engine_state
             .as_ref()
-            .map(|s| (Some(s.provider.clone()), Some(s.model_id.clone())))
-            .unwrap_or((None, None));
+            .map(|s| {
+                (
+                    Some(s.provider.clone()),
+                    Some(s.model_id.clone()),
+                    s.thinking_level.map(|t| t.to_string()),
+                )
+            })
+            .unwrap_or((None, None, None));
 
         // 溢出:容量满 → 剔除最旧(drop sender → 任务循环退出)
         {
@@ -213,9 +219,10 @@ impl SessionRuntime {
         let (tx, rx) = mpsc::channel::<SessionCmd>(64);
         let snap = Arc::new(Mutex::new(SessionSnap {
             session_id: Some(session_id.clone()),
-            model_provider: eng_provider.or(provider),
-            model_id: eng_model.or(model),
-            thinking_level,
+            model_provider: eng_provider.clone().or(provider),
+            model_id: eng_model.clone().or(model),
+            // 引擎解析真相优先(含 scoped pin/settings 默认);显式请求值兜底
+            thinking_level: eng_thinking.clone().or(thinking_level),
             cwd: Some(cwd.to_string()),
             ..Default::default()
         }));
@@ -243,7 +250,14 @@ impl SessionRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(session_id.clone(), SessionHandle { tx, snap, dead });
-        Ok(session_id)
+        // 引擎真相随会话返回(agent_new 响应回传 model/thinkingLevel,
+        // 对齐上游 route.ts:70-84)
+        Ok((
+            session_id,
+            eng_provider,
+            eng_model,
+            eng_thinking,
+        ))
     }
 
     /// 显式销毁(drop sender → 任务退出;注册表剔除)。
@@ -827,7 +841,7 @@ mod sink_tests {
         std::fs::create_dir_all(&pi).unwrap();
         std::fs::write(
             pi.join("models.json"),
-            r#"{"providers":{"probe":{"baseUrl":"https://probe.invalid","api":"openai-completions","apiKey":"k","models":[{"id":"p1"}]}}}}"#,
+            r#"{"providers":{"probe":{"baseUrl":"https://probe.invalid","api":"openai-completions","apiKey":"k","models":[{"id":"p1"}]}}}"#,
         )
         .unwrap();
         let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
@@ -1258,7 +1272,7 @@ mod bash_tests {
         std::fs::create_dir_all(&pi).unwrap();
         std::fs::write(
             pi.join("models.json"),
-            r#"{"providers":{"probe":{"baseUrl":"https://probe.invalid","api":"openai-completions","apiKey":"k","models":[{"id":"p1"}]}}}}"#,
+            r#"{"providers":{"probe":{"baseUrl":"https://probe.invalid","api":"openai-completions","apiKey":"k","models":[{"id":"p1"}]}}}"#,
         )
         .unwrap();
         let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
@@ -1333,6 +1347,71 @@ mod bash_tests {
         // 回落:get_state isBashRunning=false
         let resp = call(&api, get(&format!("/api/agent/{sid}"))).expect("state ok");
         assert_eq!(body(&resp)["state"]["isBashRunning"], serde_json::json!(false));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// agent_new 契约(对齐上游 route.ts:49-51/70-84):
+    /// - 未显式指定模型 → 引擎兜底选中 models.json 里唯一有 key 的自定义
+    ///   provider(而非偏好表条目 —— bedrock 无 AWS 凭证时 not ready 是
+    ///   引擎侧 TS hasConfiguredAuth 对齐修复的行为断言);
+    /// - 响应回传引擎真相 model/thinkingLevel(前端同步选中态);
+    /// - provider/modelId 半配对 → 400。
+    #[test]
+    fn agent_new_contract_model_thinking_roundtrip() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = real_home();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let api = api_for(&tmp);
+        let cwd = tmp.to_string_lossy().to_string();
+        // 未显式模型 → 引擎兜底 = 唯一 ready 的 probe/p1
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create ok");
+        let v = body(&resp);
+        assert!(
+            v["model"]["provider"] == serde_json::json!("probe"),
+            "engine fallback must pick the user-configured provider, got: {v}"
+        );
+        assert_eq!(v["model"]["modelId"], serde_json::json!("p1"));
+        assert!(
+            v["thinkingLevel"].is_string(),
+            "engine-resolved thinking must round-trip, got: {v}"
+        );
+
+        // 显式模型 → 精确透传
+        let resp = call(
+            &api,
+            post(
+                "/api/agent/new",
+                &format!(r#"{{"cwd":"{cwd}","provider":"probe","modelId":"p1"}}"#),
+            ),
+        )
+        .expect("explicit create ok");
+        let v = body(&resp);
+        assert_eq!(v["model"]["provider"], serde_json::json!("probe"));
+        assert_eq!(v["model"]["modelId"], serde_json::json!("p1"));
+
+        // 半配对 → 400(成对校验)
+        for half in [
+            format!(r#"{{"cwd":"{cwd}","provider":"probe"}}"#),
+            format!(r#"{{"cwd":"{cwd}","modelId":"p1"}}"#),
+        ] {
+            match call(&api, post("/api/agent/new", &half)) {
+                Ok(resp) => assert_eq!(resp.status(), 400, "half-pair must 400: {half}"),
+                Err(e) => assert_eq!(e.status, 400, "half-pair must 400: {half}"),
+            }
+        }
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),

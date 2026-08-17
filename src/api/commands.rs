@@ -350,15 +350,31 @@ async fn agent_new(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
     };
     let provider = dispatch.args.get("provider").and_then(|v| v.as_str()).map(String::from);
     let model = dispatch.args.get("modelId").and_then(|v| v.as_str()).map(String::from);
+    // 成对校验(对齐上游 route.ts:49-51):半配对属契约错误,400。
+    match (provider.as_deref(), model.as_deref()) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ApiError::new(400, "provider and modelId must be provided together"));
+        }
+        _ => {}
+    }
     let thinking = dispatch.args.get("thinkingLevel").and_then(|v| v.as_str()).map(String::from);
     let tools = dispatch.args.get("toolNames").and_then(|v| v.as_array()).map(|a| {
         a.iter().filter_map(|t| t.as_str().map(String::from)).collect::<Vec<_>>()
     });
-    let session_id = ctx
+    let (session_id, eng_provider, eng_model, eng_thinking) = ctx
         .sessions
         .create(ctx, &cwd, provider, model, thinking, tools)
         .await?;
-    json_response(json!({ "sessionId": session_id }))
+    // 响应回传引擎实际选中(对齐上游 route.ts:70-84:前端 setNewSessionDefaultModel
+    // /setThinkingLevel 消费,消灭"UI 显示 A、引擎用 B")
+    json_response(json!({
+        "sessionId": session_id,
+        "model": match (eng_provider, eng_model) {
+            (Some(p), Some(m)) => json!({ "provider": p, "modelId": m }),
+            _ => Value::Null,
+        },
+        "thinkingLevel": eng_thinking,
+    }))
 }
 
 /// GET /api/agent/running —— {runningSessionIds}(侧栏轮询面)。
