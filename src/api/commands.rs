@@ -76,6 +76,8 @@ pub(crate) async fn execute(
         "file_index" => super::file_index::file_index_command(&ctx, dispatch).await,
         "models_list" => super::models::models_list(&ctx, dispatch).await,
         "models_config_get" => super::models::models_config_get(&ctx).await,
+        "models_config_discover" => super::models::models_config_discover(&ctx, dispatch).await,
+        "models_config_test" => super::models::models_config_test(&ctx, dispatch).await,
         "models_config_put" => super::models::models_config_put(&ctx, dispatch).await,
         "agent_new" => agent_new(&ctx, dispatch).await,
         "agent_running" => agent_running(&ctx),
@@ -648,7 +650,7 @@ fn catalog_from_cache() -> Option<Value> {
 }
 
 /// catalog 获取:缓存快路径 + 未命中时**专用线程**网络抓取。
-/// 网络经 HostHooks::fetch_text(阻塞,宿主侧 15s 超时)—— 不得占用共享
+/// 网络经 HostHooks::fetch(策略在此:15s;机制在宿主)—— 不得占用共享
 /// blocking 池:池线程被数秒级网络等待独占时,sessions_list 等本地 IO
 /// 命令会在池上排队饿死(宿主过渡代理 2s 收包超时 → 侧栏 HTTP 500,
 /// 网络不可达机型上 100% 复现)。等待在 async 上下文(oneshot),池零占用。
@@ -659,7 +661,14 @@ async fn fetch_catalog(hooks: Arc<dyn HostHooks>) -> Result<Value, String> {
     let (tx, rx) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let fetched = (|| {
-            let text = hooks.fetch_text(CATALOG_URL)?;
+            let resp = hooks.fetch(&super::FetchSpec::get_json(
+                CATALOG_URL,
+                std::time::Duration::from_secs(15), // 对齐旧 handler 的 catalog 超时
+            ))?;
+            if !(200..300).contains(&resp.status) {
+                return Err(format!("fetch {CATALOG_URL}: HTTP {}", resp.status));
+            }
+            let text = resp.text();
             let v: Value =
                 serde_json::from_str(&text).map_err(|e| format!("catalog parse: {e}"))?;
             let _ = std::fs::write(catalog_cache_path(), &text);

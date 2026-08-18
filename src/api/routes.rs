@@ -85,6 +85,8 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("GET", "/api/file-index", "file_index", TimeoutClass::Default),
     ("GET", "/api/models", "models_list", TimeoutClass::Default),
     ("GET", "/api/models-config", "models_config_get", TimeoutClass::Default),
+    ("POST", "/api/models-config/discover", "models_config_discover", TimeoutClass::Default),
+    ("POST", "/api/models-config/test", "models_config_test", TimeoutClass::Default),
     ("GET", "/api/models-config/catalog", "models_config_catalog", TimeoutClass::Default),
     ("GET", "/api/project-trust", "project_trust_get", TimeoutClass::Default),
     ("POST", "/api/project-trust", "project_trust_set", TimeoutClass::Default),

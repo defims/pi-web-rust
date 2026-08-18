@@ -83,10 +83,10 @@ pub fn build_discovery_models_document(provider_name: &str, provider: &Value) ->
 }
 
 /// 临时目录 RAII 守卫(等价 TS 的 `finally { rmSync(tempDir, recursive, force) }`)。
-struct TempDirGuard(PathBuf);
+pub(crate) struct TempDirGuard(PathBuf);
 
 impl TempDirGuard {
-    fn create(prefix: &str) -> io::Result<Self> {
+    pub(crate) fn create(prefix: &str) -> io::Result<Self> {
         let base = std::env::temp_dir();
         // mkdtemp 等价语义:不断尝试不存在的唯一名
         let mut attempts = 0u32;
@@ -108,7 +108,7 @@ impl TempDirGuard {
         }
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }

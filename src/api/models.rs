@@ -271,3 +271,468 @@ mod tests {
         http::Request::builder().method("GET").uri(uri).body(Vec::new()).unwrap()
     }
 }
+
+// ============================================================================
+// POST /api/models-config/discover + /test —— 上游 route.ts 下沉(2026-08-18)
+// ============================================================================
+
+/// 按家族鉴权头(对齐上游 discover/route.ts buildHeaders):accept 统一;
+/// anthropic → x-api-key + anthropic-version;google → x-goog-api-key;
+/// 其余 → Authorization: Bearer。provider 条目的自定义 headers 先铺
+/// (上游 configured Headers 语义:用户显式头优先,家族头仅补缺)。
+fn discovery_headers(api: &str, api_key: Option<&str>, configured: &serde_json::Value) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = vec![("accept".to_string(), "application/json".to_string())];
+    if let Some(obj) = configured.as_object() {
+        for (k, v) in obj {
+            if let Some(vs) = v.as_str() {
+                headers.push((k.clone(), vs.to_string()));
+            }
+        }
+    }
+    let key = api_key.map(str::trim).filter(|k| !k.is_empty());
+    if let Some(key) = key {
+        fn has(headers: &[(String, String)], name: &str) -> bool {
+            headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+        }
+        match api {
+            "anthropic-messages" => {
+                if !has(&headers, "x-api-key") {
+                    headers.push(("x-api-key".to_string(), key.to_string()));
+                }
+                if !has(&headers, "anthropic-version") {
+                    headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
+                }
+            }
+            "google-generative-ai" => {
+                if !has(&headers, "x-goog-api-key") {
+                    headers.push(("x-goog-api-key".to_string(), key.to_string()));
+                }
+            }
+            _ => {
+                if !has(&headers, "authorization") {
+                    headers.push(("authorization".to_string(), format!("Bearer {key}")));
+                }
+            }
+        }
+    }
+    headers
+}
+
+/// POST /api/models-config/discover:provider /models 端点探测,自动填模型列表。
+pub(crate) async fn models_config_discover(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let provider_name = dispatch.args.get("providerName").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if provider_name.is_empty() {
+        return Err(ApiError::new(400, "providerName is required"));
+    }
+    let provider = dispatch.args.get("provider").cloned().unwrap_or(Value::Null);
+    if !provider.is_object() {
+        return Err(ApiError::new(400, "provider is required"));
+    }
+    let base_url = provider.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if base_url.is_empty() {
+        return Err(ApiError::new(400, "Base URL is required"));
+    }
+    let api = provider
+        .get("api")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("openai-completions")
+        .to_string();
+    let endpoint = crate::models::discovery::build_models_list_url(&base_url, &api);
+    // 鉴权:fallback 已裁(定案 2026-08-18)——provider 条目 apiKey + 自定义头
+    let api_key = provider.get("apiKey").and_then(|v| v.as_str()).map(str::to_string);
+    if provider.get("apiKey").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false)
+        && api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).is_none()
+    {
+        return Err(ApiError::new(400, format!("No API key found for \"{provider_name}\"")));
+    }
+    let headers = discovery_headers(&api, api_key.as_deref(), provider.get("headers").unwrap_or(&Value::Null));
+
+    // 网络:专用线程 + oneshot(不占共享 blocking 池 —— catalog 停顿教训)
+    let hooks = ctx.hooks.clone();
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let r = hooks.fetch(&super::FetchSpec {
+            url: endpoint.clone(),
+            headers,
+            timeout: std::time::Duration::from_secs(20), // DISCOVERY_TIMEOUT_MS
+        });
+        let _ = tx.send((endpoint, r));
+    });
+    let (endpoint, result) = rx.await.map_err(|_| ApiError::internal("discovery thread crashed"))?;
+    let resp = match result {
+        Ok(r) => r,
+        Err(e) => {
+            // 超时分类(宿主 fetch 的超时错误含 "timed out";对齐上游 504)
+            if e.to_lowercase().contains("timed out") {
+                return Err(ApiError::new(504, "Model discovery timed out"));
+            }
+            return Err(ApiError::new(502, format!("network error: {e}")));
+        }
+    };
+    if !(200..300).contains(&resp.status) {
+        let text = resp.text();
+        let msg = if text.is_empty() {
+            format!("Upstream returned HTTP {}", resp.status)
+        } else {
+            text.chars().take(500).collect::<String>()
+        };
+        return Err(ApiError::new(502, msg));
+    }
+    let v: Value = match serde_json::from_slice(&resp.body) {
+        Ok(v) => v,
+        Err(_) => return Err(ApiError::new(502, "Upstream model list was not valid JSON")),
+    };
+    let models = crate::models::discovery::parse_discovered_models(&v);
+    if models.is_empty() {
+        return Err(ApiError::new(502, "No models found in the upstream response"));
+    }
+    super::commands::json_response(json!({ "models": models, "endpoint": endpoint }))
+}
+
+/// 集成:本地 HTTP server + 直连 fetch 钩子(测试侧手写最小 GET 客户端,
+/// 佐证头按家族送达 + 解析 + 404→502 映射)。
+#[cfg(test)]
+mod discover_tests {
+    use super::*;
+    use crate::api::{ApiConfig, EventSink, HostHooks, PiWebApi};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    struct Hooks(std::path::PathBuf);
+    impl HostHooks for Hooks {
+        fn sessions_root(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.join("sessions"))
+        }
+        fn fetch(&self, spec: &super::super::FetchSpec) -> Result<super::super::FetchResponse, String> {
+            // 最小 HTTP GET(std::net;picrab-web 零 HTTP 纪律在测试侧同样成立)
+            let url = spec.url.trim_start_matches("http://");
+            let (hostport, path) = url.split_once('/').ok_or("bad url")?;
+            let mut stream = std::net::TcpStream::connect(hostport).map_err(|e| e.to_string())?;
+            let mut req = format!("GET /{path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n");
+            for (k, v) in &spec.headers {
+                req.push_str(&format!("{k}: {v}\r\n"));
+            }
+            req.push_str("\r\n");
+            stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            let (head, body) = text.split_once("\r\n\r\n").ok_or("no body")?;
+            let status: u16 = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .ok_or("bad status")?;
+            Ok(super::super::FetchResponse { status, body: body.as_bytes().to_vec() })
+        }
+    }
+
+    /// 单请求 server:记录收到的 Authorization 头,回 /models JSON。
+    fn spawn_models_server(auth_seen: Arc<std::sync::Mutex<Option<String>>>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf).to_string();
+                if let Some(line) = req.lines().find(|l| l.to_lowercase().starts_with("authorization:")) {
+                    *auth_seen.lock().unwrap() = Some(line["authorization:".len()..].trim().to_string());
+                }
+                let body = r#"{"data":[{"id":"m-a"},{"id":"m-b"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn api_with_hooks(tmp: &std::path::Path) -> PiWebApi {
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(2, 4)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let mut cfg = ApiConfig::new(Arc::new(|_: crate::api::ApiEvent| {}) as EventSink);
+        cfg.hooks = Arc::new(Hooks(tmp.to_path_buf()));
+        PiWebApi::new(rt, cfg)
+    }
+
+    fn call(api: &PiWebApi, req: http::Request<Vec<u8>>) -> Result<http::Response<Vec<u8>>, crate::api::ApiError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        api.handle(req, Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("responder")
+    }
+
+    /// test 命令:假 LLM → ok:true + reply;隔离注册表不碰真实 models.json。
+    #[test]
+    fn models_test_ok_via_fake_llm_and_isolated_registry() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("mtest-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        // 假 SSE LLM server(标准流形态)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = concat!(
+                    "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":null}]}
+
+",
+                    "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+",
+                    "data: [DONE]
+
+",
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Content-Length: {}
+Connection: close
+
+{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let real_models = tmp.join(".pi/agent/models.json");
+        std::fs::create_dir_all(real_models.parent().unwrap()).unwrap();
+        std::fs::write(&real_models, r#"{"providers":{}}"#).unwrap(); // 真实注册表保持空
+        let api = api_with_hooks(&tmp);
+
+        let body = json!({
+            "providerName": "fake",
+            "provider": {
+                "baseUrl": format!("http://127.0.0.1:{port}/v1"),
+                "api": "openai-completions",
+                "apiKey": "k",
+            },
+            "model": { "id": "f1" }
+        });
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/api/models-config/test")
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        let resp = call(&api, req).expect("test cmd ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["ok"], json!(true), "test response: {v}");
+        assert!(v["responseText"].as_str().unwrap_or("").contains("OK"), "{v}");
+        assert!(v["latencyMs"].as_u64().is_some(), "{v}");
+        // 隔离:真实 models.json 不被改写
+        let after = std::fs::read_to_string(&real_models).unwrap();
+        assert_eq!(after, r#"{"providers":{}}"#, "real registry must stay untouched");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    #[test]
+    fn discover_returns_models_and_sends_bearer() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("discover-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let auth = Arc::new(std::sync::Mutex::new(None));
+        let port = spawn_models_server(auth.clone());
+        let api = api_with_hooks(&tmp);
+
+        let body = json!({
+            "providerName": "fake",
+            "provider": {
+                "baseUrl": format!("http://127.0.0.1:{port}/v1"),
+                "api": "openai-completions",
+                "apiKey": "sk-test",
+            }
+        });
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/api/models-config/discover")
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        let resp = call(&api, req).expect("discover ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        let ids: Vec<&str> = v["models"].as_array().unwrap().iter()
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str())).collect();
+        assert_eq!(ids, vec!["m-a", "m-b"], "parsed models: {v}");
+        assert!(v["endpoint"].as_str().unwrap_or("").contains("/v1/models"));
+        assert_eq!(auth.lock().unwrap().as_deref(), Some("Bearer sk-test"), "bearer header sent");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+}
+
+/// POST /api/models-config/test:经引擎真发一条补全(上游 completeSimple 等价)。
+///
+/// 四条硬性约束(评审 2026-08-18):
+/// - 裸 handle 不入 SessionRuntime 注册表(宿主 max_sessions=1 会驱逐活会话);
+/// - 事件零出口(on_event: None —— 经全局 sink 会污染 lastActive 会话);
+/// - system_prompt: None + enabled_tools: [](上游 completeSimple 无 prompt 无工具);
+/// - models_path 临时注册表隔离(不碰用户 models.json;auth 路径保持全局)。
+pub(crate) async fn models_config_test(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    // 上游 test.ts:31-37:缺参 → 400,先于一切网络
+    let provider_name = dispatch.args.get("providerName").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if provider_name.is_empty() {
+        return Err(ApiError::new(400, "providerName is required"));
+    }
+    let provider = dispatch.args.get("provider").cloned().unwrap_or(Value::Null);
+    if !provider.is_object() {
+        return Err(ApiError::new(400, "provider is required"));
+    }
+    let model = dispatch.args.get("model").cloned().unwrap_or(Value::Null);
+    if !model.is_object() {
+        return Err(ApiError::new(400, "model is required"));
+    }
+    let model_id = model.get("id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if model_id.is_empty() {
+        return Err(ApiError::new(400, "Model ID is required"));
+    }
+    // Content-Type → 415(上游 hasJsonContentType;嵌入语境跳过 isApiRequestAllowed)
+    if let Some(ct) = &dispatch.content_type {
+        if !ct.to_ascii_lowercase().starts_with("application/json") {
+            return Err(ApiError::new(415, "Content-Type must be application/json"));
+        }
+    }
+
+    // 临时注册表隔离(上游 mkdtemp + 单 provider 文档)
+    // TempDirGuard 是 discovery_auth 的私有 RAII;此处直接内联同款(等价上游 mkdtemp)
+    let temp = crate::models::discovery_auth::TempDirGuard::create("picrab-model-test-")
+        .map_err(|e| ApiError::internal(format!("tempdir: {e}")))?;
+    let models_path = temp.path().join("models.json");
+    // 文档 = 单 provider + 单真实模型(上游 test.ts:44-53 的
+    // {[providerName]: {...provider, models: [{...model, id}]}};不用
+    // discovery_auth 的 DISCOVERY_MODEL_ID 占位 —— 那是 discover 鉴权解析用的)
+    let mut provider_obj = provider.as_object().cloned().unwrap_or_default();
+    let mut model_obj = model.as_object().cloned().unwrap_or_default();
+    model_obj.insert("id".to_string(), json!(model_id));
+    provider_obj.insert("models".to_string(), json!([Value::Object(model_obj)]));
+    let mut providers = serde_json::Map::new();
+    providers.insert(provider_name.clone(), Value::Object(provider_obj));
+    let document = json!({ "providers": Value::Object(providers) });
+    std::fs::write(&models_path, serde_json::to_vec(&document).map_err(|e| ApiError::internal(e.to_string()))?)
+        .map_err(|e| ApiError::internal(format!("write models.json: {e}")))?;
+
+    // 裸会话:一次性 handle,不入注册表;经 blocking 池建(重同步外壳)
+    let cwd = crate::paths::home_dir()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let provider_opt = Some(provider_name.clone()); // 注册表键 = providerName(上游 getModel)
+    let handle = super::commands::blocking(ctx, move || {
+        let options = pi::sdk::SessionOptions {
+            provider: provider_opt,
+            model: Some(model_id.clone()),
+            system_prompt: None,       // 双清零①:上游 completeSimple 无 prompt
+            enabled_tools: Some(vec![]), // 双清零②:无工具
+            no_session: true,          // 不落盘
+            models_path: Some(models_path.clone()),
+            working_directory: Some(cwd.clone()),
+            on_event: None,            // 事件零出口
+            ..Default::default()
+        };
+        futures::executor::block_on(pi::sdk::create_agent_session(options))
+            .map_err(|e| ApiError::new(400, format!("{e}")))
+    })
+    .await??;
+
+    // 单轮补全 + 20s 超时(TEST_TIMEOUT_MS)
+    let t0 = std::time::Instant::now();
+    let (ah, signal) = pi::sdk::AgentSessionHandle::new_abort_handle();
+    let mut h = handle;
+    h.set_max_tokens(Some(16)); // 上游 maxTokens:16
+    let now = asupersync::time::wall_now();
+    let fut = async move {
+        h.prompt_with_abort("Reply with OK only.", signal, |_| {}).await
+    };
+    let timed = asupersync::time::timeout(now, std::time::Duration::from_secs(20), fut);
+    let outcome = super::commands::blocking(ctx, move || futures::executor::block_on(timed))
+        .await
+        .map_err(|_| ApiError::internal("test thread dropped"))?;
+    let result = outcome.map_err(|_| {
+        ah.abort();
+        ApiError::new(504, "Model test timed out")
+    })?;
+    let latency_ms = t0.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(am) => {
+            if matches!(am.stop_reason, pi::sdk::StopReason::Error | pi::sdk::StopReason::Aborted) {
+                return super::commands::json_response(json!({
+                    "ok": false, "latencyMs": latency_ms,
+                    "error": am.error_message.unwrap_or_else(|| "stop reason: error".to_string()),
+                }));
+            }
+            let text: String = am
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    pi::sdk::ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            super::commands::json_response(json!({
+                "ok": true, "latencyMs": latency_ms,
+                "responseText": text.chars().take(300).collect::<String>(),
+            }))
+        }
+        Err(e) => super::commands::json_response(json!({
+            "ok": false, "error": e.to_string(),
+        })),
+    }
+}

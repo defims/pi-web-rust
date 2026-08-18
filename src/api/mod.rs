@@ -62,10 +62,43 @@ pub trait HostHooks: Send + Sync {
         None
     }
 
-    /// 网络文本抓取(models.dev catalog 等;picrab-web 保持零 HTTP 客户端,
-    /// 宿主注入 reqwest/其他)。默认不支持 → 依赖它的命令返回 502。
-    fn fetch_text(&self, url: &str) -> Result<String, String> {
-        Err(format!("fetch not supported by this host: {url}"))
+    /// 网络传输(单一传输钩子:机制在宿主,策略在调用方)。picrab-web 保持
+    /// 零 HTTP 客户端;fetch_text 的窄签名(无头/宿主藏超时)已退役 ——
+    /// discover 的按家族鉴权头、各路由超时常量(对齐上游)都由 FetchSpec 携带。
+    /// 默认不支持 → 依赖它的命令按各自语义返回 502/504。
+    fn fetch(&self, spec: &FetchSpec) -> Result<FetchResponse, String> {
+        Err(format!("fetch not supported by this host: {}", spec.url))
+    }
+}
+
+/// 传输请求描述(方法固定 GET;POST 需要时再扩)。
+#[derive(Debug, Clone)]
+pub struct FetchSpec {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub timeout: std::time::Duration,
+}
+
+impl FetchSpec {
+    pub fn get_json(url: impl Into<String>, timeout: std::time::Duration) -> Self {
+        Self {
+            url: url.into(),
+            headers: vec![("accept".to_string(), "application/json".to_string())],
+            timeout,
+        }
+    }
+}
+
+/// 传输响应(状态码 + 字节体)。
+#[derive(Debug, Clone)]
+pub struct FetchResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl FetchResponse {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
     }
 }
 
