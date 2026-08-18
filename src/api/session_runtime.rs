@@ -228,9 +228,12 @@ impl SessionRuntime {
         let rt = ctx.rt.clone();
         let sink = ctx.sink.clone();
         let hooks = ctx.hooks.clone();
+        let tx_task = tx.clone();
+        let dead_task = dead.clone();
+        let registry_task = self.sessions.clone();
         let _joined = rt.handle().spawn(async move {
             let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                session_loop(handle, rx, snap_task, sink, rt.clone(), hooks),
+                session_loop(handle, rx, tx_task, dead_task, registry_task, snap_task, sink, rt.clone(), hooks),
             ))
             .await;
             if result.is_err() {
@@ -350,11 +353,14 @@ impl SessionRuntime {
         let rt = ctx.rt.clone();
         let sink = ctx.sink.clone();
         let hooks = ctx.hooks.clone();
+        let tx_task = tx.clone();
+        let dead_task = dead.clone();
+        let registry_task = self.sessions.clone();
         let _joined = rt.handle().spawn(async move {
             // panic 纪律:mid-await panic 经 FutureExt::catch_unwind 截获(P0 报告:
             // panic 会向 await 点传播,监督任务不得被波及)
             let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                session_loop(handle, rx, snap_task, sink, rt.clone(), hooks),
+                session_loop(handle, rx, tx_task, dead_task, registry_task, snap_task, sink, rt.clone(), hooks),
             ))
             .await;
             if result.is_err() {
@@ -387,12 +393,22 @@ impl SessionRuntime {
         h.filter(|h| !h.dead.load(std::sync::atomic::Ordering::SeqCst))
     }
 
+    /// 正在运行的会话 id(对齐上游 getRunningRpcSessionIds/isRunning,
+    /// rpc-manager.ts:207-209、1491-1497):alive 且 streaming/prompt/compacting
+    /// 任一为真。此前只过滤 dead,导致所有聊过的会话永久显示运行中
+    /// (侧栏 spinner 永转)。
     pub fn running_ids(&self) -> Vec<String> {
         self.sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|(_, h)| !h.dead.load(std::sync::atomic::Ordering::SeqCst))
+            .filter(|(_, h)| {
+                if h.dead.load(std::sync::atomic::Ordering::SeqCst) {
+                    return false;
+                }
+                let s = h.snap.lock().unwrap_or_else(|e| e.into_inner());
+                s.is_streaming || s.is_prompt_running || s.is_compacting
+            })
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -406,6 +422,9 @@ impl SessionRuntime {
 async fn session_loop(
     mut handle: AgentSessionHandle,
     mut rx: mpsc::Receiver<SessionCmd>,
+    tx: mpsc::Sender<SessionCmd>,
+    dead: Arc<std::sync::atomic::AtomicBool>,
+    registry: Arc<Mutex<HashMap<String, SessionHandle>>>,
     snap: Arc<Mutex<SessionSnap>>,
     sink: super::EventSink,
     rt: Arc<asupersync::runtime::Runtime>,
@@ -425,7 +444,7 @@ async fn session_loop(
                         .await;
                 }
                 other => {
-                    idle_cmd(other, &mut handle, &snap, &sink, &rt, &hooks).await;
+                    idle_cmd(other, &mut handle, &snap, &sink, &rt, &hooks, &tx, &dead, &registry).await;
                 }
             },
         }
@@ -476,6 +495,9 @@ async fn idle_cmd(
     sink: &super::EventSink,
     rt: &Arc<asupersync::runtime::Runtime>,
     hooks: &Arc<dyn super::HostHooks>,
+    tx: &mpsc::Sender<SessionCmd>,
+    dead: &Arc<std::sync::atomic::AtomicBool>,
+    registry: &Arc<Mutex<HashMap<String, SessionHandle>>>,
 ) {
     match cmd {
         SessionCmd::Steer { message, reply } => {
@@ -584,8 +606,38 @@ async fn idle_cmd(
                         let cwd = snap.lock().unwrap_or_else(|e| e.into_inner()).cwd.clone().unwrap_or_default();
                         match rebuild_session(&mut handle, snap.clone(), Some(new_path.clone()), cwd, sink, rt, hooks).await {
                             Ok(()) => {
-                                let new_id = new_path
-                                    .file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
+                                // registry 重键(对齐上游 fork:cacheSessionPath(newId)+
+                                // 旧会话 shutdown):rebuild 已把 snap.session_id 换成
+                                // 新文件的引擎 id;旧键移除,新键接管本任务的 tx/snap。
+                                // 不重键则新 id 的后续 RPC 走 restore 为同一文件再起
+                                // 一个引擎实例(双写),旧键成孤儿。
+                                let new_id = snap
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .session_id
+                                    .clone()
+                                    .unwrap_or_default();
+                                let old_id_key = {
+                                    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut old: Option<String> = None;
+                                    for (k, v) in reg.iter() {
+                                        if std::sync::Arc::ptr_eq(&v.snap, &snap) {
+                                            old = Some(k.clone());
+                                            break;
+                                        }
+                                    }
+                                    if let Some(k) = &old {
+                                        reg.remove(k);
+                                    }
+                                    if !new_id.is_empty() {
+                                        reg.insert(
+                                            new_id.clone(),
+                                            SessionHandle { tx: tx.clone(), snap: snap.clone(), dead: dead.clone() },
+                                        );
+                                    }
+                                    old
+                                };
+                                let _ = old_id_key;
                                 let _ = reply.send(Ok(json!({ "cancelled": false, "newSessionId": new_id })));
                             }
                             Err(e) => {
@@ -1125,12 +1177,17 @@ pub(crate) fn fork_file(source: &std::path::Path, entry_id: Option<&str>) -> Res
     };
     let new_id = uuid::Uuid::new_v4().to_string();
     let parent_dir = source.parent().ok_or("source has no parent dir")?;
-    let new_path = parent_dir.join(format!("{new_id}.jsonl"));
+    // 文件名对齐 lib 落盘约定 <timestamp>_<id前8位>.jsonl(restore 扫描按此
+    // 约定匹配;裸 uuid 文件名会导致 fork 会话磁盘恢复 404)。
+    let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
+    let new_path = parent_dir.join(format!("{ts}_{}.jsonl", &new_id[..8]));
 
-    // header:branchedFrom = 源文件路径
+    // header:branchedFrom = 源文件路径;id 换成新会话 id(引擎按 header.id
+    // 建会话,restore 也按 header.id 校验 —— 不换则 fork 会话仍指向旧 id)
     let mut new_header = header;
     if let Some(obj) = new_header.as_object_mut() {
         obj.insert("branchedFrom".to_string(), serde_json::json!(source.to_string_lossy()));
+        obj.insert("id".to_string(), serde_json::json!(new_id));
     }
 
     let mut out = Vec::new();
@@ -1872,6 +1929,81 @@ mod success_settle_tests {
             Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
+    }
+
+    /// running_ids 只含真正运行的会话(对齐上游 isRunning):空闲后清空。
+    #[test]
+    fn running_ids_clear_after_settle() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("runids-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#))).expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // prompt 完成 → idle → running 列表必须清空(修复前恒含该 id)
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"hi"}"#)).expect("prompt");
+        assert_eq!(resp.status(), 200);
+        let t0 = std::time::Instant::now();
+        loop {
+            let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+            if !body(&st)["running"].as_bool().unwrap_or(true) {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "never idle");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let running = call(&api, get("/api/agent/running")).expect("running");
+        let ids = body(&running)["runningSessionIds"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !ids.iter().any(|v| v.as_str() == Some(sid.as_str())),
+            "idle session must not be reported running: {ids:?}"
+        );
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// fork 后:新文件名满足 <ts>_<id8>.jsonl 约定且 header.id 已换新 id。
+    #[test]
+    fn fork_file_matches_restore_convention() {
+        let tmp = tempfile_dir();
+        let src = tmp.join("2026-01-01T00-00-00.000Z_aaaa1111.jsonl");
+        std::fs::write(&src,
+            "{\"type\":\"session\",\"id\":\"aaaa1111-1111-1111-1111-111111111111\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-01-01T00:00:00.000Z\"}\n{\"type\":\"message\",\"id\":\"m1\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n"
+        ).unwrap();
+        let new_path = super::super::session_runtime::fork_file(&src, Some("m1")).expect("fork");
+        let name = new_path.file_name().unwrap().to_string_lossy().into_owned();
+        // 约定:8 位短 id 结尾 + 时间戳前缀
+        let id8 = name.trim_end_matches(".jsonl").rsplit('_').next().unwrap().to_string();
+        assert_eq!(id8.len(), 8, "filename must carry id prefix: {name}");
+        // header.id 已换新(读回校验)
+        let header = crate::session::reader::read_session_header(&new_path.to_string_lossy()).expect("header");
+        assert_ne!(header.id, "aaaa1111-1111-1111-1111-111111111111", "header id must be re-stamped");
+        assert!(header.id.starts_with(&id8), "header id must match filename prefix");
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("forkfile-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[test]
