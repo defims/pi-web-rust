@@ -152,32 +152,37 @@ function uploadFiles(
   strategy: UploadConflictStrategy,
   onProgress: (progress: number) => void,
 ): Promise<{ status: number; data: UploadResponse }> {
-  return new Promise((resolve, reject) => {
-    const formData = new FormData();
-    files.forEach((file) => formData.append("files", file, file.name));
-
-    const xhr = new XMLHttpRequest();
-    xhr.open(
-      "POST",
-      `/api/files/${encodeFilePathForApi(targetDirectory)}?type=upload&conflict=${strategy}`,
+  // Wire B 直连(2026-08-18):浏览器序列化 FormData 体在自定义协议 0B 到达
+  // (P0 T2B/T2D FAIL),上传须 fetch + 手工组 multipart(P0 T2E 已验证
+  // 字节完整)。XHR shim 随桥退役。
+  const boundary = `moho-${Math.random().toString(36).slice(2)}`;
+  const parts: Blob[] = [];
+  for (const file of files) {
+    const name = file.name.replace(/["\r\n]/g, "_");
+    parts.push(
+      new Blob([
+        `--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="${name}"\r\nContent-Type: ${file.type || "application/octet-stream"}\r\n\r\n`,
+      ]),
     );
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) {
-        onProgress(Math.round((event.loaded / event.total) * 100));
-      }
-    };
-    xhr.onerror = () => reject(new Error("Network error while uploading files"));
-    xhr.onabort = () => reject(new Error("Upload cancelled"));
-    xhr.onload = () => {
-      let data: UploadResponse = {};
-      try {
-        data = JSON.parse(xhr.responseText) as UploadResponse;
-      } catch {
-        if (xhr.responseText) data.error = xhr.responseText;
-      }
-      resolve({ status: xhr.status, data });
-    };
-    xhr.send(formData);
+    parts.push(file);
+    parts.push(new Blob(["\r\n"]));
+  }
+  parts.push(new Blob([`--${boundary}--\r\n`]));
+  const body = new Blob(parts, { type: "multipart/form-data; boundary=" + boundary });
+
+  return fetch(
+    `/api/files/${encodeFilePathForApi(targetDirectory)}?type=upload&conflict=${strategy}`,
+    { method: "POST", body },
+  ).then(async (res) => {
+    onProgress(100);
+    let data: UploadResponse = {};
+    try {
+      data = (await res.json()) as UploadResponse;
+    } catch {
+      const text = await res.text().catch(() => "");
+      if (text) data.error = text;
+    }
+    return { status: res.status, data };
   });
 }
 
