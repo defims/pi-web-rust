@@ -218,6 +218,7 @@ impl SessionRuntime {
             });
             let options = pi::sdk::SessionOptions {
                 system_prompt: hooks.system_prompt(),
+                tool_factory: hooks.tool_factory(),
                 no_session: false,
                 session_dir: Some(std::path::PathBuf::from(
                     super::commands::default_sessions_root_pub(),
@@ -316,6 +317,7 @@ impl SessionRuntime {
                 // settings 默认与 enabledModels 的 pin。
                 thinking: tl_c.as_deref().and_then(|s| s.parse().ok()),
                 system_prompt: hooks.system_prompt(),
+                tool_factory: hooks.tool_factory(),
                 enabled_tools: tools_c,
                 no_session: false,
                 session_dir: Some(std::path::PathBuf::from(
@@ -1443,6 +1445,7 @@ async fn rebuild_session(
     let path_c = path.clone();
     let options = pi::sdk::SessionOptions {
         system_prompt: hooks.system_prompt(),
+        tool_factory: hooks.tool_factory(),
         no_session: false,
         session_dir: Some(std::path::PathBuf::from(super::commands::default_sessions_root_pub())),
         working_directory: Some(std::path::PathBuf::from(cwd)),
@@ -2381,6 +2384,85 @@ mod success_settle_tests {
             "consumed"
         };
         assert_eq!(queued, "consumed");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// tool_factory 接线回归:hooks 提供的工厂必须在建会话时被引擎调用
+    /// (Wire B 会话曾漏传 → Moho 工具全丢)。
+    #[test]
+    fn host_tool_factory_invoked_on_create() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("toolfac-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        struct SpyFactory(std::sync::atomic::AtomicBool);
+        impl pi::sdk::ToolFactory for SpyFactory {
+            fn create_tool_registry(
+                &self,
+                enabled: &[&str],
+                cwd: &std::path::Path,
+                config: &pi::sdk::Config,
+            ) -> pi::sdk::ToolRegistry {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                pi::sdk::default_tool_registry(enabled, cwd, config)
+            }
+        }
+
+        let spy = Arc::new(SpyFactory(std::sync::atomic::AtomicBool::new(false)));
+        struct FactoryHooks(std::sync::Arc<SpyFactory>, std::path::PathBuf);
+        impl HostHooks for FactoryHooks {
+            fn sessions_root(&self) -> Option<std::path::PathBuf> {
+                Some(self.1.join("sessions"))
+            }
+            fn tool_factory(&self) -> Option<Arc<dyn pi::sdk::ToolFactory>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        // api_with_provider 用默认 Hooks;这里手搭一个带工厂的 api
+        let pi_dir = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi_dir).unwrap();
+        std::fs::write(
+            pi_dir.join("models.json"),
+            format!(
+                r#"{{"providers":{{"fake":{{"baseUrl":"http://127.0.0.1:{port}/v1","api":"openai-completions","apiKey":"k","models":[{{"id":"f1","name":"f1"}}]}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(2, 4)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let mut cfg = crate::api::ApiConfig::new(Arc::new(|_: crate::api::ApiEvent| {}) as EventSink);
+        cfg.hooks = Arc::new(FactoryHooks(spy.clone(), tmp.clone()));
+        let api = PiWebApi::new(rt, cfg);
+
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#))).expect("create");
+        assert_eq!(resp.status(), 200);
+        assert!(
+            spy.0.load(std::sync::atomic::Ordering::SeqCst),
+            "tool_factory must be invoked during session creation"
+        );
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),

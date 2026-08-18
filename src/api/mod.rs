@@ -48,9 +48,11 @@ pub trait HostHooks: Send + Sync {
         None
     }
 
-    /// 额外工具注册(moho_tools 注入面)。
-    fn extra_tools(&self) -> Vec<String> {
-        Vec::new()
+    /// 宿主原生工具工厂(嵌入者缝:引擎 SessionOptions::tool_factory 的注入面,
+    /// 上游 SDK 文档明示给"下游嵌入者叠加原生工具"用 —— moho_tools 五工具)。
+    /// None = 引擎默认工具集。
+    fn tool_factory(&self) -> Option<std::sync::Arc<dyn pi::sdk::ToolFactory>> {
+        None
     }
 
     /// 会话根目录覆盖(moho-mate 的 AppConfig.chat.session_dir 注入面;
