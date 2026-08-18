@@ -81,6 +81,8 @@ pub(crate) struct SessionSnap {
     pub is_bash_running: bool,
     /// bash 子进程 pid(abort kill 用)
     pub bash_child_pid: Option<u32>,
+    /// 会话名(SetSessionName 维护;get_session_stats 合并进响应)
+    pub session_name: Option<String>,
 }
 
 impl SessionSnap {
@@ -682,7 +684,15 @@ async fn idle_cmd(
             let _ = reply.send(r);
         }
         SessionCmd::SetSessionName { name, reply } => {
-            let r = handle.set_session_name(&name).await.map(|_| json!({})).map_err(|e| format!("{e}"));
+            // 空名校验(对齐上游 rpc-manager.ts:607-613:空名直接拒绝)
+            let r = if name.trim().is_empty() {
+                Err("session name must not be empty".to_string())
+            } else {
+                handle.set_session_name(&name).await.map(|_| json!({})).map_err(|e| format!("{e}"))
+            };
+            if r.is_ok() {
+                snap.lock().unwrap_or_else(|e| e.into_inner()).session_name = Some(name);
+            }
             let _ = reply.send(r);
         }
         SessionCmd::Bash { command, reply } => {
@@ -819,7 +829,11 @@ async fn idle_cmd(
             let r = handle
                 .compact(|_| {}) // 事件经 session 级 on_event 透传(避免双发)
                 .await
-                .map(|_| json!({ "result": "ok" }))
+                .map(|_| {
+                    // InProcess compact 不暴露 token 统计(上游契约要 tokensBefore/
+                    // estimatedTokensAfter,仅在 RPC 变体可得)—— 保持 result 信封
+                    json!({ "result": "ok" })
+                })
                 .map_err(|e| format!("{e}"));
             {
                 let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
@@ -850,7 +864,16 @@ async fn idle_cmd(
             let _ = reply.send(Err(format!("{what}: extension wiring pending")));
         }
         SessionCmd::GetStats { reply } => {
-            let stats = handle.get_session_stats().await.unwrap_or_else(|_| json!({}));
+            let mut stats = handle.get_session_stats().await.unwrap_or_else(|_| json!({}));
+            // 合并 snap 会话名(上游 get_session_stats 契约含 sessionName;
+            // 引擎 InProcess 统计不带名字段)
+            if stats.get("sessionName").and_then(|v| v.as_str()).map_or(true, |n| n.is_empty()) {
+                if let Some(name) = snap.lock().unwrap_or_else(|e| e.into_inner()).session_name.clone() {
+                    if let Some(obj) = stats.as_object_mut() {
+                        obj.insert("sessionName".to_string(), serde_json::json!(name));
+                    }
+                }
+            }
             let _ = reply.send(Ok(stats));
         }
         SessionCmd::GetLastText { reply } => {
@@ -2186,6 +2209,49 @@ mod success_settle_tests {
         )
         .expect_err("out-of-scope must 400");
         assert_eq!(e.status, 400, "got: {:?}", e.message);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// P2:空会话名拒绝;合法重命名写入 stats.sessionName(上游契约)。
+    #[test]
+    fn set_session_name_validation_and_stats_merge() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("name-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#))).expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // 空名 → 400 语义(上游 rpc-manager 拒绝)
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"set_session_name","name":"  "}"#)).expect("empty");
+        assert_eq!(resp.status(), 500, "empty name must error");
+        let v = body(&resp);
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("must not be empty")), "{v}");
+
+        // 合法名 → 200 + stats 合并
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"set_session_name","name":"My Project"}"#)).expect("rename");
+        assert_eq!(resp.status(), 200);
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"get_session_stats"}"#)).expect("stats");
+        assert_eq!(resp.status(), 200);
+        let data = &body(&resp)["data"];
+        assert_eq!(data["sessionName"], serde_json::json!("My Project"), "stats must carry name: {data}");
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
