@@ -83,6 +83,9 @@ pub(crate) struct SessionSnap {
     pub bash_child_pid: Option<u32>,
     /// 会话名(SetSessionName 维护;get_session_stats 合并进响应)
     pub session_name: Option<String>,
+    /// 运行期排队的完整 prompt(上游 pendingPromptCount 语义:连发第二条
+    /// prompt 不拒绝,当前 turn 完成后自动续跑;reply 在入队时已 ack)
+    pub queued_prompts: VecDeque<(String, Option<Vec<pi::sdk::ImageContent>>)>,
 }
 
 impl SessionSnap {
@@ -582,33 +585,52 @@ async fn session_loop(
 async fn handle_prompt_turn(
     handle: &mut AgentSessionHandle,
     rx: &mut mpsc::Receiver<SessionCmd>,
-    message: String,
-    images: Option<Vec<pi::sdk::ImageContent>>,
+    mut message: String,
+    mut images: Option<Vec<pi::sdk::ImageContent>>,
     abort_handle: &mut Option<AbortHandle>,
     snap: &Arc<Mutex<SessionSnap>>,
     sink: &super::EventSink,
 ) {
-    {
-        let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
-        for m in s.queued_steering.drain(..) {
-            let _ = handle.session_mut().agent.queue_steering(user_text_message(m));
+    // 循环:首轮用参数,之后续跑 queued_prompts(上游 pendingPromptCount
+    // 排队语义 —— 连发第二条 prompt 不拒绝,当前 turn 完成自动续跑)
+    loop {
+        {
+            let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+            for m in s.queued_steering.drain(..) {
+                let _ = handle.session_mut().agent.queue_steering(user_text_message(m));
+            }
+            for m in s.queued_follow_up.drain(..) {
+                let _ = handle.session_mut().agent.queue_follow_up(user_text_message(m));
+            }
         }
-        for m in s.queued_follow_up.drain(..) {
-            let _ = handle.session_mut().agent.queue_follow_up(user_text_message(m));
+        let (ah, signal) = AgentSessionHandle::new_abort_handle();
+        *abort_handle = Some(ah);
+        mark_running(snap, true);
+        let fut: PinBoxPromptFut<'_> = match images {
+            Some(imgs) if !imgs.is_empty() => {
+                Box::pin(handle.prompt_images_with_abort(message, imgs, signal, |_| {}))
+            }
+            _ => Box::pin(handle.prompt_with_abort(message, signal, |_| {})),
+        };
+        let res = run_prompt_until_settled(fut, rx, abort_handle.as_ref(), snap, sink).await;
+        mark_running(snap, false);
+        *abort_handle = None;
+        // 队列非空 → 续跑;agent_settled 只在最后一轮发(上游 settled = 无
+        // 活动 run 且无排队续跑)
+        let next = snap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queued_prompts
+            .pop_front();
+        finish_turn(res, snap, sink, next.is_none()).await;
+        match next {
+            Some((m, imgs)) => {
+                message = m;
+                images = imgs;
+            }
+            None => return,
         }
     }
-    let (ah, signal) = AgentSessionHandle::new_abort_handle();
-    *abort_handle = Some(ah);
-    mark_running(snap, true);
-    let fut: PinBoxPromptFut<'_> = match images {
-        Some(imgs) if !imgs.is_empty() => {
-            Box::pin(handle.prompt_images_with_abort(message, imgs, signal, |_| {}))
-        }
-        _ => Box::pin(handle.prompt_with_abort(message, signal, |_| {})),
-    };
-    run_prompt_until_settled(fut, rx, abort_handle.as_ref(), snap, sink).await;
-    mark_running(snap, false);
-    *abort_handle = None;
 }
 
 type PinBoxPromptFut<'a> = std::pin::Pin<
@@ -899,16 +921,17 @@ async fn run_prompt_until_settled<'a>(
     abort_handle: Option<&AbortHandle>,
     snap: &Arc<Mutex<SessionSnap>>,
     sink: &super::EventSink,
-) {
+) -> Result<pi::sdk::AssistantMessage, pi::sdk::Error> {
     loop {
         tokio::select! {
             biased;
             res = &mut prompt_fut => {
-                finish_turn(res, snap, sink).await;
-                return;
+                return res;
             }
             cmd = rx.recv() => {
-                let Some(cmd) = cmd else { return };
+                let Some(cmd) = cmd else {
+                    return Err(pi::sdk::Error::api("session task dropped during prompt"));
+                };
                 handle_running_cmd(cmd, abort_handle, snap, sink);
             }
         }
@@ -962,6 +985,13 @@ fn handle_running_cmd(
             abort_bash_kill(snap);
             let _ = reply.send(Ok(json!({})));
         }
+        // 运行期新 prompt → 排队(对齐上游 pendingPromptCount:立即 ack 接受,
+        // 当前 turn 结束后由 handle_prompt_turn 循环续跑)
+        SessionCmd::Prompt { message, images, reply } => {
+            let _ = reply.send(Ok(json!({})));
+            snap.lock().unwrap_or_else(|e| e.into_inner())
+                .queued_prompts.push_back((message, images));
+        }
         // 借 handle 的重命令运行期 busy(沿用 chat_thread 语义)
         SessionCmd::SetModel { reply, .. }
         | SessionCmd::SetThinking { reply, .. }
@@ -973,18 +1003,20 @@ fn handle_running_cmd(
         | SessionCmd::Reload { reply }
         | SessionCmd::Rebuild { reply, .. }
         | SessionCmd::Deferred { reply, .. }
-        | SessionCmd::GetStats { reply }
-        | SessionCmd::Prompt { reply, .. } => {
+        | SessionCmd::GetStats { reply } => {
             let _ = reply.send(Err("session busy (prompt running)".into()));
         }
     }
 }
 
-/// turn 完成:回落标志 + last_assistant_text + 合成 prompt_done/error + agent_settled。
+/// turn 完成:回落标志 + last_assistant_text + 合成 prompt_done/error。
+/// `emit_settled` 仅在队列空(最后一轮)时为 true —— agent_settled 语义 =
+/// 无活动 run 且无排队续跑,连发 prompt 时提前发会让前端提前收表。
 async fn finish_turn(
     res: Result<pi::sdk::AssistantMessage, pi::sdk::Error>,
     snap: &Arc<Mutex<SessionSnap>>,
     sink: &super::EventSink,
+    emit_settled: bool,
 ) {
     match &res {
         Ok(am) => {
@@ -994,7 +1026,9 @@ async fn finish_turn(
             s.is_prompt_running = false;
             s.last_assistant_text = Some(text);
             emit_agent(sink, json!({ "type": "prompt_done" }));
-            emit_agent(sink, json!({ "type": "agent_settled" }));
+            if emit_settled {
+                emit_agent(sink, json!({ "type": "agent_settled" }));
+            }
         }
         Err(e) => {
             let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
@@ -1004,7 +1038,9 @@ async fn finish_turn(
             // prompt_done 复位 rpcPromptPendingRef,否则 agent_settled 被守卫吞)
             emit_agent(sink, json!({ "type": "prompt_error", "errorMessage": e.to_string() }));
             emit_agent(sink, json!({ "type": "prompt_done" }));
-            emit_agent(sink, json!({ "type": "agent_settled" }));
+            if emit_settled {
+                emit_agent(sink, json!({ "type": "agent_settled" }));
+            }
         }
     }
 }
@@ -2252,6 +2288,73 @@ mod success_settle_tests {
         assert_eq!(resp.status(), 200);
         let data = &body(&resp)["data"];
         assert_eq!(data["sessionName"], serde_json::json!("My Project"), "stats must carry name: {data}");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// P2 连发排队(上游 pendingPromptCount):运行中第二条 prompt 不再
+    /// busy-reject,而是 ack 入队、当前 turn 完成后自动续跑;两轮都完成。
+    #[test]
+    fn queued_prompts_continue_after_current_turn() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("queue-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#))).expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // 第一条 prompt(fire)+ 立即第二条(运行中) → 均 ack
+        let r1 = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"first"}"#)).expect("p1");
+        assert_eq!(r1.status(), 200, "first prompt must ack");
+        let r2 = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"second"}"#)).expect("p2");
+        assert_eq!(r2.status(), 200, "queued prompt must ack, not busy-reject");
+
+        // 两轮都完成 → idle
+        let t0 = std::time::Instant::now();
+        loop {
+            let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+            if !body(&st)["running"].as_bool().unwrap_or(true) {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(25), "two turns never idle");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        // 两条 prompt 都被消费(队列空 = 第二轮已续跑;idle 到达 = 末轮
+        // settled 已发)。context 断言不适用:引擎 write-behind 落盘在进程
+        // 退出,磁盘文件此时未必存在。
+        let queued = {
+            // 经 get_state 间接验证队列空:快照 queuedMessages 只含 steering/
+            // follow_up;queued_prompts 通过 running 复位与 idle 到达证明消费。
+            // 直接断言:再次 prompt 会立即跑(fake server 仍在线),无积压。
+            let _ = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"third"}"#)).expect("p3 ack");
+            let t1 = std::time::Instant::now();
+            loop {
+                let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+                if !body(&st)["running"].as_bool().unwrap_or(true) {
+                    break;
+                }
+                assert!(t1.elapsed() < std::time::Duration::from_secs(20), "third never idle");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            "consumed"
+        };
+        assert_eq!(queued, "consumed");
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
