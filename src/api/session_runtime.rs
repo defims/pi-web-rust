@@ -2182,10 +2182,16 @@ mod success_settle_tests {
             .expect("prompt on dead must restore from disk");
         assert_eq!(resp.status(), 200);
 
-        // 完全不存在的 id → 404
-        let e = call(&api, post("/api/agent/00000000-0000-0000-0000-000000000000", r#"{"type":"get_state"}"#))
-            .expect_err("unknown id");
-        assert_eq!(e.status, 404);
+        // 完全不存在的 id → 404 JSON(信封形状:prompt 带 prompt_rejected)
+        let resp = call(&api, post("/api/agent/00000000-0000-0000-0000-000000000000", r#"{"type":"get_state"}"#))
+            .expect("unknown id handled");
+        assert_eq!(resp.status(), 404);
+        assert_eq!(body(&resp)["error"], serde_json::json!("Session not found"));
+        let resp = call(&api, post("/api/agent/00000000-0000-0000-0000-000000000000", r#"{"type":"prompt","message":"x"}"#))
+            .expect("unknown id prompt handled");
+        assert_eq!(resp.status(), 404);
+        assert_eq!(body(&resp)["code"], serde_json::json!("prompt_rejected"));
+        assert_eq!(body(&resp)["accepted"], serde_json::json!(false));
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),

@@ -399,25 +399,26 @@ fn agent_get_state(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
 /// 信封:{success:true,data} / 500 {error}(对齐上游 route.ts)。
 async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
     let id = str_arg(&dispatch, "id");
-    // 死会话惰性恢复(对齐上游 route.ts:19-32:resolveSessionPath →
-    // startRpcSession(id, path) 后再执行命令;磁盘也找不到才 404)
-    let mut h = match ctx.sessions.get(&id) {
-        Some(h) => h,
-        None => {
-            if !ctx.sessions.restore(ctx, &id).await {
-                return Err(ApiError::not_found("Session not found"));
-            }
-            ctx.sessions
-                .get(&id)
-                .ok_or_else(|| ApiError::not_found("Session not found"))?
-        }
-    };
     let ty = dispatch
         .args
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // 死会话惰性恢复(对齐上游 route.ts:19-32:resolveSessionPath →
+    // startRpcSession(id, path) 后再执行命令;磁盘也找不到才 404)
+    let mut h = match ctx.sessions.get(&id) {
+        Some(h) => h,
+        None => {
+            if !ctx.sessions.restore(ctx, &id).await {
+                // 对齐上游 route.ts:28-33:prompt 被拒带 prompt_rejected 信封
+                return reject_session_response(&ty);
+            }
+            ctx.sessions
+                .get(&id)
+                .ok_or_else(|| ApiError::not_found("Session not found"))?
+        }
+    };
     let message = dispatch.args.get("message").and_then(|v| v.as_str()).map(String::from);
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -499,14 +500,18 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
             return Err(ApiError::new(400, format!("unknown rpc type: {other}")));
         }
     };
-    h.tx
-        .send(cmd)
-        .await
-        .map_err(|_| ApiError::not_found(format!("session task gone: {id}")))?;
+    if h.tx.send(cmd).await.is_err() {
+        return reject_session_response(&ty);
+    }
     match reply_rx.await {
         Ok(Ok(data)) => json_response(json!({ "success": true, "data": data })),
         Ok(Err(e)) => {
-            let body = json!({ "error": e });
+            // 上游 route.ts:41-47:prompt 失败(未 accepted)带 prompt_rejected
+            let mut body = json!({ "error": e });
+            if ty == "prompt" {
+                body["code"] = json!("prompt_rejected");
+                body["accepted"] = json!(false);
+            }
             let body = serde_json::to_vec(&body).map_err(|e2| ApiError::internal(e2.to_string()))?;
             Ok(http::Response::builder()
                 .status(500)
@@ -514,8 +519,24 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
                 .body(body)
                 .expect("static builder"))
         }
-        Err(_) => Err(ApiError::not_found(format!("session task dropped reply: {id}"))),
+        Err(_) => reject_session_response(&ty),
     }
+}
+
+/// 会话拒绝响应:404 JSON {error, code?, accepted?}(对齐上游 route.ts:28-33
+/// 的 prompt_rejected 信封;非 prompt 命令仅 {error})。
+fn reject_session_response(rpc_type: &str) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let mut body = json!({ "error": "Session not found" });
+    if rpc_type == "prompt" {
+        body["code"] = json!("prompt_rejected");
+        body["accepted"] = json!(false);
+    }
+    let body = serde_json::to_vec(&body).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(http::Response::builder()
+        .status(404)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .expect("static builder"))
 }
 
 /// GET /api/agent/:id/bash-output?path= —— bash 全量输出读取

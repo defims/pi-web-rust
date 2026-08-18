@@ -100,13 +100,15 @@ impl ApiError {
         Self::new(503, "api is shutting down")
     }
 
-    /// 渲染为 http 响应(错误 body 为纯文本,对齐上游 404 形态;
-    /// JSON 错误体的逐路由差异由 P2 口径盘点定夺)。
+    /// 渲染为 http 响应(JSON 错误体 {error},对齐上游 NextResponse.json({error})
+    /// 系列 —— 前端消费方读 body.error;agent RPC 信封已是同形。此前 text/plain
+    /// 让原生协议路径(Wire B 直连)的错误信息在前端降级为 "HTTP xxx")。
     pub fn to_response(&self) -> http::Response<Vec<u8>> {
+        let body = serde_json::json!({ "error": self.message });
         http::Response::builder()
             .status(self.status)
-            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(self.message.clone().into_bytes())
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&body).unwrap_or_else(|_| self.message.clone().into_bytes()))
             .expect("static response builder")
     }
 }
@@ -280,6 +282,18 @@ mod tests {
         api.handle(get("/api/nope"), responder);
         let r = rx.recv_timeout(Duration::from_secs(30)).expect("responder called");
         assert_eq!(r.unwrap_err().status, 404);
+    }
+
+    #[test]
+    fn error_body_is_json_error_shape() {
+        // Wire B 直连前置(A):错误体 {error} JSON(对齐上游 NextResponse.json
+        // 系列),前端消费方读 body.error。此前 text/plain 让原生协议路径的
+        // 错误信息在前端降级为 "HTTP xxx"。
+        let err = ApiError::not_found("no route: GET /api/nope");
+        let resp = err.to_response();
+        assert_eq!(resp.headers().get("content-type").unwrap().to_str().unwrap(), "application/json");
+        let v: serde_json::Value = serde_json::from_slice(resp.body()).expect("json body");
+        assert_eq!(v["error"], serde_json::json!("no route: GET /api/nope"));
     }
 
     #[test]
