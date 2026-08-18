@@ -130,11 +130,18 @@ pub(crate) struct SessionHandle {
 pub(crate) struct SessionRuntime {
     pub sessions: Arc<Mutex<HashMap<String, SessionHandle>>>,
     pub max_sessions: usize,
+    /// 死会话恢复的 per-id 启动锁:两次并发 RPC 对同一磁盘会话同时 restore
+    /// 会为同一文件起两个引擎实例(双写)—— 串行化恢复,恢复后二次检查。
+    restore_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SessionRuntime {
     pub fn new(max_sessions: usize) -> Self {
-        Self { sessions: Arc::new(Mutex::new(HashMap::new())), max_sessions }
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            max_sessions,
+            restore_locks: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// 创建并注册会话(溢出 = 关旧建新,对齐 moho Clear/rebuild 语义)。
@@ -144,6 +151,19 @@ impl SessionRuntime {
     /// 这条路径时 RPC 404,前端乐观 agentRunning 永不收敛(loading 永转)。
     /// 返回 false = 磁盘也找不到(调用方回 404)。
     pub async fn restore(&self, ctx: &ExecCtx, id: &str) -> bool {
+        // per-id 启动锁(并发恢复防双实例)
+        let lock = self
+            .restore_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        // 恢复期间首个调用者可能已注册成功
+        if self.sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id) {
+            return true;
+        }
         // 与 create 传给引擎的 session_dir 同根(引擎落盘位置);hooks 根仅当
         // 宿主覆写了 sessions_root 且引擎仍写默认根时兜底扫描。
         let root = super::commands::default_sessions_root_pub();
