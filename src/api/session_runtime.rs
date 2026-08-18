@@ -27,7 +27,11 @@ use super::ApiError;
 #[derive(Debug)]
 pub(crate) enum SessionCmd {
     /// 发起一轮 prompt(完整 turn 循环,见 session_loop Prompt 分支)。
-    Prompt { message: String, reply: oneshot::Sender<Result<Value, String>> },
+    Prompt {
+        message: String,
+        images: Option<Vec<pi::sdk::ImageContent>>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Steer { message: String, reply: oneshot::Sender<Result<Value, String>> },
     FollowUp { message: String, reply: oneshot::Sender<Result<Value, String>> },
     Abort,
@@ -267,7 +271,7 @@ impl SessionRuntime {
         let tools_c = enabled_tools.clone();
         let cwd_owned = cwd.to_string();
         let sink = ctx.sink.clone();
-        let handle = super::commands::blocking(ctx, move || -> Result<AgentSessionHandle, ApiError> {
+        let scope_out = super::commands::blocking(ctx, move || -> Result<(AgentSessionHandle, Option<(String, String)>, Option<(String, String, String)>), ApiError> {
             // 事件线第一段:引擎 on_event → wire 过滤 → EventSink
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |ev: AgentEvent| {
                 let ev_value = serde_json::to_value(&ev).unwrap_or(serde_json::Value::Null);
@@ -278,9 +282,9 @@ impl SessionRuntime {
                     }));
                 }
             });
-            let options = pi::sdk::SessionOptions {
-                provider: provider_c,
-                model: model_c,
+            let mut options = pi::sdk::SessionOptions {
+                provider: provider_c.clone(),
+                model: model_c.clone(),
                 // 仅显式传值(行级对齐上游 route.ts:61):未指定时交引擎解析
                 // (scoped pin → 会话恢复 → settings default_thinking_level →
                 // 引擎默认经 clamp,app.rs:620-637)。此前强制 Off 会覆盖
@@ -296,10 +300,130 @@ impl SessionRuntime {
                 on_event: Some(on_event),
                 ..Default::default()
             };
-            futures::executor::block_on(pi::sdk::create_agent_session(options))
-                .map_err(|e| ApiError::internal(format!("create_agent_session: {e}")))
+
+            // P1(上游 rpc-manager.ts:1599-1627 对齐):services 一次快照
+            // (settings 全局+项目合并的 config + 真 registry),web 层解析
+            // 默认模型 —— 显式越界 400;未指定时 default > scoped[0] >
+            // visible 内 default。解析出的 (provider, model) 显式注入,
+            // 引擎兜底链不再参与(上游同款"原子性"语义)。
+            let services = futures::executor::block_on(
+                pi::sdk::create_agent_session_services(&options),
+            )
+            .map_err(|e| ApiError::internal(format!("agent_session_services: {e}")))?;
+            let cfg = &services.config;
+            let scope = crate::models::scope::resolve_visible_models(
+                cfg.enabled_models.as_deref().unwrap_or(&[]),
+                || {
+                    services
+                        .model_registry
+                        .get_available()
+                        .into_iter()
+                        .map(|e| crate::models::scope::Model {
+                            id: e.model.id.clone(),
+                            name: e.model.name.clone(),
+                            provider: e.model.provider.clone(),
+                        })
+                        .collect()
+                },
+                |patterns| {
+                    let (scoped, diags) = pi::sdk::resolve_model_scope_with_diagnostics(
+                        patterns,
+                        &services.model_registry,
+                        false,
+                    );
+                    let scoped = scoped
+                        .into_iter()
+                        .map(|sm| crate::models::scope::ScopedModel {
+                            model: crate::models::scope::Model {
+                                id: sm.model.model.id.clone(),
+                                name: sm.model.model.name.clone(),
+                                provider: sm.model.model.provider.clone(),
+                            },
+                            thinking_level: sm.thinking_level.map(|t| t.to_string()),
+                        })
+                        .collect();
+                    (scoped, diags)
+                },
+            );
+            let default_ref = match (&cfg.default_provider, &cfg.default_model) {
+                (Some(p), Some(m)) => Some(crate::models::scope::ModelRef {
+                    provider: p.clone(),
+                    model_id: m.clone(),
+                }),
+                _ => None,
+            };
+            let requested_ref = match (&provider_c, &model_c) {
+                (Some(p), Some(m)) => Some(crate::models::scope::ModelRef {
+                    provider: p.clone(),
+                    model_id: m.clone(),
+                }),
+                _ => None,
+            };
+            let sel = crate::models::scope::select_initial_model_scope(
+                &scope,
+                &crate::models::scope::InitialModelScopeOptions {
+                    requested_model: requested_ref.clone(),
+                    default_model: default_ref,
+                    thinking_level: tl_c.clone(),
+                },
+            )
+            .map_err(|e| ApiError::new(400, e.0))?;
+            if let Some(m) = &sel.model {
+                options.provider = Some(m.provider.clone());
+                options.model = Some(m.id.clone());
+            }
+            if let Some(level) = &sel.thinking_level {
+                options.thinking = level.parse().ok();
+            }
+
+            let handle = futures::executor::block_on(
+                pi::sdk::create_agent_session_from_services(&services, options),
+            )
+            .map_err(|e| ApiError::internal(format!("create_agent_session: {e}")))?;
+            // startup preferences 原料:显式请求(可能为空) + 引擎生效值
+            let state = futures::executor::block_on(handle.state()).ok();
+            let effective = state.map(|s| (s.provider.clone(), s.model_id.clone(), s.thinking_level.map(|t| t.to_string())));
+            Ok((handle, requested_ref.map(|r| (r.provider, r.model_id)), effective.map(|(p, m, t)| (p, m, t.unwrap_or_default()))))
         })
         .await??;
+        let (handle, explicit_ref, effective) = scope_out;
+
+        // P1-2(上游 rpc-manager.ts:1629-1643):显式选择与引擎生效一致时
+        // 写回 settings.json 默认(deep-merge 保他键)—— "记住我的选择"。
+        // 文件 IO 走 blocking。
+        let explicit_model_ref = explicit_ref.clone().map(|(p, m)| {
+            crate::models::cache::ModelRef { provider: p, model_id: m }
+        });
+        {
+            let explicit = crate::settings::startup_preferences::ExplicitStartupPreferences {
+                model: explicit_model_ref,
+                thinking_level: thinking_level.clone(),
+            };
+            let effective = crate::settings::startup_preferences::EffectiveStartupPreferences {
+                model: effective.as_ref().map(|(p, m, _)| {
+                    crate::models::cache::ModelRef {
+                        provider: p.clone(),
+                        model_id: m.clone(),
+                    }
+                }),
+                thinking_level: effective
+                    .as_ref()
+                    .map(|(_, _, t)| t.clone())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "off".to_string()),
+                supports_thinking: true,
+            };
+            let tl_guard = thinking_level.clone();
+            let _ = super::commands::blocking(ctx, move || {
+                let mut ops = JsonSettingsOps::new();
+                let _ = crate::settings::startup_preferences::persist_explicit_startup_preferences(
+                    &mut ops,
+                    &explicit,
+                    &effective,
+                );
+            })
+            .await;
+        }
 
         let engine_state = handle.state().await.ok();
         let session_id = engine_state
@@ -438,9 +562,9 @@ async fn session_loop(
                 // Prompt:future 在独立函数内创建并消费(不跨迭代返回借用 ——
                 // 等价 chat_thread 的"起 prompt 与驱动至完成同一匹配",但结构
                 // 更简:借用生命周期封闭在 handle_prompt_turn 调用内)
-                SessionCmd::Prompt { message, reply } => {
+                SessionCmd::Prompt { message, images, reply } => {
                     let _ = reply.send(Ok(json!({})));
-                    handle_prompt_turn(&mut handle, &mut rx, message, &mut abort_handle, &snap, &sink)
+                    handle_prompt_turn(&mut handle, &mut rx, message, images, &mut abort_handle, &snap, &sink)
                         .await;
                 }
                 other => {
@@ -457,6 +581,7 @@ async fn handle_prompt_turn(
     handle: &mut AgentSessionHandle,
     rx: &mut mpsc::Receiver<SessionCmd>,
     message: String,
+    images: Option<Vec<pi::sdk::ImageContent>>,
     abort_handle: &mut Option<AbortHandle>,
     snap: &Arc<Mutex<SessionSnap>>,
     sink: &super::EventSink,
@@ -473,7 +598,12 @@ async fn handle_prompt_turn(
     let (ah, signal) = AgentSessionHandle::new_abort_handle();
     *abort_handle = Some(ah);
     mark_running(snap, true);
-    let fut: PinBoxPromptFut<'_> = Box::pin(handle.prompt_with_abort(message, signal, |_| {}));
+    let fut: PinBoxPromptFut<'_> = match images {
+        Some(imgs) if !imgs.is_empty() => {
+            Box::pin(handle.prompt_images_with_abort(message, imgs, signal, |_| {}))
+        }
+        _ => Box::pin(handle.prompt_with_abort(message, signal, |_| {})),
+    };
     run_prompt_until_settled(fut, rx, abort_handle.as_ref(), snap, sink).await;
     mark_running(snap, false);
     *abort_handle = None;
@@ -1654,6 +1784,63 @@ mod bash_tests {
     }
 }
 
+/// settings.json 的 SettingsOps 实现(startup preferences 写回用):
+/// set_* 记录变更,flush 深合并写回文件(保留 theme 等其它键)。
+struct JsonSettingsOps {
+    default_model: Option<(String, String)>,
+    default_thinking: Option<String>,
+}
+
+impl JsonSettingsOps {
+    fn new() -> Self {
+        Self { default_model: None, default_thinking: None }
+    }
+
+    fn settings_path() -> std::path::PathBuf {
+        let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent")))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        dir.join("settings.json")
+    }
+}
+
+impl crate::settings::startup_preferences::SettingsOps for JsonSettingsOps {
+    fn set_default_model_and_provider(&mut self, provider: &str, model_id: &str) {
+        self.default_model = Some((provider.to_string(), model_id.to_string()));
+    }
+
+    fn set_default_thinking_level(&mut self, level: &str) {
+        self.default_thinking = Some(level.to_string());
+    }
+
+    fn flush(&mut self) {
+        let path = Self::settings_path();
+        let mut root: serde_json::Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !root.is_object() {
+            root = serde_json::json!({});
+        }
+        if let Some(obj) = root.as_object_mut() {
+            if let Some((p, m)) = &self.default_model {
+                obj.insert("default_provider".to_string(), serde_json::json!(p));
+                obj.insert("default_model".to_string(), serde_json::json!(m));
+            }
+            if let Some(t) = &self.default_thinking {
+                obj.insert("default_thinking_level".to_string(), serde_json::json!(t));
+            }
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+            let _ = std::fs::write(&path, pretty);
+        }
+    }
+}
+
 /// 成功路径 settle 扫描:极简本地 SSE server 逐形态验证引擎 prompt future
 /// 收尾(用户症状:回复完整送达但 loading 永转 = future 不 settle)。
 #[cfg(test)]
@@ -1920,6 +2107,85 @@ mod success_settle_tests {
         let e = call(&api, post("/api/agent/00000000-0000-0000-0000-000000000000", r#"{"type":"get_state"}"#))
             .expect_err("unknown id");
         assert_eq!(e.status, 404);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// P1 scope 接线:settings 默认模型被选中;显式请求可用模型外的组合 → 400。
+    /// P1-2 startup prefs:显式选择与引擎生效一致 → settings.json 写回默认。
+    #[test]
+    fn scope_resolution_and_startup_preferences() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("scope-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        // 两个模型:z-first(排序首)与 chosen(settings 默认)
+        let pi = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("models.json"),
+            r#"{"providers":{"fake":{"baseUrl":"http://127.0.0.1:1/v1","api":"openai-completions","apiKey":"k","models":[{"id":"z-first","name":"z-first"},{"id":"chosen","name":"chosen"}]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pi.join("settings.json"),
+            r#"{"default_provider":"fake","default_model":"chosen","theme":"global"}"#,
+        )
+        .unwrap();
+
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(2, 4)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let mut cfg = crate::api::ApiConfig::new(Arc::new(|_: crate::api::ApiEvent| {}) as EventSink);
+        cfg.hooks = Arc::new(Hooks(tmp.to_path_buf()));
+        let api = PiWebApi::new(rt, cfg);
+        let cwd = tmp.to_string_lossy().to_string();
+
+        // 无显式 → settings 默认 chosen(而非排序首 z-first)
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#))).expect("create");
+        let v = body(&resp);
+        assert_eq!(v["model"]["modelId"], serde_json::json!("chosen"), "settings default must win: {v}");
+
+        // 显式可用模型 → 精确选中 + settings 写回(显式==生效)
+        let resp = call(
+            &api,
+            post("/api/agent/new", r#"{"cwd":"/tmp","provider":"fake","modelId":"z-first"}"#),
+        )
+        .expect("explicit create");
+        let v = body(&resp);
+        assert_eq!(v["model"]["modelId"], serde_json::json!("z-first"));
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pi.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["default_model"], serde_json::json!("z-first"), "startup prefs must persist: {settings}");
+        assert_eq!(settings["theme"], serde_json::json!("global"), "other keys preserved");
+
+        // 显式越界(不存在的模型)→ 400(scope 语义)
+        let e = call(
+            &api,
+            post("/api/agent/new", r#"{"cwd":"/tmp","provider":"fake","modelId":"nope"}"#),
+        )
+        .expect_err("out-of-scope must 400");
+        assert_eq!(e.status, 400, "got: {:?}", e.message);
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),

@@ -428,10 +428,19 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
         "prompt" if dispatch.args.get("streamingBehavior").and_then(|v| v.as_str()) == Some("steer") => {
             C::Steer { message: message.unwrap_or_default(), reply: reply_tx }
         }
-        "prompt" => C::Prompt {
-            message: message.unwrap_or_default(),
-            reply: reply_tx,
-        },
+        "prompt" => {
+            // images: [{data: base64, mimeType}] → 引擎 ImageContent
+            // (上游 rpc-manager.ts:397-400 校验后透传;此处 serde 直转)
+            let images = dispatch
+                .args
+                .get("images")
+                .and_then(|v| serde_json::from_value::<Vec<pi::sdk::ImageContent>>(v.clone()).ok());
+            C::Prompt {
+                message: message.unwrap_or_default(),
+                images,
+                reply: reply_tx,
+            }
+        }
         "steer" => C::Steer { message: message.unwrap_or_default(), reply: reply_tx },
         "follow_up" => C::FollowUp { message: message.unwrap_or_default(), reply: reply_tx },
         "abort" => {
