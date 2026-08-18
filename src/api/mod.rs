@@ -285,6 +285,19 @@ mod tests {
     }
 
     #[test]
+    fn gated_auth_providers_route() {
+        // Wire B 直连回归:Models 面板读 /api/auth/(all-)providers,原桥
+        // 常量 stub 迁到 api 层;缺失时 d.providers undefined → .filter 崩渲染。
+        let (rx, responder) = collector();
+        let api = api_with(Arc::new(|_| {}), TimeoutConfig::default());
+        api.handle(get("/api/auth/providers"), responder);
+        let resp = rx.recv_timeout(Duration::from_secs(30)).expect("responder").expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["providers"], serde_json::json!([]));
+    }
+
+    #[test]
     fn error_body_is_json_error_shape() {
         // Wire B 直连前置(A):错误体 {error} JSON(对齐上游 NextResponse.json
         // 系列),前端消费方读 body.error。此前 text/plain 让原生协议路径的

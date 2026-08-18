@@ -28,6 +28,19 @@ pub(crate) async fn execute(
     dispatch: Dispatch,
 ) -> Result<http::Response<Vec<u8>>, ApiError> {
     match dispatch.command {
+        "gated_skills_get" => json_response(json!({
+            "skills": [], "diagnostics": [], "projectResourcesLoaded": false
+        })),
+        "gated_skills_patch" => json_response(json!({ "success": true })),
+        "gated_skills_search" => json_response(json!({ "results": [] })),
+        "gated_skills_check" => json_response(json!({ "updates": [] })),
+        "gated_plugins_get" => json_response(json!({
+            "packages": [],
+            "totals": { "extensions": 0, "skills": 0, "prompts": 0, "themes": 0 },
+            "diagnostics": [],
+            "projectResourcesLoaded": false
+        })),
+        "gated_auth_providers" => json_response(json!({ "providers": [] })),
         "home" => home().await,
         "sessions_list" => sessions_list(&ctx).await,
         "sessions_get" => {
