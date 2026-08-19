@@ -2432,9 +2432,12 @@ Do foo things.
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 use std::io::Read;
-                let mut buf = vec![0u8; 65536];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // 读完整请求(35KB+ system prompt 跨多个 TCP segment;
+                // 设短超时后 read_to_end,超时即视为已读完)
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                let mut req = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut stream, &mut req);
+                let req = String::from_utf8_lossy(&req).to_string();
                 let _ = tx.send(req.clone());
                 let body = "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":null}]}
 

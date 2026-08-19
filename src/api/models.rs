@@ -904,3 +904,71 @@ pub(crate) async fn skills_get(
         "projectResourcesLoaded": trusted,
     }))
 }
+
+// ============================================================================
+// PATCH /api/skills — disable-model-invocation 切换(上游行手术)
+// ============================================================================
+
+/// PATCH /api/skills body: {filePath, disableModelInvocation}
+/// → {success: true} / 400 / 404 / 403 / 500(写失败)
+pub(crate) async fn skills_patch(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let file_path = dispatch.args.get("filePath").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if file_path.is_empty() {
+        return Err(ApiError::new(400, "filePath required"));
+    }
+    let disable = dispatch.args.get("disableModelInvocation").and_then(|v| v.as_bool()).unwrap_or(false);
+    let path = std::path::PathBuf::from(&file_path);
+    if !path.exists() {
+        return Err(ApiError::new(404, "file not found"));
+    }
+
+    // 门禁:roots + agent_dir + ~/.agents/skills 全局根(上游 symlink 解析后放行)
+    {
+        let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent")))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let global_skills = crate::paths::home_dir()
+            .map(|h| h.join(".agents/skills"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+        // roots 检查(files 命令同款;agent_dir 与全局技能根总是允许)
+        let allowed = crate::fs::path_security::is_path_within_roots(
+            &path.to_string_lossy(),
+            &&crate::fs::file_access::get_allowed_file_roots(&std::collections::HashSet::new()),
+        ) || path.starts_with(&agent_dir) || path.starts_with(&global_skills);
+        if !allowed {
+            return Err(ApiError::new(403, format!("Access denied: {file_path}")));
+        }
+    }
+
+    // 行手术(上游 surgical line edit:保留其余 YAML 原格式)
+    let _ = ctx;
+    super::commands::blocking(ctx, move || {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| ApiError::new(500, format!("read: {e}")))?;
+        let key = "disable-model-invocation";
+        let has_key = content.lines().any(|l| l.trim_start().starts_with(key));
+
+        let updated: String = if disable && !has_key {
+            // 在首行 --- 后插入
+            content.replacen("---\n", &format!("---\n{key}: true\n"), 1)
+        } else if !disable && has_key {
+            // 删除该 key 的行
+            content.lines()
+                .filter(|l| !l.trim_start().starts_with(key))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            return Ok(()); // 已是目标状态,无需写
+        };
+
+        std::fs::write(&path, &updated)
+            .map_err(|e| ApiError::new(500, format!("write: {e}")))?;
+        Ok(())
+    })
+    .await??;
+    super::commands::json_response(json!({ "success": true }))
+}
