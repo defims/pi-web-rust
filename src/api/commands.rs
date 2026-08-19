@@ -32,12 +32,7 @@ pub(crate) async fn execute(
         "gated_skills_patch" => super::models::skills_patch(&ctx, dispatch).await,
         "gated_skills_search" => super::models::skills_search(&ctx, dispatch).await,
         "gated_skills_check" => super::models::skills_check(&ctx, dispatch).await,
-        "gated_plugins_get" => json_response(json!({
-            "packages": [],
-            "totals": { "extensions": 0, "skills": 0, "prompts": 0, "themes": 0 },
-            "diagnostics": [],
-            "projectResourcesLoaded": false
-        })),
+        "gated_plugins_get" => super::models::plugins_get(&ctx, dispatch).await,
         "gated_auth_providers" => json_response(json!({ "providers": [] })),
         "home" => home().await,
         "sessions_list" => sessions_list(&ctx).await,

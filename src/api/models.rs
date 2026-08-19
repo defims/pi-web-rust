@@ -1122,3 +1122,317 @@ pub(crate) async fn skills_check(
     let _ = ctx; // TODO: IO adapter for lib check; 当前返回空(上游网络面受限)
     super::commands::json_response(json!({ "updates": [] }))
 }
+
+// ============================================================================
+// GET /api/plugins — 包清单(上游 PluginPackageInfo 契约,api-types.ts:93)
+// ============================================================================
+
+/// GET /api/plugins?cwd= → {packages, totals, diagnostics, projectResourcesLoaded}
+/// 引擎 PackageManager:settings packageSources(user+project 双层)列表 +
+/// resolve_package_resources_blocking 的逐资源 metadata(source/scope/origin)
+/// 归组计数。无包时与旧空壳同形(前端零适配)。
+pub(crate) async fn plugins_get(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let cwd = dispatch.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if cwd.is_empty() {
+        return Err(ApiError::new(400, "cwd required"));
+    }
+    super::commands::gate_roots(ctx, &cwd).await?;
+
+    let cwd_path = std::path::PathBuf::from(&cwd);
+    let scan = super::commands::blocking(ctx, move || plugins_scan(&cwd_path))
+        .await?
+        .map_err(|e| ApiError::internal(format!("package scan failed: {e}")))?;
+
+    super::commands::json_response(scan)
+}
+
+fn plugin_scope_str(scope: pi::package_manager::PackageScope) -> &'static str {
+    use pi::package_manager::PackageScope;
+    match scope {
+        PackageScope::User => "global",
+        PackageScope::Project | PackageScope::Temporary => "project",
+    }
+}
+
+/// 包扫描(blocking 池内执行):列表 + 资源分组。
+fn plugins_scan(cwd: &std::path::Path) -> pi::error::Result<serde_json::Value> {
+    use pi::package_manager::{PackageManager, ResolvedPaths};
+    use std::collections::BTreeMap;
+
+    // PackageScope 无 Ord —— BTreeMap 键用 (source, scope 判别值 0/1/2)
+    fn scope_key(scope: pi::package_manager::PackageScope) -> u8 {
+        use pi::package_manager::PackageScope;
+        match scope {
+            PackageScope::User => 0,
+            PackageScope::Project => 1,
+            PackageScope::Temporary => 2,
+        }
+    }
+
+    let pm = PackageManager::new(cwd.to_path_buf());
+    let packages = pm.list_packages_blocking()?;
+    // Ok(None) = 有源需要 install(本地不完整)→ 资源组空 + 诊断
+    let resolved: Option<ResolvedPaths> = pm.resolve_package_resources_blocking().unwrap_or(None);
+
+    // (source, scope) → 资源记录;只收 origin=Package(顶层自动发现不属包)
+    #[derive(Default, Clone)]
+    struct Group {
+        entries: Vec<( &'static str, std::path::PathBuf, bool )>, // (kind, path, enabled)
+    }
+    let mut groups: BTreeMap<(String, u8), Group> = BTreeMap::new();
+    if let Some(r) = resolved.as_ref() {
+        for (kind, list) in [
+            ("extension", &r.extensions),
+            ("skill", &r.skills),
+            ("prompt", &r.prompts),
+            ("theme", &r.themes),
+        ] {
+            for res in list {
+                if !matches!(res.metadata.origin, pi::package_manager::ResourceOrigin::Package) {
+                    continue;
+                }
+                groups
+                    .entry((res.metadata.source.clone(), scope_key(res.metadata.scope)))
+                    .or_default()
+                    .entries
+                    .push((kind, res.path.clone(), res.enabled));
+            }
+        }
+    }
+
+    let mut diagnostics: Vec<serde_json::Value> = Vec::new();
+    if resolved.is_none() {
+        diagnostics.push(json!({
+            "type": "warning",
+            "message": "one or more package sources need install/update; resources incomplete",
+        }));
+    }
+
+    let mut pkgs_out: Vec<serde_json::Value> = Vec::new();
+    let (mut t_ext, mut t_ski, mut t_pro, mut t_the) = (0usize, 0usize, 0usize, 0usize);
+
+    for entry in &packages {
+        let scope_s = plugin_scope_str(entry.scope);
+        let key = (entry.source.clone(), scope_key(entry.scope));
+        let group = groups.get(&key);
+        let entries: &[( &str, std::path::PathBuf, bool )] =
+            group.map(|g| g.entries.as_slice()).unwrap_or(&[]);
+        let n_ext = entries.iter().filter(|(k, _, _)| *k == "extension").count();
+        let n_ski = entries.iter().filter(|(k, _, _)| *k == "skill").count();
+        let n_pro = entries.iter().filter(|(k, _, _)| *k == "prompt").count();
+        let n_the = entries.iter().filter(|(k, _, _)| *k == "theme").count();
+        t_ext += n_ext;
+        t_ski += n_ski;
+        t_pro += n_pro;
+        t_the += n_the;
+
+        let installed: Option<std::path::PathBuf> =
+            pm.installed_path_blocking(&entry.source, entry.scope).unwrap_or(None);
+        let installed_exists = installed
+            .as_ref()
+            .is_some_and(|p| p.exists());
+
+        // status:有资源=loaded;全禁用=disabled;目录在=installed;缺=missing
+        let status = if !entries.is_empty() {
+            if entries.iter().all(|(_, _, en)| !en) {
+                "disabled"
+            } else {
+                "loaded"
+            }
+        } else if installed_exists {
+            "installed"
+        } else {
+            "missing"
+        };
+
+        let resources: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(kind, path, en)| {
+                let name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let relative = installed
+                    .as_ref()
+                    .and_then(|base| path.strip_prefix(base).ok())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| name.clone());
+                let mut v = json!({
+                    "kind": kind,
+                    "name": name,
+                    "path": path.to_string_lossy(),
+                    "relativePath": relative,
+                });
+                if !en {
+                    v["disabled"] = json!(true);
+                }
+                v
+            })
+            .collect();
+
+        let package_name = installed
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned());
+
+        pkgs_out.push(json!({
+            "source": entry.source,
+            "scope": scope_s,
+            "filtered": entry.filter.is_some(),
+            "disabled": status == "disabled",
+            "installedPath": installed.map(|p| p.to_string_lossy().into_owned()),
+            "packageName": package_name,
+            "counts": {
+                "extensions": n_ext,
+                "skills": n_ski,
+                "prompts": n_pro,
+                "themes": n_the,
+            },
+            "resources": resources,
+            "status": status,
+        }));
+    }
+
+    Ok(json!({
+        "packages": pkgs_out,
+        "totals": {
+            "extensions": t_ext,
+            "skills": t_ski,
+            "prompts": t_pro,
+            "themes": t_the,
+        },
+        "diagnostics": diagnostics,
+        "projectResourcesLoaded": true,
+    }))
+}
+
+#[cfg(test)]
+mod plugins_tests {
+    use super::*;
+    use crate::api::{ApiConfig, EventSink, HostHooks, PiWebApi};
+    use std::sync::Arc;
+
+    struct Hooks(std::path::PathBuf);
+    impl HostHooks for Hooks {
+        fn sessions_root(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.join("sessions"))
+        }
+    }
+
+    fn api_with_hooks(tmp: &std::path::Path) -> PiWebApi {
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(2, 4)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let mut cfg = ApiConfig::new(Arc::new(|_: crate::api::ApiEvent| {}) as EventSink);
+        cfg.hooks = Arc::new(Hooks(tmp.to_path_buf()));
+        PiWebApi::new(rt, cfg)
+    }
+
+    fn call(api: &PiWebApi, req: http::Request<Vec<u8>>) -> Result<http::Response<Vec<u8>>, crate::api::ApiError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        api.handle(req, Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("responder")
+    }
+
+    /// GET /api/plugins:settings packages(本地源)→ 真列表(包 + 计数 +
+    /// 资源 + loaded 状态);缺 cwd 400;门禁外 403。
+    #[test]
+    fn plugins_get_lists_local_package_with_counts() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("pluginsget-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        // 本地包源:pkg-mine/{skills,extensions}
+        let pkg = tmp.join("pkg-mine");
+        std::fs::create_dir_all(pkg.join("skills/pkg-skill")).unwrap();
+        std::fs::write(
+            pkg.join("skills/pkg-skill/SKILL.md"),
+            "---\nname: pkg-skill\ndescription: from package\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(pkg.join("extensions")).unwrap();
+        std::fs::write(pkg.join("extensions/tool.ext.js"), "// ext\n").unwrap();
+
+        // 全局 settings.json packages 数组(源 = 本地路径字符串)
+        let agent_dir = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let settings = agent_dir.join("settings.json");
+        let pkg_s = pkg.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        std::fs::write(
+            &settings,
+            format!(r#"{{"packages":[{{"source":"{pkg_s}"}}]}}"#),
+        )
+        .unwrap();
+
+        let proj_cwd = tmp.join("proj");
+        std::fs::create_dir_all(&proj_cwd).unwrap();
+        crate::fs::allowed_roots::allow_file_root(&proj_cwd.to_string_lossy());
+
+        let api = api_with_hooks(&tmp);
+        let cwd_s = proj_cwd.to_string_lossy().to_string();
+
+        // 缺 cwd → 400
+        let e = call(&api, http::Request::builder().method("GET").uri("/api/plugins").body(Vec::new()).unwrap())
+            .err()
+            .expect("missing cwd must err");
+        assert_eq!(e.status, 400);
+
+        // 带 cwd → 包列表
+        let resp = call(&api, http::Request::builder()
+            .method("GET")
+            .uri(format!("/api/plugins?cwd={}", cwd_s.replace('/', "%2F")))
+            .body(Vec::new()).unwrap())
+            .expect("plugins get ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        let pkgs = v["packages"].as_array().expect("packages array");
+        assert_eq!(pkgs.len(), 1, "one configured package: {pkgs:?}");
+        let p = &pkgs[0];
+        assert_eq!(p["scope"], serde_json::json!("global"));
+        assert_eq!(p["status"], serde_json::json!("loaded"));
+        assert_eq!(p["counts"]["skills"], serde_json::json!(1));
+        assert_eq!(p["counts"]["extensions"], serde_json::json!(1));
+        assert!(p["installedPath"].is_string(), "local source resolves to its path");
+        assert!(p["packageName"].is_string());
+        let kinds: Vec<&str> = p["resources"].as_array().unwrap().iter()
+            .filter_map(|r| r.get("kind").and_then(|k| k.as_str())).collect();
+        assert!(kinds.contains(&"skill"), "resources include skill: {kinds:?}");
+        // totals 汇总
+        assert_eq!(v["totals"]["skills"], serde_json::json!(1));
+        assert_eq!(v["totals"]["extensions"], serde_json::json!(1));
+
+        // 门禁外 cwd → 403
+        let e = call(&api, http::Request::builder()
+            .method("GET")
+            .uri("/api/plugins?cwd=%2Fprivate%2Fetc")
+            .body(Vec::new()).unwrap())
+            .err()
+            .expect("outside roots must err");
+        assert_eq!(e.status, 403);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+}
