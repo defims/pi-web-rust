@@ -86,6 +86,11 @@ pub(crate) struct SessionSnap {
     /// 运行期排队的完整 prompt(上游 pendingPromptCount 语义:连发第二条
     /// prompt 不拒绝,当前 turn 完成后自动续跑;reply 在入队时已 ack)
     pub queued_prompts: VecDeque<(String, Option<Vec<pi::sdk::ImageContent>>)>,
+    /// 当前流式中的 partial message(message_update 的 message 字段;
+    /// EventSource 连接时重放为 message_start —— 上游 streamingMessage
+    /// + agent-event-stream.ts:97-99 snapshot replay 等价)。Arc 共享
+    /// 给 on_event 回调(在 SessionSnap 构造前创建)。
+    pub streaming_message: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
 impl SessionSnap {
@@ -101,6 +106,7 @@ impl SessionSnap {
         json!({
             "sessionId": self.session_id,
             "isStreaming": self.is_streaming,
+            "streamingMessage": self.streaming_message.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             "isPromptRunning": self.is_prompt_running,
             "isCompacting": self.is_compacting,
             "isBashRunning": self.is_bash_running,
@@ -297,10 +303,27 @@ impl SessionRuntime {
         let tools_c = enabled_tools.clone();
         let cwd_owned = cwd.to_string();
         let sink = ctx.sink.clone();
+        let streaming_msg: Arc<Mutex<Option<serde_json::Value>>> =
+            Arc::new(Mutex::new(None));
+        let stream_track = streaming_msg.clone();
         let scope_out = super::commands::blocking(ctx, move || -> Result<(AgentSessionHandle, Option<(String, String)>, Option<(String, String, String)>), ApiError> {
-            // 事件线第一段:引擎 on_event → wire 过滤 → EventSink
+            // 事件线第一段:引擎 on_event → streaming 捕获 → wire 过滤 → EventSink
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |ev: AgentEvent| {
                 let ev_value = serde_json::to_value(&ev).unwrap_or(serde_json::Value::Null);
+                // 快照跟踪(上游 streamingMessage):在 wire filter 剥掉 message
+                // 字段之前捕获最新流式消息
+                let ty = ev_value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match ty {
+                    "message_update" | "message_start" => {
+                        if let Some(msg) = ev_value.get("message") {
+                            *stream_track.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.clone());
+                        }
+                    }
+                    "message_end" | "agent_end" => {
+                        *stream_track.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    }
+                    _ => {}
+                }
                 if let Some(payload) = to_client_event(&ev_value) {
                     let sink = sink.clone();
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -488,6 +511,7 @@ impl SessionRuntime {
         // 会话任务(监督 catch_unwind;panic → dead 标记)
         let (tx, rx) = mpsc::channel::<SessionCmd>(64);
         let snap = Arc::new(Mutex::new(SessionSnap {
+            streaming_message: streaming_msg,
             session_id: Some(session_id.clone()),
             model_provider: eng_provider.clone().or(provider),
             model_id: eng_model.clone().or(model),
