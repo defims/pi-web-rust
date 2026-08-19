@@ -565,6 +565,80 @@ Connection: close
         }
     }
 
+    /// P1:GET /api/skills 真列表 —— 双源(user + project)+ 缺 cwd 400。
+    #[test]
+    fn skills_get_lists_dual_sources() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("skillsget-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        // user 源:~/.pi/agent/skills/user-skill
+        let user_skill = tmp.join(".pi/agent/skills/user-skill");
+        std::fs::create_dir_all(&user_skill).unwrap();
+        std::fs::write(
+            user_skill.join("SKILL.md"),
+            "---
+name: user-skill
+description: From user dir
+---
+",
+        ).unwrap();
+
+        // project 源:<cwd>/.pi/skills/project-skill
+        let proj_cwd = tmp.join("proj");
+        let proj_skill = proj_cwd.join(".pi/skills/project-skill");
+        std::fs::create_dir_all(&proj_skill).unwrap();
+        std::fs::write(
+            proj_skill.join("SKILL.md"),
+            "---
+name: project-skill
+description: From project dir
+---
+",
+        ).unwrap();
+
+        // 播种 roots(项目 cwd 无活跃会话,需显式允许 —— files 命令同款)
+        crate::fs::allowed_roots::allow_file_root(&proj_cwd.to_string_lossy());
+
+        let api = api_with_hooks(&tmp);
+        let cwd_s = proj_cwd.to_string_lossy().to_string();
+
+        // 缺 cwd → 400
+        let e = call(&api, http::Request::builder().method("GET").uri("/api/skills").body(Vec::new()).unwrap())
+            .err()
+            .expect("missing cwd must err");
+        assert_eq!(e.status, 400);
+
+        // 带 cwd → 双源列表
+        let resp = call(&api, http::Request::builder()
+            .method("GET")
+            .uri(format!("/api/skills?cwd={}", cwd_s.replace('/', "%2F")))
+            .body(Vec::new()).unwrap())
+            .expect("skills get ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        let names: Vec<&str> = v["skills"].as_array().unwrap().iter()
+            .filter_map(|sk| sk.get("name").and_then(|n| n.as_str())).collect();
+        assert!(names.contains(&"user-skill"), "user source must appear: {names:?}");
+        assert!(names.contains(&"project-skill"), "project source must appear: {names:?}");
+        assert!(v["projectResourcesLoaded"].is_boolean(), "trust field present");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
     #[test]
     fn discover_returns_models_and_sends_bearer() {
         let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -679,6 +753,7 @@ pub(crate) async fn models_config_test(
             model: Some(model_id.clone()),
             system_prompt: None,       // 双清零①:上游 completeSimple 无 prompt
             enabled_tools: Some(vec![]), // 双清零②:无工具
+            skills: Some(vec![]),      // 三清零:排除面(P0 评审#1 —— 裸测试会话跳过自动加载)
             no_session: true,          // 不落盘
             models_path: Some(models_path.clone()),
             working_directory: Some(cwd.clone()),
@@ -735,4 +810,97 @@ pub(crate) async fn models_config_test(
             "ok": false, "error": e.to_string(),
         })),
     }
+}
+
+// ============================================================================
+// GET /api/skills?cwd= —— 真列表(替换 gated 空壳;上游 skills/route.ts 对齐)
+// ============================================================================
+
+/// 引擎 Skill → lib SkillInfo(平 source → 嵌套 sourceInfo)。
+fn skill_to_info(sk: &pi::resources::Skill) -> crate::skills::skill_lock::SkillInfo {
+    crate::skills::skill_lock::SkillInfo {
+        name: sk.name.clone(),
+        description: sk.description.clone(),
+        file_path: sk.file_path.to_string_lossy().into_owned(),
+        base_dir: sk.base_dir.to_string_lossy().into_owned(),
+        disable_model_invocation: sk.disable_model_invocation,
+        source_info: crate::skills::skill_lock::SourceInfo {
+            source: Some(sk.source.clone()),
+            scope: Some(sk.source.clone()),
+        },
+        install: None,
+    }
+}
+
+/// 引擎 ResourceDiagnostic → lib 形状(kind → type 字符串;collision 降级文本)。
+fn diag_to_lib(d: &pi::resources::ResourceDiagnostic) -> crate::skills::skills_service::ResourceDiagnostic {
+    crate::skills::skills_service::ResourceDiagnostic {
+        r#type: format!("{:?}", d.kind).to_lowercase(),
+        message: d.message.clone(),
+        source: None,
+        path: Some(d.path.to_string_lossy().into_owned()),
+    }
+}
+
+/// GET /api/skills?cwd= —— cwd 必填(400);门禁(403);四源扫描经引擎
+/// load_skills;lib 标注安装信息;响应 {skills, diagnostics, projectResourcesLoaded}。
+pub(crate) async fn skills_get(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let cwd = dispatch.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if cwd.is_empty() {
+        return Err(ApiError::new(400, "cwd required"));
+    }
+    // 门禁(上游 isExistingFilePathAllowed 同款)
+    super::commands::gate_roots(ctx, &cwd).await?;
+
+    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let cwd_path = std::path::PathBuf::from(&cwd);
+
+    let hooks = ctx.hooks.clone();
+    let result = super::commands::blocking(ctx, move || {
+        // settings 的 skill paths(Config 已有 skills 字段)
+        let config = pi::sdk::Config::load().unwrap_or_default();
+        let skill_paths: Vec<std::path::PathBuf> = config
+            .skills
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        pi::resources::load_skills(pi::resources::LoadSkillsOptions {
+            cwd: cwd_path,
+            agent_dir,
+            skill_paths,
+            include_defaults: true,
+        })
+    })
+    .await?;
+
+    // lib 编排(安装信息标注)
+    let lib_agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(|v| v.to_string_lossy().into_owned())
+        .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent").to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let global_lock = crate::skills::skill_lock::get_global_skills_lock_path(&lib_agent_dir, None);
+    let project_lock = std::path::Path::new(&cwd).join(".pi/skills/skills-lock.json").to_string_lossy().into_owned();
+    let _ = hooks;
+
+    let mut skills: Vec<crate::skills::skill_lock::SkillInfo> =
+        result.skills.iter().map(skill_to_info).collect();
+    let diagnostics: Vec<_> = result.diagnostics.iter().map(diag_to_lib).collect();
+    crate::skills::skill_lock::annotate_skills_with_install_info(
+        &mut skills, &cwd, &lib_agent_dir, &global_lock, &project_lock,
+    );
+    let trusted = crate::security::project_trust::get_project_trust_status(&cwd, &lib_agent_dir).trusted;
+
+    super::commands::json_response(json!({
+        "skills": skills,
+        "diagnostics": diagnostics,
+        "projectResourcesLoaded": trusted,
+    }))
 }

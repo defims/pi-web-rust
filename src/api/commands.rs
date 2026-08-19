@@ -28,9 +28,7 @@ pub(crate) async fn execute(
     dispatch: Dispatch,
 ) -> Result<http::Response<Vec<u8>>, ApiError> {
     match dispatch.command {
-        "gated_skills_get" => json_response(json!({
-            "skills": [], "diagnostics": [], "projectResourcesLoaded": false
-        })),
+        "gated_skills_get" => super::models::skills_get(&ctx, dispatch).await,
         "gated_skills_patch" => json_response(json!({ "success": true })),
         "gated_skills_search" => json_response(json!({ "results": [] })),
         "gated_skills_check" => json_response(json!({ "updates": [] })),

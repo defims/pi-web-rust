@@ -2395,6 +2395,113 @@ mod success_settle_tests {
         }
     }
 
+    /// P0(Skills):种 ~/.pi/agent/skills/foo/SKILL.md → 建会话 → fake LLM
+    /// server 收到的请求体 system message 含技能描述。
+    #[test]
+    fn skills_reach_session_prompt() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("skills-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        // 种技能(~/.pi/agent/skills/foo/SKILL.md)
+        let skill_dir = tmp.join(".pi/agent/skills/foo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---
+name: foo
+description: Test skill for prompt injection
+---
+# Foo
+Do foo things.
+",
+        )
+        .unwrap();
+
+        // fake LLM server:读请求体,断言 system message 含技能描述
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                use std::io::Read;
+                let mut buf = vec![0u8; 65536];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(req.clone());
+                let body = "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+
+";
+                let resp = format!("HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Content-Length: {}
+Connection: close
+
+{}", body.len(), body);
+                use std::io::Write;
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        // models.json 指向 fake server
+        let pi = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("models.json"),
+            format!(
+                r#"{{"providers":{{"fake":{{"baseUrl":"http://127.0.0.1:{port}/v1","api":"openai-completions","apiKey":"k","models":[{{"id":"f1","name":"f1"}}]}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(2, 4)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let mut cfg = crate::api::ApiConfig::new(Arc::new(|_: crate::api::ApiEvent| {}) as EventSink);
+        cfg.hooks = Arc::new(Hooks(tmp.clone()));
+        let api = PiWebApi::new(rt, cfg);
+
+        // 建会话 + prompt(触发 LLM 请求)
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#))).expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+        let _ = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"hi"}"#)).expect("prompt");
+
+        // fake server 收到的请求体含技能描述
+        let req = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("LLM request received");
+        assert!(
+            req.contains("foo") && req.contains("Test skill"),
+            "skills must reach session prompt; req contains foo={}, Test skill={}; head: {}",
+            req.contains("foo"), req.contains("Test skill"),
+            &req[..req.len().min(300)]
+        );
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
     /// tool_factory 接线回归:hooks 提供的工厂必须在建会话时被引擎调用
     /// (Wire B 会话曾漏传 → Moho 工具全丢)。
     #[test]
