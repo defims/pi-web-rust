@@ -155,6 +155,9 @@ pub struct ApiConfig {
     pub timeouts: TimeoutConfig,
     /// 会话注册表容量(默认 1;溢出 = 关旧建新)。
     pub max_sessions: usize,
+    /// idle 清扫阈值(None = 禁用;Some(d) = 无命令且不忙超过 d 的会话
+    /// 被优雅关停:引擎 flush 落盘后任务退出,后续 RPC 走磁盘恢复)。
+    pub idle_shutdown_after: Option<std::time::Duration>,
 }
 
 impl ApiConfig {
@@ -164,6 +167,7 @@ impl ApiConfig {
             hooks: Arc::new(NoopHooks),
             timeouts: TimeoutConfig::default(),
             max_sessions: 1,
+            idle_shutdown_after: None,
         }
     }
 }
@@ -184,6 +188,19 @@ struct Inner {
 impl PiWebApi {
     pub fn new(rt: Arc<Runtime>, cfg: ApiConfig) -> Self {
         let sessions = Arc::new(session_runtime::SessionRuntime::new(cfg.max_sessions));
+        // idle 清扫任务(上游 rpc-manager 闲置驱逐):每 60s 扫一次,
+        // 超过阈值且不忙的会话优雅关停(flush 后任务自退)。
+        // 任务随运行时生命周期(进程退出即止),无泄漏面。
+        if let Some(idle_after) = cfg.idle_shutdown_after {
+            let sweeper = sessions.clone();
+            rt.handle().spawn(async move {
+                loop {
+                    let now = asupersync::time::wall_now();
+                    asupersync::time::sleep(now, std::time::Duration::from_secs(60)).await;
+                    sweeper.sweep_idle(idle_after);
+                }
+            });
+        }
         Self(Arc::new(Inner { rt, cfg, shutdown: AtomicBool::new(false), sessions }))
     }
 
@@ -248,11 +265,59 @@ impl PiWebApi {
         self.0.shutdown.store(true, Ordering::SeqCst);
     }
 
+    /// 优雅关停(退出配方):向所有会话发强制 Shutdown(idle_after=ZERO
+    /// 跳过 idle 二次确认;busy 会话在 turn 内 busy-拒绝),有界等待
+    /// flush 落盘回执,再置停机位。此后 drop runtime 不丢未落盘消息
+    /// (write-behind 队列已在会话任务内 drain)。
+    pub fn shutdown_graceful(&self, grace: std::time::Duration) {
+        self.0.rt.block_on(async {
+            let handles: Vec<_> = self
+                .0
+                .sessions
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .cloned()
+                .collect();
+            let mut waits = Vec::new();
+            for h in handles {
+                if h.dead.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if h.tx
+                    .send(session_runtime::SessionCmd::Shutdown {
+                        idle_after: std::time::Duration::ZERO,
+                        reply: tx,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    waits.push(rx);
+                }
+            }
+            let now = asupersync::time::wall_now();
+            let _ = asupersync::time::timeout(now, grace, futures::future::join_all(waits)).await;
+        });
+        self.0.shutdown.store(true, Ordering::SeqCst);
+    }
+
     /// 宿主事件注入(legacy 链路的归宿);sink panic 被 catch_unwind 吞掉
     /// 并忽略(尽力而为语义,见契约三纪律)。
     pub fn emit(&self, event: ApiEvent) {
         let sink = self.0.cfg.sink.clone();
         let _ = std::panic::catch_unwind(AssertUnwindSafe(move || sink(event)));
+    }
+
+    /// 手动触发 idle 清扫(自动清扫之外的宿主/测试入口)。
+    pub fn sweep_idle_sessions(&self, idle_after: std::time::Duration) {
+        self.0.sessions.sweep_idle(idle_after);
+    }
+
+    /// 注册表会话数(观测/测试用)。
+    pub fn session_count(&self) -> usize {
+        self.0.sessions.sessions.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 

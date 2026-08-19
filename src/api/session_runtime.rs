@@ -57,6 +57,13 @@ pub(crate) enum SessionCmd {
     Deferred { what: &'static str, reply: oneshot::Sender<Result<Value, String>> },
     GetStats { reply: oneshot::Sender<Result<Value, String>> },
     GetLastText { reply: oneshot::Sender<Result<Value, String>> },
+    /// 优雅关停:任务侧二次 idle 确认 → flush write-behind 落盘 → 注册表
+    /// 剔除 → 任务退出。idle 清扫与宿主退出用;清扫后若有新命令抢先
+    /// touch(邮箱序在前),二次确认不成立即放弃关停继续服务。
+    Shutdown {
+        idle_after: std::time::Duration,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
 /// 会话状态快照(LoopState 对应物;app 自有追踪 —— 计划口径:
@@ -93,9 +100,35 @@ pub(crate) struct SessionSnap {
     pub streaming_message: Arc<Mutex<Option<serde_json::Value>>>,
     /// 累计 usage tokens(finish_turn 每轮更新;contextUsage 百分比用)
     pub last_usage_total: u64,
+    /// 最近一次命令到达时刻(idle 清扫判据;命令线是唯一活动来源 ——
+    /// 引擎事件只在 turn 内流动,而 turn 内 is_prompt_running 恒真)
+    pub last_activity: Option<std::time::Instant>,
 }
 
 impl SessionSnap {
+    /// 盖章活动(session_loop 每收到一条命令调用)。
+    pub fn touch(&mut self) {
+        self.last_activity = Some(std::time::Instant::now());
+    }
+
+    /// 距最近活动的时长(None = 无活动记录,视为 0 —— 未用会话由容量
+    /// 溢出/destroy 处置,清扫只针对用过的)。
+    pub fn idle_for(&self) -> std::time::Duration {
+        self.last_activity.map(|t| t.elapsed()).unwrap_or_default()
+    }
+
+    /// 运行中判定(清扫豁免):streaming/prompt/compacting/bash 任一进行,
+    /// 或有排队续跑/转向。
+    pub fn is_busy(&self) -> bool {
+        self.is_streaming
+            || self.is_prompt_running
+            || self.is_compacting
+            || self.is_bash_running
+            || !self.queued_prompts.is_empty()
+            || !self.queued_steering.is_empty()
+            || !self.queued_follow_up.is_empty()
+    }
+
     /// agent_get_state.state 形状(前端挂载恢复/运行中对账的切片)。
     pub fn to_state_json(&self) -> Value {
         let (model, thinking) = match (&self.model_provider, &self.model_id) {
@@ -258,6 +291,7 @@ impl SessionRuntime {
             session_id: Some(restored_id.clone()),
             session_path: Some(path_for_snap),
             cwd: Some(cwd.clone()),
+            last_activity: Some(std::time::Instant::now()),
             ..Default::default()
         }));
         let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -520,6 +554,7 @@ impl SessionRuntime {
             // 引擎解析真相优先(含 scoped pin/settings 默认);显式请求值兜底
             thinking_level: eng_thinking.clone().or(thinking_level),
             cwd: Some(cwd.to_string()),
+            last_activity: Some(std::time::Instant::now()),
             ..Default::default()
         }));
         // 注:路径回填 —— 引擎 AgentSessionState 无 session_file 字段;fork/reload
@@ -562,6 +597,37 @@ impl SessionRuntime {
     /// 显式销毁(drop sender → 任务退出;注册表剔除)。
     pub fn destroy(&self, id: &str) -> bool {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id).is_some()
+    }
+
+    /// idle 清扫(上游 rpc-manager 闲置会话驱逐语义的 InProcess 等价):
+    /// 超过 `idle_after` 无命令且不忙的会话发 Shutdown(任务侧二次 idle
+    /// 确认 → 引擎 flush 落盘 → 注册表自剔 → 退出);dead 会话直接剔除
+    /// (任务已亡,无从 flush)。busy(streaming/prompt/compacting/bash/
+    /// 队列非空)一律豁免。
+    /// 键的剔除发生在 flush 之后(Shutdown 分支)—— 若在此先剔,并发 RPC
+    /// 会走磁盘恢复在同文件起第二个引擎实例(双写)。
+    pub fn sweep_idle(&self, idle_after: std::time::Duration) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut dead_victims, mut idle_victims): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        for (id, h) in sessions.iter() {
+            if h.dead.load(std::sync::atomic::Ordering::SeqCst) {
+                dead_victims.push(id.clone());
+                continue;
+            }
+            let s = h.snap.lock().unwrap_or_else(|e| e.into_inner());
+            if !s.is_busy() && s.idle_for() >= idle_after {
+                idle_victims.push(id.clone());
+            }
+        }
+        for id in dead_victims {
+            sessions.remove(&id);
+        }
+        for id in idle_victims {
+            if let Some(h) = sessions.get(&id) {
+                // 发送即返回;flush 在会话任务内完成(Shutdown 分支回执后退出)
+                let _ = h.tx.try_send(SessionCmd::Shutdown { idle_after, reply: oneshot::channel().0 });
+            }
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<SessionHandle> {
@@ -617,10 +683,37 @@ async fn session_loop(
                 // 更简:借用生命周期封闭在 handle_prompt_turn 调用内)
                 SessionCmd::Prompt { message, images, reply } => {
                     let _ = reply.send(Ok(json!({})));
+                    snap.lock().unwrap_or_else(|e| e.into_inner()).touch();
                     handle_prompt_turn(&mut handle, &mut rx, message, images, &mut abort_handle, &snap, &sink)
                         .await;
                 }
+                // 优雅关停(idle 清扫/宿主退出):二次 idle 确认 → flush 落盘
+                // → 回执 → 注册表剔除(fork 重键后键=新 id,按 snap ptr 找)→
+                // 退出任务。二次确认失败(清扫决策后有新命令 touch)= 放弃
+                // 关停继续服务;宿主强制退出场景传 Duration::ZERO 跳过确认。
+                SessionCmd::Shutdown { idle_after, reply } => {
+                    let still_idle = {
+                        let s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                        !s.is_busy() && (idle_after.is_zero() || s.idle_for() >= idle_after)
+                    };
+                    if !still_idle {
+                        let _ = reply.send(Err("shutdown cancelled: session active".into()));
+                        continue;
+                    }
+                    let res = handle
+                        .shutdown()
+                        .await
+                        .map(|_| json!({ "result": "ok" }))
+                        .map_err(|e| format!("{e}"));
+                    registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .retain(|_, v| !std::sync::Arc::ptr_eq(&v.snap, &snap));
+                    let _ = reply.send(res);
+                    return;
+                }
                 other => {
+                    snap.lock().unwrap_or_else(|e| e.into_inner()).touch();
                     idle_cmd(other, &mut handle, &snap, &sink, &rt, &hooks, &tx, &dead, &registry).await;
                 }
             },
@@ -899,10 +992,17 @@ async fn idle_cmd(
             let r = handle
                 .compact(|_| {}) // 事件经 session 级 on_event 透传(避免双发)
                 .await
-                .map(|_| {
-                    // InProcess compact 不暴露 token 统计(上游契约要 tokensBefore/
-                    // estimatedTokensAfter,仅在 RPC 变体可得)—— 保持 result 信封
-                    json!({ "result": "ok" })
+                .map(|info| {
+                    // 引擎现返回 token 统计(上游 compaction_result 契约:
+                    // tokensBefore + estimatedTokensAfter,前端 readCompactResult
+                    // 两者齐备才显示统计)
+                    json!({
+                        "result": "ok",
+                        "summary": info.summary,
+                        "tokensBefore": info.tokens_before,
+                        "estimatedTokensAfter": info.estimated_tokens_after,
+                        "firstKeptEntryId": info.first_kept_entry_id,
+                    })
                 })
                 .map_err(|e| format!("{e}"));
             {
@@ -954,6 +1054,10 @@ async fn idle_cmd(
         SessionCmd::Prompt { reply, .. } => {
             // 主循环已拦截 Prompt;防御分支
             let _ = reply.send(Err("prompt handled at top level".into()));
+        }
+        SessionCmd::Shutdown { reply, .. } => {
+            // 主循环已拦截 Shutdown;防御分支
+            let _ = reply.send(Err("shutdown handled at top level".into()));
         }
     }
 }
@@ -1051,7 +1155,8 @@ fn handle_running_cmd(
         | SessionCmd::Reload { reply }
         | SessionCmd::Rebuild { reply, .. }
         | SessionCmd::Deferred { reply, .. }
-        | SessionCmd::GetStats { reply } => {
+        | SessionCmd::GetStats { reply }
+        | SessionCmd::Shutdown { reply, .. } => {
             let _ = reply.send(Err("session busy (prompt running)".into()));
         }
     }
@@ -2232,6 +2337,100 @@ mod success_settle_tests {
             Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
+    }
+
+    /// idle 清扫:prompt 完成 → sweep_idle(ZERO)→ 会话任务优雅关停:
+    /// write-behind 队列 drain(会话文件落盘含本轮消息)+ 注册表剔除。
+    /// 修复前:裸 drop 不 flush —— 同进程内文件永不出现本轮消息
+    /// (dead_session 测试注释的"落盘只在进程退出"即此行为)。
+    #[test]
+    fn idle_sweep_flushes_write_behind_and_evicts() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("idlesweep-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // prompt → 等 settled(running=false)
+        let (ptx, _prx) = std::sync::mpsc::channel();
+        api.handle(
+            post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"hi-flush-marker"}"#),
+            Box::new(move |r| {
+                let _ = ptx.send(r);
+            }),
+        );
+        let t0 = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+            if !body(&st)["running"].as_bool().unwrap_or(true) {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "never settled");
+        }
+        assert_eq!(api.session_count(), 1, "session still registered after turn");
+
+        // 清扫(ZERO = 无视 idle 时长立即判)
+        api.sweep_idle_sessions(std::time::Duration::ZERO);
+
+        // 轮询:注册表清空 + 会话文件含本轮 user 消息(flush 证据)
+        // (落盘根随 sessions_root/hooks 解析;扫整个测试 HOME 定位)
+        let mut flushed = false;
+        let t1 = std::time::Instant::now();
+        while t1.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if api.session_count() == 0 {
+                let found = walk_jsonl(&tmp)
+                    .into_iter()
+                    .any(|content| content.contains("hi-flush-marker"));
+                if found {
+                    flushed = true;
+                    break;
+                }
+            }
+        }
+        assert!(flushed, "idle sweep must flush write-behind queue to disk (registry emptied: {})", api.session_count() == 0);
+
+        // 驱逐后 RPC 走磁盘恢复:GET 不 404(dead-session 同语义)
+        let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("get after sweep");
+        assert_eq!(body(&st)["running"], serde_json::json!(false));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// 递归收集 dir 下所有 .jsonl 文件内容(测试观测用)。
+    fn walk_jsonl(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else { return out };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk_jsonl(&p));
+            } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                if let Ok(c) = std::fs::read_to_string(&p) {
+                    out.push(c);
+                }
+            }
+        }
+        out
     }
 
     /// P1 scope 接线:settings 默认模型被选中;显式请求可用模型外的组合 → 400。
