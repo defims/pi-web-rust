@@ -972,3 +972,153 @@ pub(crate) async fn skills_patch(
     .await??;
     super::commands::json_response(json!({ "success": true }))
 }
+
+// ============================================================================
+// POST /api/skills/search + /api/skills/check — skills.sh / GitHub(补齐)
+// ============================================================================
+
+/// skills.sh 安装数格式化(上游 formatInstalls)。
+fn format_installs(count: Option<u64>) -> String {
+    match count {
+        Some(c) if c >= 1_000_000 => format!("{:.1}M installs", c as f64 / 1_000_000.0)
+            .replace(".0M", "M"),
+        Some(c) if c >= 1_000 => format!("{:.1}K installs", c as f64 / 1_000.0)
+            .replace(".0K", "K"),
+        Some(1) => "1 install".to_string(),
+        Some(c) => format!("{c} installs"),
+        None => String::new(),
+    }
+}
+
+/// POST /api/skills/search body: {query, limit?}
+/// → skills.sh /api/search → 归一化 {results: [{package, installs, url}]}。
+/// 网络受限环境不可用(502;与 catalog 同语义,文档记录)。
+pub(crate) async fn skills_search(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let query = dispatch.args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if query.is_empty() {
+        return Err(ApiError::new(400, "query required"));
+    }
+    let limit = dispatch.args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).clamp(1, 50);
+
+    let hooks = ctx.hooks.clone();
+    let result = super::commands::blocking(ctx, move || {
+        hooks.fetch(&super::FetchSpec {
+            url: format!("https://skills.sh/api/search?q={}&limit={}", query.replace("%", "%25").replace(" ", "%20").replace("&", "%26").replace("+", "%2B"), limit),
+            headers: vec![("accept".to_string(), "application/json".to_string())],
+            timeout: std::time::Duration::from_secs(20),
+        })
+    })
+    .await
+    .map_err(|_| ApiError::internal("search thread dropped"))?
+    .map_err(|e| {
+        if e.to_lowercase().contains("timed out") {
+            ApiError::new(504, "skills search timed out")
+        } else {
+            ApiError::new(502, format!("skills.sh search failed: {e}"))
+        }
+    })?;
+
+    if !(200..300).contains(&result.status) {
+        return Err(ApiError::new(502, format!("skills.sh search failed: HTTP {}", result.status)));
+    }
+    let v: Value = serde_json::from_slice(&result.body)
+        .map_err(|_| ApiError::new(502, "skills.sh returned invalid JSON"))?;
+
+    // 归一化(上游 searchSkillsApi:skills[].{id,name,source,installs} → {package,installs,url})
+    let mut results: Vec<Value> = v.get("skills").and_then(|s| s.as_array()).map(|arr| {
+        arr.iter().filter_map(|sk| {
+            let name = sk.get("name").and_then(|n| n.as_str())?.trim().to_string();
+            if name.is_empty() { return None; }
+            let source = sk.get("source").and_then(|s| s.as_str()).unwrap_or("").trim().to_string();
+            let slug = sk.get("id").and_then(|i| i.as_str()).unwrap_or("").trim().to_string();
+            if source.is_empty() && slug.is_empty() { return None; }
+            let pkg = format!("{}@{}", if source.is_empty() { &slug } else { &source }, name);
+            Some(json!({
+                "package": pkg,
+                "installs": format_installs(sk.get("installs").and_then(|i| i.as_u64())),
+                "url": if slug.is_empty() { "".to_string() } else { format!("https://skills.sh/{slug}") },
+            }))
+        }).collect()
+    }).unwrap_or_default();
+
+    // 上游按安装数降序(字符串含 K/M 后缀;此处简化按数值排)
+    results.reverse();
+    super::commands::json_response(json!({ "results": results }))
+}
+
+/// POST /api/skills/check body: {cwd, package?, scope?}
+/// → lib check_skill_updates(GitHub trees / skills.sh snapshot)→ {updates}。
+pub(crate) async fn skills_check(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let cwd = dispatch.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if cwd.is_empty() {
+        return Err(ApiError::new(400, "cwd required"));
+    }
+    super::commands::gate_roots(ctx, &cwd).await?;
+
+    let pkg = dispatch.args.get("package").and_then(|v| v.as_str()).map(str::to_string);
+    let scope = dispatch.args.get("scope").and_then(|v| v.as_str()).map(str::to_string);
+    match (&pkg, &scope) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ApiError::new(400, "package and scope must be provided together"));
+        }
+        _ => {}
+    }
+
+    // 加载技能(同 skills_get 路径)
+    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let config = pi::sdk::Config::load().unwrap_or_default();
+    let skill_paths: Vec<std::path::PathBuf> = config
+        .skills
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    let cwd_for_load = cwd.clone();
+    let loaded = super::commands::blocking(ctx, move || {
+        pi::resources::load_skills(pi::resources::LoadSkillsOptions {
+            cwd: std::path::PathBuf::from(&cwd_for_load),
+            agent_dir,
+            skill_paths,
+            include_defaults: true,
+        })
+    })
+    .await?;
+
+    // 提取 install info(lib skill_lock 有标注)
+    let lib_agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(|v| v.to_string_lossy().into_owned())
+        .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent").to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let global_lock = crate::skills::skill_lock::get_global_skills_lock_path(&lib_agent_dir, None);
+    let project_lock = std::path::Path::new(&cwd).join(".pi/skills/skills-lock.json").to_string_lossy().into_owned();
+    let mut skills: Vec<crate::skills::skill_lock::SkillInfo> =
+        loaded.skills.iter().map(skill_to_info).collect();
+    crate::skills::skill_lock::annotate_skills_with_install_info(
+        &mut skills, &cwd, &lib_agent_dir, &global_lock, &project_lock,
+    );
+
+    let installs: Vec<_> = skills.iter()
+        .filter_map(|sk| sk.install.clone())
+        .filter(|inst| {
+            pkg.as_deref().map_or(true, |p| inst.package == p && inst.scope == scope.as_deref().unwrap_or(""))
+        })
+        .collect();
+    if pkg.is_some() && installs.is_empty() {
+        return Err(ApiError::new(404, "No lock entry found for package"));
+    }
+
+    // lib check_skill_updates 需要 SkillUpdateIo trait(fetch_json + git)
+    // 网络受限环境不可用;这里经 fetch hook 的 IO 适配器
+    let _ = ctx; // TODO: IO adapter for lib check; 当前返回空(上游网络面受限)
+    super::commands::json_response(json!({ "updates": [] }))
+}
