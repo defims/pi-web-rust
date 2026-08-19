@@ -2732,6 +2732,69 @@ Connection: close
         }
     }
 
+    /// 扩展自动进会话(引擎 SDK auto-load,skills P0 同款):
+    /// 种 ~/.pi/agent/extensions/hello/index.js → create → has_extensions;
+    /// 无种子 → false;no_extensions=true + 种子 → false(opt-out)。
+    /// 直接调 SDK(不经 API 层 —— 会话创建是观测点)。
+    #[test]
+    fn extensions_auto_load_into_session() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("extload-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        // models.json(fake provider,不实际发请求)
+        let pi = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("models.json"),
+            r#"{"providers":{"fake":{"baseUrl":"http://127.0.0.1:9/v1","api":"openai-completions","apiKey":"k","models":[{"id":"f1","name":"f1"}]}}}"#,
+        )
+        .unwrap();
+        // 种扩展:auto 目录 index.js(JS 入口)
+        let ext_dir = pi.join("extensions/hello");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("index.js"), "export function activate() {}\n").unwrap();
+
+        let cwd = tmp.to_path_buf();
+        let mk = |no_ext: bool| {
+            let cwd = cwd.clone();
+            futures::executor::block_on(pi::sdk::create_agent_session(
+                pi::sdk::SessionOptions {
+                    no_session: true,
+                    working_directory: Some(cwd),
+                    no_extensions: no_ext,
+                    ..Default::default()
+                },
+            ))
+        };
+
+        let handle = mk(false).expect("session with extension");
+        assert!(handle.has_extensions(), "auto-discovered extension must load");
+
+        let handle = mk(true).expect("session with opt-out");
+        assert!(!handle.has_extensions(), "no_extensions must opt out");
+
+        // 无种子 → false(移走扩展目录)
+        std::fs::remove_dir_all(&ext_dir).unwrap();
+        let handle = mk(false).expect("session without extensions");
+        assert!(!handle.has_extensions(), "no sources → no extensions");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
     /// tool_factory 接线回归:hooks 提供的工厂必须在建会话时被引擎调用
     /// (Wire B 会话曾漏传 → Moho 工具全丢)。
     #[test]
