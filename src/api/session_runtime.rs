@@ -91,6 +91,8 @@ pub(crate) struct SessionSnap {
     /// + agent-event-stream.ts:97-99 snapshot replay 等价)。Arc 共享
     /// 给 on_event 回调(在 SessionSnap 构造前创建)。
     pub streaming_message: Arc<Mutex<Option<serde_json::Value>>>,
+    /// 累计 usage tokens(finish_turn 每轮更新;contextUsage 百分比用)
+    pub last_usage_total: u64,
 }
 
 impl SessionSnap {
@@ -1067,9 +1069,11 @@ async fn finish_turn(
     match &res {
         Ok(am) => {
             let text = extract_assistant_text(am);
+            let usage_total = am.usage.total_tokens;
             let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
             s.is_streaming = false;
             s.is_prompt_running = false;
+            s.last_usage_total = s.last_usage_total.max(usage_total);
             s.last_assistant_text = Some(text);
             emit_agent(sink, json!({ "type": "prompt_done" }));
             if emit_settled {

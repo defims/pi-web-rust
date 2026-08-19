@@ -405,8 +405,47 @@ fn agent_get_state(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
     };
     let snap = h.snap.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let running = snap.is_streaming || snap.is_prompt_running || snap.is_compacting;
-    json_response(json!({ "running": running, "state": snap.to_state_json() }))
+
+    // contextUsage(上游 getContextUsage 等价):snap 缓存的 usage tokens
+    // vs 模型 context_window 的百分比。tokens 由 finish_turn 每轮更新。
+    let tokens = snap.last_usage_total;
+    let provider = snap.model_provider.clone().unwrap_or_default();
+    let model_id = snap.model_id.clone().unwrap_or_default();
+    let context_usage = compute_context_usage(tokens, &provider, &model_id);
+
+    let mut state = snap.to_state_json();
+    if let Some(obj) = state.as_object_mut() {
+        obj.insert("contextUsage".to_string(), context_usage);
+    }
+    json_response(json!({ "running": running, "state": state }))
 }
+
+/// tokens + models.json 的 contextWindow → {tokens, contextWindow, percent};
+/// 任一缺失 → null(上游压缩后 percent 可 null 同款语义)。
+fn compute_context_usage(tokens: u64, provider: &str, model_id: &str) -> Value {
+    if tokens == 0 || provider.is_empty() || model_id.is_empty() {
+        return Value::Null;
+    }
+    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent")))
+        .unwrap_or_default();
+    let cfg = crate::fs::models_config_store::read_models_config(&agent_dir.join("models.json"));
+    let cw = cfg.get("providers").and_then(|p| p.get(provider))
+        .and_then(|p| p.get("models")).and_then(|m| m.as_array())
+        .and_then(|arr| arr.iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(model_id)))
+        .and_then(|m| m.get("contextWindow")).and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if cw == 0 {
+        return Value::Null;
+    }
+    json!({
+        "tokens": tokens,
+        "contextWindow": cw,
+        "percent": (tokens as f64 / cw as f64) * 100.0,
+    })
+}
+
 
 /// POST /api/agent/:id —— 25-case RPC(body {type: ...})。
 /// 信封:{success:true,data} / 500 {error}(对齐上游 route.ts)。
