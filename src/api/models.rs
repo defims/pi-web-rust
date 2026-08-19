@@ -687,6 +687,102 @@ description: From project dir
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
     }
+
+    /// POST /api/plugins disable/enable 往返:disable → settings 条目变全空
+    /// filter(引擎禁用语义)→ 列表 status=disabled;enable → 还原 → loaded。
+    #[test]
+    fn plugins_disable_enable_roundtrip() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("pluginsde-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let pkg = tmp.join("pkg-de");
+        std::fs::create_dir_all(pkg.join("skills/de-skill")).unwrap();
+        std::fs::write(
+            pkg.join("skills/de-skill/SKILL.md"),
+            "---\nname: de-skill\ndescription: roundtrip\n---\n",
+        )
+        .unwrap();
+        let agent_dir = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let pkg_s = pkg.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            format!(r#"{{"packages":[{{"source":"{pkg_s}"}}]}}"#),
+        )
+        .unwrap();
+
+        let proj_cwd = tmp.join("proj");
+        std::fs::create_dir_all(&proj_cwd).unwrap();
+        crate::fs::allowed_roots::allow_file_root(&proj_cwd.to_string_lossy());
+        let api = api_with_hooks(&tmp);
+        let cwd_s = proj_cwd.to_string_lossy().to_string();
+        let get_uri = format!("/api/plugins?cwd={}", cwd_s.replace('/', "%2F"));
+        let post_body = |source: &str, action: &str| {
+            format!(
+                r#"{{"action":"{action}","source":"{}","scope":"global","cwd":"{cwd_s}"}}"#,
+                source.replace('\\', "\\\\").replace('"', "\\\"")
+            )
+        };
+
+        // disable → status disabled(资源在但全禁用)
+        let resp = call(&api, http::Request::builder()
+            .method("POST")
+            .uri("/api/plugins")
+            .header("content-type", "application/json")
+            .body(post_body(&pkg.to_string_lossy(), "disable").into_bytes()).unwrap())
+            .expect("disable ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["packages"][0]["status"], serde_json::json!("disabled"), "{v}");
+        assert_eq!(v["packages"][0]["disabled"], serde_json::json!(true));
+        // settings 落盘为全空 filter 对象形态
+        let saved: Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_dir.join("settings.json")).unwrap(),
+        ).unwrap();
+        assert!(saved["packages"][0].get("skills").is_some_and(|f| f.as_array().is_some_and(Vec::is_empty)));
+
+        // enable → 还原纯字符串形态 → loaded
+        let resp = call(&api, http::Request::builder()
+            .method("POST")
+            .uri("/api/plugins")
+            .header("content-type", "application/json")
+            .body(post_body(&pkg.to_string_lossy(), "enable").into_bytes()).unwrap())
+            .expect("enable ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["packages"][0]["status"], serde_json::json!("loaded"), "{v}");
+        let saved: Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_dir.join("settings.json")).unwrap(),
+        ).unwrap();
+        assert!(saved["packages"][0].is_string(), "entry restored to plain source form");
+
+        // 未知动作 → 400;GET 仍正常
+        let e = call(&api, http::Request::builder()
+            .method("POST")
+            .uri("/api/plugins")
+            .header("content-type", "application/json")
+            .body(post_body(&pkg.to_string_lossy(), "explode").into_bytes()).unwrap())
+            .err().expect("unknown action must err");
+        assert_eq!(e.status, 400);
+        let resp = call(&api, http::Request::builder().method("GET").uri(&get_uri).body(Vec::new()).unwrap()).unwrap();
+        assert_eq!(resp.status(), 200);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
 }
 
 /// POST /api/models-config/test:经引擎真发一条补全(上游 completeSimple 等价)。
@@ -1434,5 +1530,140 @@ mod plugins_tests {
             Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
+    }
+}
+
+// ============================================================================
+// POST /api/plugins — install/remove/update/disable/enable(上游五动作)
+// ============================================================================
+
+/// POST /api/plugins body: {action, source, scope, cwd} → 动作后的新清单。
+/// disable/enable = settings 手术(引擎禁用表示:filter 四字段全空数组 →
+/// 资源 enabled=false;enable 还原为无 filter 形态);remove/install/update
+/// = 引擎 PackageManager 原生动作(remove 先删文件/锁再删 settings 条目;
+/// install 先 settings 后安装;npm/git 源走网络 —— Long 超时档)。
+pub(crate) async fn plugins_post(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let cwd = dispatch.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if cwd.is_empty() {
+        return Err(ApiError::new(400, "cwd required"));
+    }
+    super::commands::gate_roots(ctx, &cwd).await?;
+
+    let action = dispatch.args.get("action").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let source = dispatch.args.get("source").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if action.is_empty() || source.is_empty() {
+        return Err(ApiError::new(400, "action and source required"));
+    }
+    if !matches!(action.as_str(), "install" | "remove" | "update" | "disable" | "enable") {
+        return Err(ApiError::new(400, format!("unknown action: {action}")));
+    }
+    let scope = match dispatch.args.get("scope").and_then(|v| v.as_str()).unwrap_or("global") {
+        "project" => pi::package_manager::PackageScope::Project,
+        _ => pi::package_manager::PackageScope::User,
+    };
+
+    let cwd_path = std::path::PathBuf::from(&cwd);
+    let scan = super::commands::blocking(ctx, move || {
+        plugins_action(&cwd_path, &action, &source, scope)?;
+        plugins_scan(&cwd_path)
+    })
+    .await?
+    .map_err(|e| ApiError::new(500, format!("package action failed: {e}")))?;
+
+    super::commands::json_response(scan)
+}
+
+fn settings_path_for_scope(cwd: &std::path::Path, scope: pi::package_manager::PackageScope) -> std::path::PathBuf {
+    match scope {
+        pi::package_manager::PackageScope::Project => cwd.join(".pi/settings.json"),
+        _ => pi::sdk::Config::global_dir().join("settings.json"),
+    }
+}
+
+/// settings 包条目手术:按 source 找条目(字符串或对象形态),disable 时改写为
+/// 全空 filter(资源全禁用),enable 时剥掉 filter 字段还原。
+fn set_package_disabled(
+    cwd: &std::path::Path,
+    source: &str,
+    scope: pi::package_manager::PackageScope,
+    disabled: bool,
+) -> pi::error::Result<()> {
+    let path = settings_path_for_scope(cwd, scope);
+    let mut root: serde_json::Value = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        root = json!({});
+    }
+    if !matches!(root.get("packages"), Some(serde_json::Value::Array(_))) {
+        root["packages"] = json!([]);
+    }
+    let packages = root
+        .get_mut("packages")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| pi::error::Error::config("failed to init packages array".to_string()))?;
+
+    let mut hit = false;
+    for entry in packages.iter_mut() {
+        let entry_source = match entry {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => o.get("source").and_then(|v| v.as_str()).map(String::from),
+            _ => None,
+        };
+        if entry_source.as_deref() != Some(source) {
+            continue;
+        }
+        hit = true;
+        if disabled {
+            // 对象形态 + 四字段空数组 = 引擎语义的全禁用
+            *entry = json!({
+                "source": source,
+                "extensions": [],
+                "skills": [],
+                "prompts": [],
+                "themes": [],
+            });
+        } else {
+            // 还原为纯字符串形态(无 filter)
+            *entry = json!(source);
+        }
+    }
+    if !hit {
+        return Err(pi::error::Error::config(format!(
+            "package source not found in settings: {source}"
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+fn plugins_action(
+    cwd: &std::path::Path,
+    action: &str,
+    source: &str,
+    scope: pi::package_manager::PackageScope,
+) -> pi::error::Result<()> {
+    use pi::package_manager::PackageManager;
+    let pm = PackageManager::new(cwd.to_path_buf());
+    match action {
+        "disable" => set_package_disabled(cwd, source, scope, true),
+        "enable" => set_package_disabled(cwd, source, scope, false),
+        "remove" => {
+            pm.remove_blocking(source, scope)?;
+            pm.remove_package_source_blocking(source, scope)
+        }
+        "install" => {
+            pm.add_package_source_blocking(source, scope)?;
+            pm.install_blocking(source, scope)
+        }
+        "update" => pm.update_source_blocking(source, scope),
+        other => Err(pi::error::Error::config(format!("unknown action: {other}"))),
     }
 }

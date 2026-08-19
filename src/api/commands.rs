@@ -33,6 +33,7 @@ pub(crate) async fn execute(
         "gated_skills_search" => super::models::skills_search(&ctx, dispatch).await,
         "gated_skills_check" => super::models::skills_check(&ctx, dispatch).await,
         "gated_plugins_get" => super::models::plugins_get(&ctx, dispatch).await,
+        "gated_plugins_post" => super::models::plugins_post(&ctx, dispatch).await,
         "gated_auth_providers" => json_response(json!({ "providers": [] })),
         "home" => home().await,
         "sessions_list" => sessions_list(&ctx).await,

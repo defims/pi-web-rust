@@ -69,6 +69,7 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("POST", "/api/skills/search", "gated_skills_search", TimeoutClass::Default),
     ("POST", "/api/skills/check", "gated_skills_check", TimeoutClass::Default),
     ("GET", "/api/plugins", "gated_plugins_get", TimeoutClass::Default),
+    ("POST", "/api/plugins", "gated_plugins_post", TimeoutClass::Long),
     ("GET", "/api/auth/providers", "gated_auth_providers", TimeoutClass::Default),
     ("GET", "/api/auth/all-providers", "gated_auth_providers", TimeoutClass::Default),
     ("GET", "/api/home", "home", TimeoutClass::Default),
