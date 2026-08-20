@@ -131,12 +131,23 @@ pub(crate) async fn models_list(
         a_key.cmp(b_key).then_with(|| ap.cmp(&bp)).then_with(|| aid.cmp(&bid))
     });
 
-    // defaultModel:null —— 默认由 pi settings.json 决定,前端 loadModels 兜底取首个
+    // defaultModel:settings.json 的 default_provider/default_model(服务端建会话
+    // 真正会用的默认)。此前恒 null —— 前端兜底取 modelList[0],与 settings
+    // 默认不一致时,新建会话显示 A、发首条消息后翻成 B(用户可感 bug)。
+    let default_model: Value = {
+        let config = pi::sdk::Config::load().unwrap_or_default();
+        match (&config.default_provider, &config.default_model) {
+            (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => {
+                json!({ "provider": p, "modelId": m })
+            }
+            _ => Value::Null,
+        }
+    };
     // modelScopeWarnings:仅非空时出现(本实现恒无)
     super::commands::json_response(json!({
         "models": models,
         "modelList": model_list,
-        "defaultModel": Value::Null,
+        "defaultModel": default_model,
         "thinkingLevels": thinking_levels,
         "thinkingLevelMaps": thinking_level_maps,
         "thinkingLevelPins": {},

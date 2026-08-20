@@ -3046,6 +3046,81 @@ Connection: close
         }
     }
 
+    /// 回归(新建会话模型翻转):/api/agent/new 显式带 provider/modelId(deepseek),
+    /// settings.json 默认是 glm —— 会话必须建在请求的模型上,而非回落默认。
+    #[test]
+    fn new_session_honors_requested_model_over_settings_default() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("newsess-model-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        // 叠加:第二个 provider(deepseek)+ settings.json 默认指向 glm(f1)
+        let pi = tmp.join(".pi/agent");
+        std::fs::write(
+            pi.join("models.json"),
+            format!(
+                r#"{{"providers":{{
+                    "fake":{{"baseUrl":"http://127.0.0.1:{port}/v1","api":"openai-completions","apiKey":"k","models":[{{"id":"f1","name":"glm-5"}}]}},
+                    "fake2":{{"baseUrl":"http://127.0.0.1:{port}/v1","api":"openai-completions","apiKey":"k","models":[{{"id":"d1","name":"deepseek-v4-flash"}}]}}
+                }}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            pi.join("settings.json"),
+            r#"{"default_provider":"fake","default_model":"f1"}"#,
+        )
+        .unwrap();
+
+        let cwd = tmp.to_string_lossy().to_string();
+        // 创建前:/api/models 的 defaultModel 必须回 settings 默认(= glm/f1)
+        // —— 前端新建会话显示与服务端创建用同一默认,不再翻转
+        let resp = call(&api, get("/api/models")).expect("models");
+        let v = body(&resp);
+        assert_eq!(v["defaultModel"]["provider"], serde_json::json!("fake"), "defaultModel: {v}");
+        assert_eq!(v["defaultModel"]["modelId"], serde_json::json!("f1"), "defaultModel: {v}");
+
+        // 显式请求 deepseek(= fake2/d1)
+        let resp = call(&api, post(
+            "/api/agent/new",
+            &format!(r#"{{"cwd":"{cwd}","provider":"fake2","modelId":"d1"}}"#),
+        )).expect("create");
+        assert_eq!(resp.status(), 200, "{}", String::from_utf8_lossy(resp.body()));
+        let v = body(&resp);
+        let sid = v["sessionId"].as_str().expect("sid").to_string();
+        assert_eq!(v["model"]["modelId"], serde_json::json!("d1"), "response model: {v}");
+        assert_eq!(v["model"]["provider"], serde_json::json!("fake2"));
+
+        // 引擎真相:get_state 的 model 必须仍是请求的模型
+        let resp = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+        let v = body(&resp);
+        assert_eq!(v["state"]["model"]["id"], serde_json::json!("d1"), "state model: {v}");
+        assert_eq!(v["state"]["model"]["provider"], serde_json::json!("fake2"));
+        // 显式选择被 startup prefs 写回 settings.json("记住我的选择")
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pi.join("settings.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(saved["default_provider"], serde_json::json!("fake2"), "write-back: {saved}");
+        assert_eq!(saved["default_model"], serde_json::json!("d1"), "write-back: {saved}");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
     /// 回归:set_model 后 sessions_get 的 context.model 必须带 modelId 字段
     /// (前端 SessionContext.model 契约是 {provider, modelId};此前返回 {provider,
     /// id} → currentModel 读 .modelId 得 undefined → 底部模型显示"没选")。
