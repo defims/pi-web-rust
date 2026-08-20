@@ -131,10 +131,13 @@ pub(crate) async fn models_list(
         a_key.cmp(b_key).then_with(|| ap.cmp(&bp)).then_with(|| aid.cmp(&bid))
     });
 
-    // defaultModel:settings.json 的 default_provider/default_model(服务端建会话
-    // 真正会用的默认)。此前恒 null —— 前端兜底取 modelList[0],与 settings
-    // 默认不一致时,新建会话显示 A、发首条消息后翻成 B(用户可感 bug)。
-    let default_model: Value = {
+    // defaultModel:跑与建会话"未指定模型"完全相同的解析链(services 快照
+    // → scope 过滤 → default > scoped[0] > visible 兜底)—— 显示与创建
+    // 构造级一致。此前恒 null:前端兜底 modelList[0],与 settings 默认
+    // 不一致时新建会话显示 A、发首条消息后翻成 B。无 cwd 时退 settings
+    // 原始对(前端请求本就总带 cwd)。
+    let cwd_for_default = raw_cwd.clone();
+    let default_model: Value = if cwd_for_default.is_empty() {
         let config = pi::sdk::Config::load().unwrap_or_default();
         match (&config.default_provider, &config.default_model) {
             (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => {
@@ -142,6 +145,15 @@ pub(crate) async fn models_list(
             }
             _ => Value::Null,
         }
+    } else {
+        super::commands::blocking(ctx, move || {
+            super::session_runtime::resolve_default_model_for_cwd(&cwd_for_default)
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|(provider, id)| json!({ "provider": provider, "modelId": id }))
+        .unwrap_or(Value::Null)
     };
     // modelScopeWarnings:仅非空时出现(本实现恒无)
     super::commands::json_response(json!({

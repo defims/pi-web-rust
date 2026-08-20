@@ -701,6 +701,71 @@ impl SessionRuntime {
 /// 借用模型:prompt future 借用 `&mut handle`;borrow checker 要求该 future
 /// 不跨空闲循环迭代存活 —— 与 chat_thread 同款:起 prompt 与驱动至完成放
 /// 进同一匹配(空闲内层循环返回 future,直接流入运行期子循环,不落跨迭代变量)。
+/// 新会话默认模型解析 —— 与 create 的"未指定模型"路径完全同链
+/// (services 快照 → enabledModels scope 过滤 → default > scoped[0] >
+/// visible 兜底)。/api/models 的 defaultModel 用它:显示与创建构造级
+/// 一致(上游同构:同一解析源,不靠碰巧)。
+pub(crate) fn resolve_default_model_for_cwd(cwd: &str) -> Option<(String, String)> {
+    let options = pi::sdk::SessionOptions {
+        no_session: true,
+        working_directory: Some(std::path::PathBuf::from(cwd)),
+        ..Default::default()
+    };
+    let services = futures::executor::block_on(pi::sdk::create_agent_session_services(&options)).ok()?;
+    let cfg = &services.config;
+    let scope = crate::models::scope::resolve_visible_models(
+        cfg.enabled_models.as_deref().unwrap_or(&[]),
+        || {
+            services
+                .model_registry
+                .get_available()
+                .into_iter()
+                .map(|e| crate::models::scope::Model {
+                    id: e.model.id.clone(),
+                    name: e.model.name.clone(),
+                    provider: e.model.provider.clone(),
+                })
+                .collect()
+        },
+        |patterns| {
+            let (scoped, diags) = pi::sdk::resolve_model_scope_with_diagnostics(
+                patterns,
+                &services.model_registry,
+                false,
+            );
+            let scoped = scoped
+                .into_iter()
+                .map(|sm| crate::models::scope::ScopedModel {
+                    model: crate::models::scope::Model {
+                        id: sm.model.model.id.clone(),
+                        name: sm.model.model.name.clone(),
+                        provider: sm.model.model.provider.clone(),
+                    },
+                    thinking_level: sm.thinking_level.map(|t| t.to_string()),
+                })
+                .collect();
+            (scoped, diags)
+        },
+    );
+    let default_ref = match (&cfg.default_provider, &cfg.default_model) {
+        (Some(p), Some(m)) => Some(crate::models::scope::ModelRef {
+            provider: p.clone(),
+            model_id: m.clone(),
+        }),
+        _ => None,
+    };
+    let sel = crate::models::scope::select_initial_model_scope(
+        &scope,
+        &crate::models::scope::InitialModelScopeOptions {
+            requested_model: None,
+            default_model: default_ref,
+            thinking_level: None,
+        },
+    )
+    .ok()?;
+    sel.model.map(|m| (m.provider.clone(), m.id.clone()))
+}
+
 /// 扩展 UI 通道接线:create/restore/rebuild 起柄后调用。
 /// 引擎扩展的 setStatus/setWidget/notify/对话框请求(select/confirm/
 /// input/editor/custom)经 asupersync mpsc 流出 —— 本任务:
@@ -3083,7 +3148,9 @@ Connection: close
         let cwd = tmp.to_string_lossy().to_string();
         // 创建前:/api/models 的 defaultModel 必须回 settings 默认(= glm/f1)
         // —— 前端新建会话显示与服务端创建用同一默认,不再翻转
-        let resp = call(&api, get("/api/models")).expect("models");
+        // 带 cwd:走与建会话同链的解析(services + scope + default)
+        crate::fs::allowed_roots::allow_file_root(&cwd);
+        let resp = call(&api, get(&format!("/api/models?cwd={}", cwd.replace('/', "%2F")))).expect("models");
         let v = body(&resp);
         assert_eq!(v["defaultModel"]["provider"], serde_json::json!("fake"), "defaultModel: {v}");
         assert_eq!(v["defaultModel"]["modelId"], serde_json::json!("f1"), "defaultModel: {v}");
