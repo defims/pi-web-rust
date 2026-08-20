@@ -68,14 +68,24 @@ fn read_entries(path: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// id → 文件路径:lib path 缓存快路径 + 扫描兜底(root/*/*.jsonl 首 header.id 比对)。
-pub(crate) fn find_session_file(root: &str, id: &str) -> Option<PathBuf> {
+/// id → 文件路径:lib path 缓存快路径 + 扫描兜底(roots/*/*.jsonl 首
+/// header.id 比对;多根依次扫)。
+pub(crate) fn find_session_file(roots: &[String], id: &str) -> Option<PathBuf> {
     if let Some(cached) = crate::session::resolve_session_path(id) {
         let path = PathBuf::from(&cached);
         if path.exists() {
             return Some(path);
         }
     }
+    for root in roots {
+        if let Some(found) = find_session_file_in_root(root, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_session_file_in_root(root: &str, id: &str) -> Option<PathBuf> {
     let root = Path::new(root);
     let Ok(days) = std::fs::read_dir(root) else {
         return None;
@@ -310,8 +320,8 @@ pub(crate) async fn get_command(
     }
     let defer_thinking = dispatch.args.get("deferThinking").and_then(|v| v.as_bool()).unwrap_or(false);
     let defer_media = dispatch.args.get("deferMedia").and_then(|v| v.as_bool()).unwrap_or(false);
-    let root = session_root(ctx);
-    let path = find_session_file(&root, &id)
+    let roots = session_roots(ctx);
+    let path = find_session_file(&roots, &id)
         .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
     let v = super::commands::blocking(ctx, move || get_value(&path, defer_thinking, defer_media))
         .await??;
@@ -336,8 +346,8 @@ pub(crate) async fn context_command(
     let leaf_id = dispatch.args.get("leafId").and_then(|v| v.as_str()).map(String::from);
     let defer_thinking = dispatch.args.get("deferThinking").and_then(|v| v.as_bool()).unwrap_or(false);
     let defer_media = dispatch.args.get("deferMedia").and_then(|v| v.as_bool()).unwrap_or(false);
-    let root = session_root(ctx);
-    let path = find_session_file(&root, &id)
+    let roots = session_roots(ctx);
+    let path = find_session_file(&roots, &id)
         .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
     super::commands::blocking(ctx, move || {
         context_value(&path, leaf_id.as_deref(), defer_thinking, defer_media)
@@ -346,10 +356,23 @@ pub(crate) async fn context_command(
 }
 
 fn session_root(ctx: &super::commands::ExecCtx) -> String {
-    ctx.hooks
-        .sessions_root()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(super::commands::default_sessions_root_pub)
+    session_roots(ctx).into_iter().next().unwrap_or_else(super::commands::default_sessions_root_pub)
+}
+
+/// 会话根全集(hooks 根优先 + 引擎默认根兜底,去重)。
+/// 修复"写读分叉":宿主配置了 sessions_root(如 AppConfig.chat.session_dir)
+/// 而历史会话/引擎默认写在 ~/.pi/agent/sessions 时,单根扫描会 404 ——
+/// 上游 TS 只有单一会话根,此处双根兼容新旧位置。
+pub(crate) fn session_roots(ctx: &super::commands::ExecCtx) -> Vec<String> {
+    let mut roots = Vec::new();
+    if let Some(p) = ctx.hooks.sessions_root() {
+        roots.push(p.to_string_lossy().into_owned());
+    }
+    let default = super::commands::default_sessions_root_pub();
+    if !roots.iter().any(|r| *r == default) {
+        roots.push(default);
+    }
+    roots
 }
 
 // ============================================================================
@@ -410,8 +433,8 @@ mod tests {
             "2026-08-16T00-00-00.000Z_deadbeef.jsonl",
             &[header("uuid-1234"), entry("e1", None, "message")],
         );
-        assert_eq!(find_session_file(root.to_str().unwrap(), "uuid-1234").as_deref(), Some(p.as_path()));
-        assert!(find_session_file(root.to_str().unwrap(), "nope").is_none());
+        assert_eq!(find_session_file(&[root.to_str().unwrap().to_string()], "uuid-1234").as_deref(), Some(p.as_path()));
+        assert!(find_session_file(&[root.to_str().unwrap().to_string()], "nope").is_none());
     }
 
     #[test]
@@ -527,8 +550,8 @@ pub(crate) async fn rename_command(
         .unwrap_or("")
         .trim()
         .to_string();
-    let root = session_root(ctx);
-    let path = find_session_file(&root, &id)
+    let roots = session_roots(ctx);
+    let path = find_session_file(&roots, &id)
         .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
 
     super::commands::blocking(ctx, move || -> Result<(), ApiError> {
@@ -578,8 +601,8 @@ pub(crate) async fn delete_command(
     if id.is_empty() {
         return Err(ApiError::new(400, "id is required"));
     }
-    let root = session_root(ctx);
-    let path = find_session_file(&root, &id)
+    let roots = session_roots(ctx);
+    let path = find_session_file(&roots, &id)
         .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
 
     // 文件手术(blocking):删文件 + 重挂直接子会话(branchedFrom 改指祖父)
@@ -682,8 +705,8 @@ pub(crate) async fn auto_name_command(
     if id.is_empty() {
         return Err(ApiError::new(400, "id is required"));
     }
-    let root = session_root(ctx);
-    let path = find_session_file(&root, &id)
+    let roots = session_roots(ctx);
+    let path = find_session_file(&roots, &id)
         .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
 
     super::commands::blocking(ctx, move || -> Result<Value, ApiError> {
@@ -741,8 +764,8 @@ pub(crate) async fn thinking_command(
     if id.is_empty() || entry_id.is_empty() {
         return Err(ApiError::new(400, "id and entryId are required"));
     }
-    let root = session_root(ctx);
-    let path = find_session_file(&root, &id)
+    let roots = session_roots(ctx);
+    let path = find_session_file(&roots, &id)
         .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
 
     super::commands::blocking(ctx, move || -> Result<Value, ApiError> {

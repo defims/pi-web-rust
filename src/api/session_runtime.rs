@@ -231,28 +231,37 @@ impl SessionRuntime {
         if self.sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id) {
             return true;
         }
-        // 与 create 传给引擎的 session_dir 同根(引擎落盘位置);hooks 根仅当
-        // 宿主覆写了 sessions_root 且引擎仍写默认根时兜底扫描。
-        let root = super::commands::default_sessions_root_pub();
+        // 双根扫描:hooks 根(现行写根)优先 + 引擎默认根(历史会话)兜底
+        // —— 单根在宿主配置了 sessions_root 时会 404(写读分叉修复)。
+        let mut scan_roots: Vec<String> = Vec::new();
+        if let Some(p) = ctx.hooks.sessions_root() {
+            scan_roots.push(p.to_string_lossy().into_owned());
+        }
+        let default_root = super::commands::default_sessions_root_pub();
+        if !scan_roots.contains(&default_root) {
+            scan_roots.push(default_root);
+        }
         // 文件名为 <timestamp>_<id前8位>.jsonl(lib 落盘约定),前缀候选 +
         // header 精确校验(短前缀有碰撞可能)
         let prefix = id.split('-').next().unwrap_or("").to_string();
         let full_id = id.to_string();
         let found = super::commands::blocking(ctx, move || {
-            let dirs = std::fs::read_dir(&root).ok()?;
             let suffix = format!("_{prefix}.jsonl");
-            for d in dirs.filter_map(|e| e.ok()) {
-                let files = std::fs::read_dir(d.path()).ok()?;
-                for f in files.filter_map(|e| e.ok()) {
-                    let name = f.file_name().to_string_lossy().into_owned();
-                    if !name.ends_with(&suffix) {
-                        continue;
-                    }
-                    let path_s = f.path().to_string_lossy().into_owned();
-                    if crate::session::reader::read_session_header(&path_s)
-                        .is_some_and(|h| h.id == full_id)
-                    {
-                        return Some(f.path());
+            for root in &scan_roots {
+                let Ok(dirs) = std::fs::read_dir(root) else { continue };
+                for d in dirs.filter_map(|e| e.ok()) {
+                    let Ok(files) = std::fs::read_dir(d.path()) else { continue };
+                    for f in files.filter_map(|e| e.ok()) {
+                        let name = f.file_name().to_string_lossy().into_owned();
+                        if !name.ends_with(&suffix) {
+                            continue;
+                        }
+                        let path_s = f.path().to_string_lossy().into_owned();
+                        if crate::session::reader::read_session_header(&path_s)
+                            .is_some_and(|h| h.id == full_id)
+                        {
+                            return Some(f.path());
+                        }
                     }
                 }
             }
@@ -287,9 +296,11 @@ impl SessionRuntime {
                 system_prompt: hooks.system_prompt(),
                 tool_factory: hooks.tool_factory(),
                 no_session: false,
-                session_dir: Some(std::path::PathBuf::from(
-                    super::commands::default_sessions_root_pub(),
-                )),
+                session_dir: Some(
+                    hooks
+                        .sessions_root()
+                        .unwrap_or_else(|| std::path::PathBuf::from(super::commands::default_sessions_root_pub())),
+                ),
                 working_directory: Some(std::path::PathBuf::from(&cwd_owned)),
                 session_path: Some(path),
                 on_event: Some(on_event),
@@ -407,9 +418,11 @@ impl SessionRuntime {
                 tool_factory: hooks.tool_factory(),
                 enabled_tools: tools_c,
                 no_session: false,
-                session_dir: Some(std::path::PathBuf::from(
-                    super::commands::default_sessions_root_pub(),
-                )),
+                session_dir: Some(
+                    hooks
+                        .sessions_root()
+                        .unwrap_or_else(|| std::path::PathBuf::from(super::commands::default_sessions_root_pub())),
+                ),
                 working_directory: Some(std::path::PathBuf::from(&cwd_owned)),
                 on_event: Some(on_event),
                 ..Default::default()
@@ -977,12 +990,16 @@ async fn idle_cmd(
                 if s.session_path.is_none()
                     && s.session_id.as_deref().is_some_and(|sid| !sid.is_empty())
                 {
-                    let root = hooks
-                        .sessions_root()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(super::commands::default_sessions_root_pub);
+                    let mut roots: Vec<String> = Vec::new();
+                    if let Some(p) = hooks.sessions_root() {
+                        roots.push(p.to_string_lossy().into_owned());
+                    }
+                    let default_root = super::commands::default_sessions_root_pub();
+                    if !roots.contains(&default_root) {
+                        roots.push(default_root);
+                    }
                     let sid = s.session_id.clone().unwrap();
-                    if let Some(p) = super::sessions::find_session_file(&root, &sid) {
+                    if let Some(p) = super::sessions::find_session_file(&roots, &sid) {
                         s.session_path = Some(p);
                     }
                 }
@@ -1816,7 +1833,11 @@ async fn rebuild_session(
         system_prompt: hooks.system_prompt(),
         tool_factory: hooks.tool_factory(),
         no_session: false,
-        session_dir: Some(std::path::PathBuf::from(super::commands::default_sessions_root_pub())),
+        session_dir: Some(
+            hooks
+                .sessions_root()
+                .unwrap_or_else(|| std::path::PathBuf::from(super::commands::default_sessions_root_pub())),
+        ),
         working_directory: Some(std::path::PathBuf::from(cwd)),
         session_path: path_c,
         on_event: Some(on_event),
@@ -3060,8 +3081,8 @@ Connection: close
             .expect("set_model");
         assert_eq!(resp.status(), 200, "{}", String::from_utf8_lossy(resp.body()));
 
-        // 定位落盘文件(递归 sessions 目录,含 cwd 编码子目录)
-        let sessions_dir = tmp.join(".pi/agent/sessions");
+        // 定位落盘文件(双根递归:hooks 根 tmp/sessions + 默认根)
+        let search_roots = [tmp.join("sessions"), tmp.join(".pi/agent/sessions")];
         let mut found: Option<std::path::PathBuf> = None;
         fn find_jsonl(dir: &std::path::Path, sid: &str, out: &mut Option<std::path::PathBuf>) {
             if out.is_some() { return; }
@@ -3079,7 +3100,10 @@ Connection: close
             }
         }
         for _ in 0..50 {
-            find_jsonl(&sessions_dir, &sid, &mut found);
+            for root in &search_roots {
+                find_jsonl(root, &sid, &mut found);
+                if found.is_some() { break; }
+            }
             if found.is_some() { break; }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -3092,6 +3116,34 @@ Connection: close
             "context.model must carry modelId (not id): {model}"
         );
         assert_eq!(model.get("provider").and_then(|p| p.as_str()), Some("fake"));
+
+        // 写根统一断言:文件必须落在 hooks 根(本 harness 的 tmp/sessions,
+        // 与引擎默认根 tmp/.pi/agent/sessions 分叉)—— 修复前写默认根,
+        // 侧栏(hooks 根扫描)与恢复各自找不到对方的文件。
+        assert!(
+            path.starts_with(tmp.join("sessions")),
+            "session file must be written under the hooks sessions root: {}",
+            path.display()
+        );
+
+        // 驱逐后 set_model 走磁盘恢复(双根扫描)→ 不再 "Session not found"
+        api.sweep_idle_sessions(std::time::Duration::ZERO);
+        let mut evicted = false;
+        for _ in 0..50 {
+            if api.session_count() == 0 {
+                evicted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(evicted, "session must be swept from registry");
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"set_model","provider":"fake","modelId":"f1"}"#))
+            .expect("set_model after eviction");
+        assert_eq!(
+            resp.status(), 200,
+            "set_model must disk-restore after eviction (dual-root scan): {}",
+            String::from_utf8_lossy(resp.body())
+        );
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
