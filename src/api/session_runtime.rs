@@ -231,37 +231,32 @@ impl SessionRuntime {
         if self.sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id) {
             return true;
         }
-        // 双根扫描:hooks 根(现行写根)优先 + 引擎默认根(历史会话)兜底
-        // —— 单根在宿主配置了 sessions_root 时会 404(写读分叉修复)。
-        let mut scan_roots: Vec<String> = Vec::new();
-        if let Some(p) = ctx.hooks.sessions_root() {
-            scan_roots.push(p.to_string_lossy().into_owned());
-        }
-        let default_root = super::commands::default_sessions_root_pub();
-        if !scan_roots.contains(&default_root) {
-            scan_roots.push(default_root);
-        }
+        // 单一会话根(上游 TS 同构):与 create/重建传给引擎的 session_dir
+        // 同根 —— hooks.sessions_root()(未提供时引擎默认)。
+        let scan_root = ctx
+            .hooks
+            .sessions_root()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(super::commands::default_sessions_root_pub);
         // 文件名为 <timestamp>_<id前8位>.jsonl(lib 落盘约定),前缀候选 +
         // header 精确校验(短前缀有碰撞可能)
         let prefix = id.split('-').next().unwrap_or("").to_string();
         let full_id = id.to_string();
         let found = super::commands::blocking(ctx, move || {
             let suffix = format!("_{prefix}.jsonl");
-            for root in &scan_roots {
-                let Ok(dirs) = std::fs::read_dir(root) else { continue };
-                for d in dirs.filter_map(|e| e.ok()) {
-                    let Ok(files) = std::fs::read_dir(d.path()) else { continue };
-                    for f in files.filter_map(|e| e.ok()) {
-                        let name = f.file_name().to_string_lossy().into_owned();
-                        if !name.ends_with(&suffix) {
-                            continue;
-                        }
-                        let path_s = f.path().to_string_lossy().into_owned();
-                        if crate::session::reader::read_session_header(&path_s)
-                            .is_some_and(|h| h.id == full_id)
-                        {
-                            return Some(f.path());
-                        }
+            let Ok(dirs) = std::fs::read_dir(&scan_root) else { return None };
+            for d in dirs.filter_map(|e| e.ok()) {
+                let Ok(files) = std::fs::read_dir(d.path()) else { continue };
+                for f in files.filter_map(|e| e.ok()) {
+                    let name = f.file_name().to_string_lossy().into_owned();
+                    if !name.ends_with(&suffix) {
+                        continue;
+                    }
+                    let path_s = f.path().to_string_lossy().into_owned();
+                    if crate::session::reader::read_session_header(&path_s)
+                        .is_some_and(|h| h.id == full_id)
+                    {
+                        return Some(f.path());
                     }
                 }
             }
@@ -990,16 +985,12 @@ async fn idle_cmd(
                 if s.session_path.is_none()
                     && s.session_id.as_deref().is_some_and(|sid| !sid.is_empty())
                 {
-                    let mut roots: Vec<String> = Vec::new();
-                    if let Some(p) = hooks.sessions_root() {
-                        roots.push(p.to_string_lossy().into_owned());
-                    }
-                    let default_root = super::commands::default_sessions_root_pub();
-                    if !roots.contains(&default_root) {
-                        roots.push(default_root);
-                    }
+                    let root = hooks
+                        .sessions_root()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(super::commands::default_sessions_root_pub);
                     let sid = s.session_id.clone().unwrap();
-                    if let Some(p) = super::sessions::find_session_file(&roots, &sid) {
+                    if let Some(p) = super::sessions::find_session_file(&root, &sid) {
                         s.session_path = Some(p);
                     }
                 }
@@ -2558,7 +2549,8 @@ mod success_settle_tests {
         // 手写磁盘会话:header + 一条 user 消息(真实前置 = 上次进程正常退出)
         let sid = "cafe1234-1111-2222-3333-444455556666".to_string();
         let slug = "restore-fixture";
-        let dir = tmp.join(".pi/agent/sessions").join(slug);
+        // 单一会话根:种子落在 hooks 根(tmp/sessions)—— 与引擎写盘/恢复扫描同根
+        let dir = tmp.join("sessions").join(slug);
         std::fs::create_dir_all(&dir).unwrap();
         let cwd = tmp.to_string_lossy().to_string();
         let jsonl = format!(
@@ -3081,8 +3073,8 @@ Connection: close
             .expect("set_model");
         assert_eq!(resp.status(), 200, "{}", String::from_utf8_lossy(resp.body()));
 
-        // 定位落盘文件(双根递归:hooks 根 tmp/sessions + 默认根)
-        let search_roots = [tmp.join("sessions"), tmp.join(".pi/agent/sessions")];
+        // 定位落盘文件(单一会话根 = hooks 根 tmp/sessions)
+        let sessions_dir = tmp.join("sessions");
         let mut found: Option<std::path::PathBuf> = None;
         fn find_jsonl(dir: &std::path::Path, sid: &str, out: &mut Option<std::path::PathBuf>) {
             if out.is_some() { return; }
@@ -3100,10 +3092,7 @@ Connection: close
             }
         }
         for _ in 0..50 {
-            for root in &search_roots {
-                find_jsonl(root, &sid, &mut found);
-                if found.is_some() { break; }
-            }
+            find_jsonl(&sessions_dir, &sid, &mut found);
             if found.is_some() { break; }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
