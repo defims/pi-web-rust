@@ -57,6 +57,17 @@ pub(crate) enum SessionCmd {
     Deferred { what: &'static str, reply: oneshot::Sender<Result<Value, String>> },
     GetStats { reply: oneshot::Sender<Result<Value, String>> },
     GetLastText { reply: oneshot::Sender<Result<Value, String>> },
+    /// 工具清单(基座 + 扩展贡献;name/description/active)。
+    GetTools { reply: oneshot::Sender<Result<Value, String>> },
+    /// 斜杠命令清单(extension + prompt 模板 + skill)。
+    GetCommands { reply: oneshot::Sender<Result<Value, String>> },
+    /// 扩展 UI 应答(前端对话框/自定义 UI 回值 → 引擎 pending_ui oneshot)。
+    ExtensionUiResponse {
+        id: String,
+        /// {value}|{confirmed}|{cancelled} 三形态之一
+        body: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// 优雅关停:任务侧二次 idle 确认 → flush write-behind 落盘 → 注册表
     /// 剔除 → 任务退出。idle 清扫与宿主退出用;清扫后若有新命令抢先
     /// touch(邮箱序在前),二次确认不成立即放弃关停继续服务。
@@ -103,6 +114,11 @@ pub(crate) struct SessionSnap {
     /// 最近一次命令到达时刻(idle 清扫判据;命令线是唯一活动来源 ——
     /// 引擎事件只在 turn 内流动,而 turn 内 is_prompt_running 恒真)
     pub last_activity: Option<std::time::Instant>,
+    /// 扩展状态栏项(setStatus 经 UI 通道跟踪;get_state 对账用,
+    /// 活体路径是 extension_ui_request 事件前端自维护)
+    pub extension_statuses: Vec<(String, String)>,
+    /// 扩展编辑器组件(setWidget:key → lines + placement)
+    pub extension_widgets: Vec<(String, Vec<String>, String)>,
 }
 
 impl SessionSnap {
@@ -153,8 +169,18 @@ impl SessionSnap {
             "contextUsage": Value::Null,
             "systemPrompt": Value::Null,
             "thinkingLevel": thinking,
-            "extensionStatuses": [],
-            "extensionWidgets": [],
+            "extensionStatuses": self
+                .extension_statuses
+                .iter()
+                .map(|(k, t)| json!({ "key": k, "text": t }))
+                .collect::<Vec<_>>(),
+            "extensionWidgets": self
+                .extension_widgets
+                .iter()
+                .map(|(k, lines, placement)| {
+                    json!({ "key": k, "lines": lines, "placement": placement })
+                })
+                .collect::<Vec<_>>(),
         })
     }
 }
@@ -303,6 +329,8 @@ impl SessionRuntime {
         let tx_task = tx.clone();
         let dead_task = dead.clone();
         let registry_task = self.sessions.clone();
+        // 扩展 UI 通道(restore 起柄同样接线)
+        wire_extension_ui(&handle, &snap_task, &sink, &rt);
         let _joined = rt.handle().spawn(async move {
             let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
                 session_loop(handle, rx, tx_task, dead_task, registry_task, snap_task, sink, rt.clone(), hooks),
@@ -568,6 +596,9 @@ impl SessionRuntime {
         let tx_task = tx.clone();
         let dead_task = dead.clone();
         let registry_task = self.sessions.clone();
+        // 扩展 UI 通道(status/widget 跟踪 + extension_ui_request 事件转发;
+        // 在 handle move 进 session_loop 之前接线)
+        wire_extension_ui(&handle, &snap_task, &sink, &rt);
         let _joined = rt.handle().spawn(async move {
             // panic 纪律:mid-await panic 经 FutureExt::catch_unwind 截获(P0 报告:
             // panic 会向 await 点传播,监督任务不得被波及)
@@ -662,6 +693,83 @@ impl SessionRuntime {
 /// 借用模型:prompt future 借用 `&mut handle`;borrow checker 要求该 future
 /// 不跨空闲循环迭代存活 —— 与 chat_thread 同款:起 prompt 与驱动至完成放
 /// 进同一匹配(空闲内层循环返回 future,直接流入运行期子循环,不落跨迭代变量)。
+/// 扩展 UI 通道接线:create/restore/rebuild 起柄后调用。
+/// 引擎扩展的 setStatus/setWidget/notify/对话框请求(select/confirm/
+/// input/editor/custom)经 asupersync mpsc 流出 —— 本任务:
+/// 1) setStatus/setWidget 落 snap(get_state 对账快照);
+/// 2) 全方法转发为 agent 事件 `extension_ui_request`(前端自己分发:
+///    状态栏/组件/通知/对话框/自定义 UI)。
+/// 通道随会话句柄 drop 而关闭 → 任务自然退出。
+fn wire_extension_ui(
+    handle: &AgentSessionHandle,
+    snap: &Arc<Mutex<SessionSnap>>,
+    sink: &super::EventSink,
+    rt: &Arc<asupersync::runtime::Runtime>,
+) {
+    let Some(manager) = handle.extension_manager() else { return };
+    let manager = manager.clone();
+    let (tx, mut rx) =
+        asupersync::channel::mpsc::channel::<pi::extensions::ExtensionUiRequest>(64);
+    manager.set_ui_sender(tx);
+    let snap = snap.clone();
+    let sink = sink.clone();
+    rt.handle().spawn(async move {
+        loop {
+            let cx = asupersync::Cx::for_request();
+            let Ok(req) = rx.recv(&cx).await else { return };
+            let payload_obj = req.payload.as_object().cloned().unwrap_or_default();
+            let field = |camel: &str, snake: &str| -> Option<Value> {
+                payload_obj.get(camel).or_else(|| payload_obj.get(snake)).cloned()
+            };
+            match req.method.as_str() {
+                "setStatus" | "set_status" => {
+                    let key = field("statusKey", "status_key")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    let text = field("statusText", "status_text")
+                        .or_else(|| field("text", "text"))
+                        .and_then(|v| v.as_str().map(str::to_string));
+                    if !key.is_empty() {
+                        let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                        s.extension_statuses.retain(|(k, _)| *k != key);
+                        if let Some(t) = text.filter(|t| !t.is_empty()) {
+                            s.extension_statuses.push((key.clone(), t));
+                        }
+                    }
+                }
+                "setWidget" | "set_widget" => {
+                    let key = field("widgetKey", "widget_key")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    let lines = field("widgetLines", "widget_lines")
+                        .or_else(|| field("lines", "lines"))
+                        .and_then(|v| v.as_array().map(|a| {
+                            a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>()
+                        }));
+                    let placement = field("widgetPlacement", "widget_placement")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "aboveEditor".to_string());
+                    if !key.is_empty() {
+                        let mut s = snap.lock().unwrap_or_else(|e| e.into_inner());
+                        s.extension_widgets.retain(|(k, _, _)| *k != key);
+                        if let Some(lines) = lines.filter(|l| !l.is_empty()) {
+                            s.extension_widgets.push((key.clone(), lines, placement));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            // 全方法转发(前端 handleExtensionUiRequest 分发各形态);
+            // 引擎 to_rpc_event 平铺 payload 字段 + timeout
+            let mut ev = req.to_rpc_event();
+            if let Some(t) = req.timeout_ms {
+                ev["timeout"] = json!(t);
+            }
+            emit_agent(&sink, ev);
+        }
+    });
+}
+
 async fn session_loop(
     mut handle: AgentSessionHandle,
     mut rx: mpsc::Receiver<SessionCmd>,
@@ -1051,6 +1159,131 @@ async fn idle_cmd(
             let t = handle.get_last_assistant_text().await.ok().flatten().or(fallback);
             let _ = reply.send(Ok(json!(t)));
         }
+        SessionCmd::GetTools { reply } => {
+            // 基座工具(agent.tools)+ 扩展贡献(extension_tool_defs);
+            // active = manager.active_tools()(None = 未限 = 全部活)
+            let mut tools: Vec<Value> = handle
+                .session_mut()
+                .agent
+                .tools()
+                .tools()
+                .iter()
+                .map(|t| json!({ "name": t.name(), "description": t.description() }))
+                .collect();
+            let active: Option<Vec<String>> = handle
+                .extension_manager()
+                .map(|m| m.active_tools().unwrap_or_default())
+                .filter(|v| !v.is_empty());
+            if let Some(m) = handle.extension_manager() {
+                tools.extend(m.extension_tool_defs().into_iter().filter(|d| {
+                    d.get("name").and_then(Value::as_str).is_some()
+                }));
+            }
+            let out: Vec<Value> = tools
+                .into_iter()
+                .map(|mut d| {
+                    let name = d.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let is_active = active
+                        .as_ref()
+                        .map_or(true, |list| list.contains(&name));
+                    d["active"] = json!(is_active);
+                    d
+                })
+                .collect();
+            let _ = reply.send(Ok(Value::Array(out)));
+        }
+        SessionCmd::GetCommands { reply } => {
+            // 三源:扩展命令(manager.list_commands)+ prompt 模板 + skills
+            // (上游 rpc-manager get_commands 同构;skill 命令带 skill: 前缀)
+            let cwd = snap.lock().unwrap_or_else(|e| e.into_inner()).cwd.clone().unwrap_or_default();
+            let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent")))
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let mut commands: Vec<Value> = handle
+                .extension_manager()
+                .map(|m| {
+                    m.list_commands()
+                        .into_iter()
+                        .map(|c| json!({
+                            "name": c.get("name").cloned().unwrap_or(Value::Null),
+                            "description": c.get("description").cloned().unwrap_or(Value::Null),
+                            "source": "extension",
+                        }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            {
+                let cwd_path = std::path::PathBuf::from(&cwd);
+                let config = pi::sdk::Config::load().unwrap_or_default();
+                let prompt_paths: Vec<std::path::PathBuf> = config
+                    .prompts
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                let skill_paths: Vec<std::path::PathBuf> = config
+                    .skills
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                let prompts = pi::resources::load_prompt_templates(pi::resources::LoadPromptTemplatesOptions {
+                    cwd: cwd_path.clone(),
+                    agent_dir: agent_dir.clone(),
+                    prompt_paths,
+                    include_defaults: true,
+                });
+                commands.extend(prompts.iter().map(|p| json!({
+                    "name": p.name,
+                    "description": p.description,
+                    "source": "prompt",
+                })));
+                let skills = pi::resources::load_skills(pi::resources::LoadSkillsOptions {
+                    cwd: cwd_path,
+                    agent_dir,
+                    skill_paths,
+                    include_defaults: true,
+                });
+                commands.extend(skills.skills.iter().map(|sk| json!({
+                    "name": format!("skill:{}", sk.name),
+                    "description": sk.description,
+                    "source": "skill",
+                })));
+            }
+            let _ = reply.send(Ok(json!({ "commands": commands })));
+        }
+        SessionCmd::ExtensionUiResponse { id, body, reply } => {
+            // 三形态:{value}|{confirmed}|{cancelled} → 引擎 respond_ui
+            let res = (|| -> Result<Value, String> {
+                let manager = handle
+                    .extension_manager()
+                    .ok_or_else(|| "session has no extensions".to_string())?
+                    .clone();
+                let (value, cancelled) = if body.get("cancelled").and_then(Value::as_bool) == Some(true) {
+                    (None, true)
+                } else if let Some(v) = body.get("value") {
+                    (Some(v.clone()), false)
+                } else if let Some(c) = body.get("confirmed").and_then(Value::as_bool) {
+                    (Some(Value::Bool(c)), false)
+                } else {
+                    (None, true)
+                };
+                let delivered = manager.respond_ui(pi::extensions::ExtensionUiResponse {
+                    id,
+                    value,
+                    cancelled,
+                });
+                if delivered {
+                    Ok(json!({ "delivered": true }))
+                } else {
+                    Err("no pending extension UI request for id".into())
+                }
+            })();
+            let _ = reply.send(res);
+        }
         SessionCmd::Prompt { reply, .. } => {
             // 主循环已拦截 Prompt;防御分支
             let _ = reply.send(Err("prompt handled at top level".into()));
@@ -1156,6 +1389,9 @@ fn handle_running_cmd(
         | SessionCmd::Rebuild { reply, .. }
         | SessionCmd::Deferred { reply, .. }
         | SessionCmd::GetStats { reply }
+        | SessionCmd::GetTools { reply }
+        | SessionCmd::GetCommands { reply }
+        | SessionCmd::ExtensionUiResponse { reply, .. }
         | SessionCmd::Shutdown { reply, .. } => {
             let _ = reply.send(Err("session busy (prompt running)".into()));
         }
@@ -1600,6 +1836,8 @@ async fn rebuild_session(
     )
     .await??;
 
+    // 扩展 UI 通道(fork/reload 重建起柄同样接线;旧通道随旧句柄 drop 关闭)
+    wire_extension_ui(&new_handle, &snap, sink, rt);
     let new_state = new_handle.state().await.ok();
     let (new_sid, eng_provider, eng_model) = new_state
         .as_ref()
@@ -2784,6 +3022,226 @@ Connection: close
         std::fs::remove_dir_all(&ext_dir).unwrap();
         let handle = mk(false).expect("session without extensions");
         assert!(!handle.has_extensions(), "no sources → no extensions");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// get_tools / get_commands RPC(P2b):
+    /// 基座工具带 name/description/active;命令三源含 skill: 前缀;
+    /// extension_ui_response 无 pending → 明确错误。
+    #[test]
+    fn get_tools_and_commands_rpc() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("tools-cmds-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        // 技能(进 get_commands 的 skill: 源)+ 扩展(extension_ui_response 面)
+        let skill_dir = tmp.join(".pi/agent/skills/foo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: foo\ndescription: Foo skill\n---\n",
+        )
+        .unwrap();
+        let ext_dir = tmp.join(".pi/agent/extensions/hello");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("index.js"), "export function activate() {}\n").unwrap();
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // get_tools → 基座工具(name/description/active)
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"get_tools"}"#))
+            .expect("get_tools ok");
+        assert_eq!(resp.status(), 200);
+        let v = body(&resp);
+        assert_eq!(v["success"], serde_json::json!(true));
+        let tools = v["data"].as_array().expect("tools array");
+        let names: Vec<&str> = tools.iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+        assert!(names.contains(&"read"), "base tools present: {names:?}");
+        assert!(tools.iter().all(|t| t.get("active").is_some()), "active flag on every tool: {tools:?}");
+
+        // get_commands → 三源之 skill:foo
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"get_commands"}"#))
+            .expect("get_commands ok");
+        assert_eq!(resp.status(), 200);
+        let v = body(&resp);
+        let cmds = v["data"]["commands"].as_array().expect("commands array");
+        let names: Vec<&str> = cmds.iter()
+            .filter_map(|c| c.get("name").and_then(|n| n.as_str())).collect();
+        assert!(names.contains(&"skill:foo"), "skill command present: {names:?}");
+        let foo = cmds.iter().find(|c| c["name"] == serde_json::json!("skill:foo")).unwrap();
+        assert_eq!(foo["source"], serde_json::json!("skill"));
+        assert_eq!(foo["description"], serde_json::json!("Foo skill"));
+
+        // extension_ui_response 无 pending → 500 明确错误
+        let resp = call(&api, post(
+            &format!("/api/agent/{sid}"),
+            r#"{"type":"extension_ui_response","id":"nonexistent","cancelled":true}"#,
+        )).expect("handled");
+        assert_eq!(resp.status(), 500);
+        let v = body(&resp);
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("pending")), "{v}");
+
+        // extension_ui_input → 400 引擎面未备
+        let e = call(&api, post(
+            &format!("/api/agent/{sid}"),
+            r#"{"type":"extension_ui_input","id":"x","data":"y"}"#,
+        )).err().expect("extension_ui_input must err");
+        assert_eq!(e.status, 400);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// 扩展 UI 通道(P2b):
+    /// 1) setStatus → snap 跟踪(get_state 对账快照);
+    /// 2) 阻塞方法(select)→ EventSink 收到 extension_ui_request 事件
+    ///    (payload 平铺);respond_ui → request_ui 的 future 收到应答。
+    /// 驱动方式:直接调 manager.request_ui(扩展发起 UI 请求的引擎面)。
+    #[test]
+    fn extension_ui_channel_tracks_status_and_forwards_blocking() {
+        use serde_json::json;
+        use crate::api::ApiEvent;
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("extui-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let pi = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("models.json"),
+            r#"{"providers":{"fake":{"baseUrl":"http://127.0.0.1:9/v1","api":"openai-completions","apiKey":"k","models":[{"id":"f1","name":"f1"}]}}}"#,
+        )
+        .unwrap();
+        let ext_dir = pi.join("extensions/hello");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("index.js"), "export function activate() {}\n").unwrap();
+
+        // 运行时 + sink(事件捕获)
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(2, 4)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<serde_json::Value>();
+        let sink: EventSink = Arc::new(move |ev| {
+            if let ApiEvent::Agent { payload } = ev {
+                let _ = ev_tx.send(payload);
+            }
+        });
+
+        let cwd = tmp.to_path_buf();
+        let snap = Arc::new(std::sync::Mutex::new(super::SessionSnap::default()));
+        let handle = futures::executor::block_on(pi::sdk::create_agent_session(
+            pi::sdk::SessionOptions {
+                no_session: true,
+                working_directory: Some(cwd),
+                ..Default::default()
+            },
+        ))
+        .expect("session with extension");
+        assert!(handle.has_extensions());
+        super::wire_extension_ui(&handle, &snap, &sink, &rt);
+        let manager = handle.extension_manager().expect("manager").clone();
+
+        // 1) setStatus → snap 跟踪
+        let req = pi::extensions::ExtensionUiRequest::new(
+            "s1",
+            "setStatus",
+            json!({ "statusKey": "net", "statusText": "online" }),
+        );
+        rt.block_on(manager.request_ui(req)).expect("setStatus sent");
+        let mut tracked = false;
+        for _ in 0..50 {
+            let s = snap.lock().unwrap_or_else(|e| e.into_inner());
+            if s.extension_statuses.iter().any(|(k, t)| k == "net" && t == "online") {
+                tracked = true;
+                break;
+            }
+            drop(s);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(tracked, "setStatus must land in snap.extension_statuses");
+
+        // 2) 阻塞 select → 事件转发 + respond_ui 闭环
+        let mgr = manager.clone();
+        let rt_c = rt.clone();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        rt.handle().spawn(async move {
+            let mut req = pi::extensions::ExtensionUiRequest::new(
+                "q1",
+                "select",
+                json!({ "title": "pick", "options": ["a", "b"] }),
+            );
+            req.timeout_ms = Some(5_000);
+            let res = mgr.request_ui(req).await;
+            let _ = res_tx.send(res);
+        });
+        // 事件流含非阻塞方法(setStatus 等也转发)—— 轮询到 select 为止
+        let mut ev = None;
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(5) {
+            match ev_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(e) if e["method"] == json!("select") => {
+                    ev = Some(e);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        let ev = ev.expect("blocking select forwarded as event");
+        assert_eq!(ev["type"], json!("extension_ui_request"), "{ev}");
+        assert_eq!(ev["method"], json!("select"));
+        assert_eq!(ev["title"], json!("pick"), "payload flattened: {ev}");
+        assert_eq!(ev["timeout"], json!(5_000));
+        // 应答 → 引擎 oneshot
+        let delivered = manager.respond_ui(pi::extensions::ExtensionUiResponse {
+            id: "q1".into(),
+            value: Some(json!("b")),
+            cancelled: false,
+        });
+        assert!(delivered, "respond_ui must resolve the pending request");
+        let res = res_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request_ui future settles")
+            .expect("request_ui ok");
+        assert_eq!(res.expect("response present").value, Some(json!("b")));
+        let _ = rt_c;
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),

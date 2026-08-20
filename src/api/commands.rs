@@ -538,9 +538,17 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
         "reload" => C::Reload { reply: reply_tx },
         "bash" => C::Bash { command: str_arg(&dispatch, "command"), reply: reply_tx },
         "abort_bash" => C::AbortBash { reply: reply_tx },
-        "get_tools" | "get_commands" | "extension_ui_response" | "extension_ui_input" => {
-            // 扩展面:随扩展接线补全
-            C::Deferred { what: "", reply: reply_tx }
+        "get_tools" => C::GetTools { reply: reply_tx },
+        "get_commands" => C::GetCommands { reply: reply_tx },
+        "extension_ui_response" => C::ExtensionUiResponse {
+            id: str_arg(&dispatch, "id"),
+            body: dispatch.args.clone(),
+            reply: reply_tx,
+        },
+        "extension_ui_input" => {
+            // 引擎暂无 custom UI 流式输入面(pending_ui 只有应答 oneshot);
+            // 前端自定义 UI 的连续输入暂不可达 —— 明确报错而非静默
+            return Err(ApiError::new(400, "extension_ui_input not supported by engine yet"));
         }
         "get_session_stats" => C::GetStats { reply: reply_tx },
         "get_last_assistant_text" => C::GetLastText { reply: reply_tx },
