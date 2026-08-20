@@ -475,7 +475,7 @@ pub fn build_session_context_from_json(
         thinking_level: snapshot.thinking_level,
         model: snapshot
             .model
-            .map(|(provider, id)| serde_json::json!({ "provider": provider, "id": id })),
+            .map(|(provider, id)| serde_json::json!({ "provider": provider, "modelId": id })),
     }
 }
 

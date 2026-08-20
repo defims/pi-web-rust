@@ -3033,6 +3033,76 @@ Connection: close
         }
     }
 
+    /// 回归:set_model 后 sessions_get 的 context.model 必须带 modelId 字段
+    /// (前端 SessionContext.model 契约是 {provider, modelId};此前返回 {provider,
+    /// id} → currentModel 读 .modelId 得 undefined → 底部模型显示"没选")。
+    #[test]
+    fn set_model_context_model_carries_model_id() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("setmodelctx-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // set_model
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"set_model","provider":"fake","modelId":"f1"}"#))
+            .expect("set_model");
+        assert_eq!(resp.status(), 200, "{}", String::from_utf8_lossy(resp.body()));
+
+        // 定位落盘文件(递归 sessions 目录,含 cwd 编码子目录)
+        let sessions_dir = tmp.join(".pi/agent/sessions");
+        let mut found: Option<std::path::PathBuf> = None;
+        fn find_jsonl(dir: &std::path::Path, sid: &str, out: &mut Option<std::path::PathBuf>) {
+            if out.is_some() { return; }
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    find_jsonl(&p, sid, out);
+                } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                    if std::fs::read_to_string(&p).unwrap_or_default().contains(sid) {
+                        *out = Some(p);
+                        return;
+                    }
+                }
+            }
+        }
+        for _ in 0..50 {
+            find_jsonl(&sessions_dir, &sid, &mut found);
+            if found.is_some() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let path = found.expect("session file persisted");
+        let ctx = crate::api::sessions::context_value(&path, None, false, false)
+            .expect("context_value");
+        let model = &ctx["context"]["model"];
+        assert!(
+            model.get("modelId").and_then(|m| m.as_str()) == Some("f1"),
+            "context.model must carry modelId (not id): {model}"
+        );
+        assert_eq!(model.get("provider").and_then(|p| p.as_str()), Some("fake"));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
     /// get_tools / get_commands RPC(P2b):
     /// 基座工具带 name/description/active;命令三源含 skill: 前缀;
     /// extension_ui_response 无 pending → 明确错误。
@@ -3096,8 +3166,7 @@ Connection: close
         let resp = call(&api, post(
             &format!("/api/agent/{sid}"),
             r#"{"type":"extension_ui_response","id":"nonexistent","cancelled":true}"#,
-        )).expect("handled");
-        assert_eq!(resp.status(), 500);
+        )).expect("handled");        assert_eq!(resp.status(), 500);
         let v = body(&resp);
         assert!(v["error"].as_str().is_some_and(|e| e.contains("pending")), "{v}");
 
