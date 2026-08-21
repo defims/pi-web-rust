@@ -1890,13 +1890,20 @@ pub(crate) fn fork_file(source: &std::path::Path, entry_id: Option<&str>) -> Res
 
     let mut out = Vec::new();
     out.push(new_header);
-    // entry_id=None → 空分支(首条消息前 fork);Some → 拷贝到该 entry(不含)
+    // entry_id=None → 空分支(首条消息前 fork);Some → 拷贝到该 entry(不含)。
+    // 无效 entryId 报错而非静默全量拷贝(对齐上游 rpc-manager.ts:550-551
+    // "Invalid entry ID for forking")
     if let Some(eid) = entry_id {
+        let mut found = false;
         for v in lines.iter().skip(1) {
             if v.get("id").and_then(|i| i.as_str()) == Some(eid) {
+                found = true;
                 break;
             }
             out.push(v.clone());
+        }
+        if !found {
+            return Err("Invalid entry ID for forking".into());
         }
     }
     let mut body = String::new();
@@ -4070,6 +4077,32 @@ Connection: close
         let header = crate::session::reader::read_session_header(&new_path.to_string_lossy()).expect("header");
         assert_ne!(header.id, "aaaa1111-1111-1111-1111-111111111111", "header id must be re-stamped");
         assert!(header.id.starts_with(&id8), "header id must match filename prefix");
+    }
+
+    /// A6 复核:无效 entryId 报错(上游同文案),不再静默全量拷贝
+    #[test]
+    fn fork_file_rejects_unknown_entry_id() {
+        let tmp = tempfile_dir();
+        let src = tmp.join("2026-01-02T00-00-00.000Z_bbbb2222.jsonl");
+        std::fs::write(&src,
+            "{\"type\":\"session\",\"id\":\"bbbb2222-2222-2222-2222-222222222222\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-01-02T00:00:00.000Z\"}\n{\"type\":\"message\",\"id\":\"m1\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n"
+        ).unwrap();
+        let err = super::super::session_runtime::fork_file(&src, Some("no-such-entry"))
+            .expect_err("bogus entryId must error");
+        assert_eq!(err, "Invalid entry ID for forking");
+        // 分支文件不落盘(报错路径无残留;只数本测试写入的 bbbb 前缀文件)
+        let jsonl_count = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .map(|p| {
+                        p.file_name().to_string_lossy().starts_with("2026-01-02")
+                            && p.path().extension().map(|x| x == "jsonl").unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(jsonl_count, 1, "only the source file remains");
     }
 
     fn tempfile_dir() -> std::path::PathBuf {
