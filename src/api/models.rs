@@ -1463,6 +1463,60 @@ mod plugins_tests {
         rx.recv_timeout(std::time::Duration::from_secs(30)).expect("responder")
     }
 
+    /// 回归(pi-cwd 自动放行):default-cwd 建的 `~/pi-cwd-YYYY-MM-DD`(带横线)
+    /// 必须被 allowed-roots 自动放行 —— 此前模式误匹配无横线 15 字符,
+    /// 自建目录不被认 → /api/models?cwd= 403 → 前端模型列表空、底部
+    /// 选择器消失(重选目录经 cwd/validate 显式放行才恢复)。
+    #[test]
+    fn models_cwd_in_dashed_pi_cwd_dir_is_allowed() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("picwd-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let pi = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("models.json"),
+            r#"{"providers":{"fake":{"baseUrl":"http://127.0.0.1:9/v1","api":"openai-completions","apiKey":"k","models":[{"id":"f1","name":"f1"}]}}}"#,
+        )
+        .unwrap();
+        // default-cwd 同款命名:pi-cwd-YYYY-MM-DD(带横线)
+        let workdir = tmp.join("pi-cwd-2026-08-21");
+        std::fs::create_dir_all(&workdir).unwrap();
+        // 失效 roots 缓存(5s TTL 会携带前一个测试 HOME 的旧根)
+        crate::fs::file_access::invalidate_allowed_roots_cache();
+
+        let api = api_with_hooks(&tmp);
+        let cwd_s = workdir.to_string_lossy().to_string();
+        let resp = call(&api, http::Request::builder()
+            .method("GET")
+            .uri(format!("/api/models?cwd={}", cwd_s.replace('/', "%2F")))
+            .body(Vec::new()).unwrap())
+            .expect("models with dashed pi-cwd cwd");
+        assert_eq!(
+            resp.status(), 200,
+            "dashed pi-cwd dir must be auto-allowed: {}",
+            String::from_utf8_lossy(resp.body())
+        );
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert!(v["modelList"].as_array().is_some_and(|a| !a.is_empty()), "{v}");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
     /// GET /api/plugins:settings packages(本地源)→ 真列表(包 + 计数 +
     /// 资源 + loaded 状态);缺 cwd 400;门禁外 403。
     #[test]

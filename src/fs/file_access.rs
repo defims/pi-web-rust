@@ -50,6 +50,24 @@ pub fn is_windows_absolute_path(file_path: &str) -> bool {
 /// 本函数负责缓存 + 组合 ~/pi-cwd-* + 额外根。
 /// 异步版 `get_allowed_file_roots`:把 `read_dir` + `home_dir()`(可能 `getpwuid`)
 /// 移入线程,避免阻塞 executor。缓存逻辑与同步版一致。
+
+/// `~/pi-cwd-YYYY-MM-DD` 目录名判定(上游 default-cwd route 用
+/// `toISOString().slice(0,10)` 建名,自动放行模式与此一致)。
+/// 此前误匹配无横线 15 字符形式,导致 default-cwd 自建的 17 字符目录
+/// 不被放行 → /api/models?cwd= 403 → 新建会话底部模型选择器消失。
+fn is_pi_cwd_dir_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if !name.starts_with("pi-cwd-") || bytes.len() != 17 {
+        return false;
+    }
+    let date = &bytes[7..];
+    // YYYY-MM-DD:位置 4 与 7 为 '-',其余为数字
+    (0..10).all(|i| match i {
+        4 | 7 => date[i] == b'-',
+        _ => date[i].is_ascii_digit(),
+    })
+}
+
 pub async fn get_allowed_file_roots_async(
     session_roots: HashSet<String>,
 ) -> HashSet<String> {
@@ -82,10 +100,7 @@ pub async fn get_allowed_file_roots_async(
                 for entry in entries.filter_map(|e| e.ok()) {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
-                    if name_str.starts_with("pi-cwd-")
-                        && name_str.len() == 15
-                        && name_str[7..].chars().all(|c| c.is_ascii_digit())
-                    {
+                    if is_pi_cwd_dir_name(&name_str) {
                         roots.insert(normalize_slashes(&entry.path().to_string_lossy()));
                     }
                 }
@@ -137,11 +152,8 @@ pub fn get_allowed_file_roots(session_roots: &HashSet<String>) -> HashSet<String
             for entry in entries.filter_map(|e| e.ok()) {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                // 匹配 pi-cwd-YYYYMMDD
-                if name_str.starts_with("pi-cwd-")
-                    && name_str.len() == 15 // "pi-cwd-" (7) + 8 digits
-                    && name_str[7..].chars().all(|c| c.is_ascii_digit())
-                {
+                // 匹配 pi-cwd-YYYY-MM-DD(default-cwd 同款命名)
+                if is_pi_cwd_dir_name(&name_str) {
                     roots.insert(normalize_slashes(&entry.path().to_string_lossy()));
                 }
             }
@@ -209,5 +221,28 @@ mod tests {
         let roots = get_allowed_file_roots(&session_roots);
         assert!(roots.contains("/tmp/test_session_root"));
         assert!(roots.contains("/tmp/test_extra_root"));
+    }
+}
+
+#[cfg(test)]
+mod pi_cwd_pattern_tests {
+    use super::is_pi_cwd_dir_name;
+
+    #[test]
+    fn dashed_date_matches_default_cwd_naming() {
+        // default-cwd route(toISOString().slice(0,10))建的就是这种
+        assert!(is_pi_cwd_dir_name("pi-cwd-2026-08-20"));
+        assert!(is_pi_cwd_dir_name("pi-cwd-2026-01-01"));
+    }
+
+    #[test]
+    fn wrong_shapes_rejected() {
+        // 此前误配的无横线 15 字符形式(修复前 default-cwd 自建的目录反而不认)
+        assert!(!is_pi_cwd_dir_name("pi-cwd-20260820"));
+        assert!(!is_pi_cwd_dir_name("pi-cwd-2026-8-20"));
+        assert!(!is_pi_cwd_dir_name("pi-cwd-202-08-20"));
+        assert!(!is_pi_cwd_dir_name("pi-cwd-2026-08-2"));
+        assert!(!is_pi_cwd_dir_name("pi-cwd-"));
+        assert!(!is_pi_cwd_dir_name("other-2026-08-20"));
     }
 }
