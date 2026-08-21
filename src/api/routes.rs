@@ -78,6 +78,7 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("PATCH", "/api/sessions/:id", "sessions_rename", TimeoutClass::Default),
     ("DELETE", "/api/sessions/:id", "sessions_delete", TimeoutClass::Default),
     ("POST", "/api/sessions/:id/auto-name", "sessions_auto_name", TimeoutClass::Default),
+    ("GET", "/api/sessions/:id/export", "sessions_export", TimeoutClass::Default),
     ("GET", "/api/sessions/:id/entries/:entryId/thinking", "sessions_thinking", TimeoutClass::Default),
     ("GET", "/api/sessions/:id/context", "sessions_context", TimeoutClass::Default),
     ("GET", "/api/cwd/browse", "cwd_browse", TimeoutClass::Default),

@@ -57,6 +57,7 @@ pub(crate) async fn execute(
             let v = super::sessions::auto_name_command(&ctx, dispatch).await?;
             json_response(v)
         }
+        "sessions_export" => super::sessions::export_command(&ctx, dispatch).await,
         "sessions_thinking" => {
             let v = super::sessions::thinking_command(&ctx, dispatch).await?;
             json_response(v)

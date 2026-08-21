@@ -917,6 +917,46 @@ impl crate::session::title::SessionTitleRunner for LlmTitleRunner {
 }
 
 // ============================================================================
+// GET /api/sessions/:id/export — 上游导出器完整移植(见 api/export.rs)
+// ============================================================================
+
+pub(crate) async fn export_command(
+    ctx: &super::commands::ExecCtx,
+    dispatch: super::routes::Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let id = dispatch
+        .args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return Err(ApiError::new(400, "id is required"));
+    }
+    // query_to_args 把 1 解析为数字;字符串/数字两种形态都认
+    let inline = dispatch
+        .args
+        .get("inline")
+        .is_some_and(|v| v == "1" || v.as_i64() == Some(1));
+    let root = session_root(ctx);
+    let path = find_session_file(&root, &id)
+        .ok_or_else(|| ApiError::not_found("Session not found".to_string()))?;
+
+    let file_name = super::export::export_file_name(&path);
+    // 文件 IO 走 blocking(本仓纪律);组装 + 补丁见 export.rs
+    let html = super::commands::blocking(ctx, move || -> Result<String, ApiError> {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| ApiError::internal(format!("read session: {e}")))?;
+        super::export::export_session_html(&content)
+            .map_err(|e| ApiError::new(500, e))
+    })
+    .await??;
+
+    super::export::html_response(html, &file_name, inline)
+}
+
+// ============================================================================
 // GET /api/sessions/:id/entries/:entryId/thinking — 惰性加载 thinking 块
 // ============================================================================
 

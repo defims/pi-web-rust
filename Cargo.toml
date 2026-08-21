@@ -30,6 +30,8 @@ sha2 = "0.10"
 regex = "1"
 # UUID v4(原子写入临时文件名,对齐 TS crypto.randomUUID())
 uuid = { version = "1", features = ["v4"] }
+# Base64(会话导出 SESSION_DATA 嵌入,对齐上游 Buffer.toString("base64"))
+base64 = "0.22"
 # unix 常量(O_NOFOLLOW,对齐 lib/bash-output.ts 的 openRegularFileNoFollow)
 libc = "0.2"
 # ── api feature 专用 ──

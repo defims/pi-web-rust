@@ -19,6 +19,7 @@ pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 mod commands;
 pub mod events;
+mod export;
 mod file_index;
 mod files;
 mod models;
