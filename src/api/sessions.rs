@@ -24,6 +24,10 @@ pub(crate) struct SessionHeader {
     pub cwd: String,
     #[serde(default)]
     pub timestamp: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
     pub leaf_id: Option<String>,
     pub branched_from: Option<String>,
 }
@@ -680,6 +684,8 @@ pub(crate) async fn auto_name_command(
     ctx: &super::commands::ExecCtx,
     dispatch: super::routes::Dispatch,
 ) -> Result<Value, ApiError> {
+    use std::io::Write;
+
     let id = dispatch
         .args
         .get("id")
@@ -694,29 +700,220 @@ pub(crate) async fn auto_name_command(
     let path = find_session_file(&root, &id)
         .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
 
-    super::commands::blocking(ctx, move || -> Result<Value, ApiError> {
-        let entries = read_entries(&path);
-        let first_user_text = entries
-            .iter()
-            .find_map(|v| {
-                if v.get("type").and_then(|t| t.as_str()) != Some("message") {
-                    return None;
-                }
-                let msg = v.get("message")?;
-                if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
-                    return None;
-                }
-                msg.get("content").map(user_first_text)
-            })
-            .unwrap_or_default();
-        let title = if first_user_text.chars().count() > 60 {
-            first_user_text.chars().take(60).collect::<String>()
-        } else {
-            first_user_text
-        };
-        Ok(json!({ "title": title, "usage": Value::Null }))
+    // 1) 读取会话消息 + header 模型(标题生成用会话自身模型优先)
+    let (messages, header_model): (Vec<Value>, Option<(String, String)>) =
+        super::commands::blocking(ctx, move || {
+            let entries = read_entries(&path);
+            let msgs: Vec<Value> = entries
+                .iter()
+                .filter_map(|v| {
+                    if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+                        return None;
+                    }
+                    v.get("message").cloned()
+                })
+                .collect();
+            let header_pair = read_first_line(&path)
+                .and_then(|l| parse_header(&l))
+                .and_then(|h| match (h.provider, h.model_id) {
+                    (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => Some((p, m)),
+                    _ => None,
+                });
+            Ok::<_, ApiError>((msgs, header_pair))
+        })
+        .await??;
+
+    // 2) LLM 生成标题(上游 session-title.ts:registry 解析模型 → 无状态
+    //    provider 调用;会话自身模型优先,settings 默认兜底)
+    let runner = LlmTitleRunner::for_session(ctx, header_model).await?;
+    let generated = crate::session::title::generate_session_title(&runner, &messages)
+        .await
+        .map_err(|e| ApiError::new(500, e))?;
+    let title = generated.title.trim().to_string();
+    if title.is_empty() {
+        return Err(ApiError::internal("generated title is empty"));
+    }
+
+    // 3) 持久化:session_info 追加(与 rename 同机制)+ 活会话引擎侧同步
+    let title_for_persist = title.clone();
+    let path_for_persist = find_session_file(&root, &id)
+        .ok_or_else(|| ApiError::not_found(format!("session not found: {id}")))?;
+    super::commands::blocking(ctx, move || -> Result<(), ApiError> {
+        let first_line = read_first_line(&path_for_persist)
+            .ok_or_else(|| ApiError::internal("cannot read session header"))?;
+        let header = parse_header(&first_line)
+            .ok_or_else(|| ApiError::internal("invalid session header"))?;
+        let entry = json!({
+            "type": "session_info",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "parentId": header.leaf_id.clone().unwrap_or_else(|| header.id.clone()),
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "name": title_for_persist,
+        });
+        let line = serde_json::to_string(&entry)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(false)
+            .open(&path_for_persist)
+            .map_err(|e| ApiError::internal(format!("open session append: {e}")))?;
+        file.write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| ApiError::internal(format!("append session_info: {e}")))?;
+        Ok(())
     })
-    .await?
+    .await??;
+    // 活会话同步(set_session_name 会话内生效;磁盘恢复路径也带名)
+    if let Some(h) = ctx.sessions.get(&id) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = h
+            .tx
+            .send(super::session_runtime::SessionCmd::SetSessionName {
+                name: title.clone(),
+                reply: tx,
+            })
+            .await;
+        let _ = rx.await;
+    }
+
+    Ok(json!({
+        "title": title,
+        "usage": generated.usage.map(|u| serde_json::to_value(u).unwrap_or(Value::Null)).unwrap_or(Value::Null),
+    }))
+}
+
+/// 无状态标题生成 runner(上游 runner 语义:独立 LLM 调用,不进会话历史)。
+/// 模型解析:会话 header 的 provider/model 优先 → settings 默认 → 首个可用。
+struct LlmTitleRunner {
+    provider: std::sync::Arc<dyn pi::provider::Provider>,
+    api_key: Option<String>,
+}
+
+impl LlmTitleRunner {
+    async fn for_session(
+        ctx: &super::commands::ExecCtx,
+        header_model: Option<(String, String)>,
+    ) -> Result<Self, ApiError> {
+        super::commands::blocking(ctx, move || {
+            let global_dir = pi::sdk::Config::global_dir();
+            let auth = pi::auth::AuthStorage::load(global_dir.join("auth.json"))
+                .map_err(|e| ApiError::internal(format!("auth load: {e}")))?;
+            let models_path = global_dir.join("models.json");
+            let registry = pi::models::ModelRegistry::load(&auth, Some(models_path));
+            let header_pair = header_model;
+            let entry = header_pair
+                .and_then(|(p, m)| registry.find(&p, &m))
+                .or_else(|| {
+                    let cfg = pi::config::Config::load().unwrap_or_default();
+                    match (&cfg.default_provider, &cfg.default_model) {
+                        (Some(p), Some(m)) => registry.find(p, m),
+                        _ => None,
+                    }
+                })
+                .or_else(|| registry.get_available().into_iter().next())
+                .ok_or_else(|| ApiError::internal("no model available for title generation"))?;
+            let api_key = entry.api_key.clone().filter(|k| !k.trim().is_empty());
+            let provider = pi::providers::create_provider(&entry, None)
+                .map_err(|e| ApiError::internal(format!("create provider: {e}")))?;
+            Ok(Self { provider, api_key })
+        })
+        .await?
+    }
+}
+
+impl crate::session::title::SessionTitleRunner for LlmTitleRunner {
+    fn run_title(
+        &self,
+        messages: &[Value],
+        _continues_from_trailing_user: bool,
+        title_prompt: &str,
+        _history_length: usize,
+        _timeout_ms: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::session::title::GeneratedSessionTitle, String>> + Send + '_>,
+    > {
+        let provider = self.provider.clone();
+        let api_key = self.api_key.clone();
+        let prompt = title_prompt.to_string();
+        // 消息平铺为对话文本(compaction serialize_conversation 同思路);
+        // 标题生成无需真实消息结构,单条 user 提示即可
+        let mut conversation = String::new();
+        for m in messages {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = match m.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(blocks)) => blocks
+                    .iter()
+                    .filter_map(|b| {
+                        if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            Some(
+                                b.get("text")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            conversation.push_str(&format!("{role}: {content}\n"));
+        }
+        Box::pin(async move {
+            use futures::StreamExt;
+            use pi::model::{ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage};
+            use pi::provider::{Context, StreamOptions};
+
+            let context = Context::owned(
+                Some(prompt),
+                vec![Message::User(UserMessage {
+                    content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(conversation))]),
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                })],
+                Vec::new(),
+            );
+            let options = StreamOptions {
+                api_key,
+                max_tokens: Some(256),
+                ..Default::default()
+            };
+            let mut stream = provider
+                .stream(&context, &options)
+                .await
+                .map_err(|e| format!("title stream: {e}"))?;
+            let mut text = String::new();
+            let mut usage = None;
+            while let Some(event) = stream.next().await {
+                match event.map_err(|e| format!("title stream event: {e}"))? {
+                    StreamEvent::Done { message, .. } => {
+                        for block in &message.content {
+                            if let ContentBlock::Text(t) = block {
+                                text.push_str(&t.text);
+                            }
+                        }
+                        usage = Some(crate::session::title::Usage {
+                            input: message.usage.input,
+                            output: message.usage.output,
+                            cache_read: message.usage.cache_read,
+                            cache_write: message.usage.cache_write,
+                            total: message.usage.total_tokens,
+                        });
+                    }
+                    StreamEvent::Error { error, .. } => {
+                        return Err(error.error_message.unwrap_or_else(|| "title error".into()));
+                    }
+                    _ => {}
+                }
+            }
+            let title = crate::session::title::parse_generated_session_title(&text)?;
+            Ok(crate::session::title::GeneratedSessionTitle { title, usage })
+        })
+    }
 }
 
 // ============================================================================

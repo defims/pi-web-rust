@@ -3111,6 +3111,166 @@ Connection: close
         }
     }
 
+    /// 回归(列表标题):prompt 完成 + idle 清扫 flush 落盘后,sessions_list
+    /// 的 firstMessage 必须含首条 user 消息、messageCount ≥ 2(用户现象:
+    /// 侧栏恒 "(no messages)")。
+    #[test]
+    fn sessions_list_first_message_after_prompt() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("listfirst-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // prompt 至 settled
+        let (ptx, _prx) = std::sync::mpsc::channel();
+        api.handle(
+            post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"hello-list-marker"}"#),
+            Box::new(move |r| {
+                let _ = ptx.send(r);
+            }),
+        );
+        let t0 = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+            if !body(&st)["running"].as_bool().unwrap_or(true) { break; }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "never settled");
+        }
+        // flush 落盘
+        api.sweep_idle_sessions(std::time::Duration::ZERO);
+        let t1 = std::time::Instant::now();
+        while api.session_count() != 0 && t1.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // 列表:firstMessage 含首条消息、messageCount ≥ 2
+        let resp = call(&api, get("/api/sessions")).expect("list");
+        let v = body(&resp);
+        let target = v["sessions"].as_array().unwrap().iter()
+            .find(|s| s["id"].as_str() == Some(sid.as_str()))
+            .unwrap_or_else(|| panic!("session {sid} in list: {v}"));
+        assert!(
+            target["firstMessage"].as_str().is_some_and(|f| f.contains("hello-list-marker")),
+            "firstMessage must contain first user msg: {target}"
+        );
+        assert!(
+            target["messageCount"].as_u64().is_some_and(|c| c >= 2),
+            "messageCount must count user+assistant: {target}"
+        );
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// 回归(auto-name):prompt 完成后 POST auto-name → LLM 生成标题
+    /// (fake SSE 回 "OK")+ session_info 持久化 + 列表 name 更新。
+    #[test]
+    fn auto_name_generates_and_persists_title() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("autoname-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // prompt 至 settled(fake LLM 回 "OK")
+        let (ptx, _prx) = std::sync::mpsc::channel();
+        api.handle(
+            post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"please name this"}"#),
+            Box::new(move |r| {
+                let _ = ptx.send(r);
+            }),
+        );
+        let t0 = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+            if !body(&st)["running"].as_bool().unwrap_or(true) { break; }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "never settled");
+        }
+
+        // auto-name:200 + title 非空
+        let resp = call(&api, post(&format!("/api/sessions/{sid}/auto-name"), "{}"))
+            .expect("auto-name ok");
+        assert_eq!(
+            resp.status(), 200,
+            "auto-name: {}",
+            String::from_utf8_lossy(resp.body())
+        );
+        let v = body(&resp);
+        let title = v["title"].as_str().unwrap_or("").to_string();
+        assert!(!title.is_empty(), "title must be non-empty: {v}");
+
+        // 持久化:文件含 session_info + name;列表 name = title
+        let sessions_dir = tmp.join("sessions");
+        let mut found = false;
+        for _ in 0..30 {
+            let mut jsonl = String::new();
+            fn walk(dir: &std::path::Path, sid: &str, out: &mut String) {
+                let Ok(rd) = std::fs::read_dir(dir) else { return };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() { walk(&p, sid, out); }
+                    else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                        let c = std::fs::read_to_string(&p).unwrap_or_default();
+                        if c.contains(sid) { *out = c; }
+                    }
+                }
+            }
+            walk(&sessions_dir, &sid, &mut jsonl);
+            if jsonl.contains("\"session_info\"") && jsonl.contains(&title) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(found, "session_info entry with generated title must be persisted");
+
+        let resp = call(&api, get("/api/sessions")).expect("list");
+        let v = body(&resp);
+        let target = v["sessions"].as_array().unwrap().iter()
+            .find(|s| s["id"].as_str() == Some(sid.as_str()))
+            .unwrap_or_else(|| panic!("session in list: {v}"));
+        assert_eq!(target["name"].as_str(), Some(title.as_str()), "list name: {target}");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
     /// 回归(新建会话模型翻转):/api/agent/new 显式带 provider/modelId(deepseek),
     /// settings.json 默认是 glm —— 会话必须建在请求的模型上,而非回落默认。
     #[test]
