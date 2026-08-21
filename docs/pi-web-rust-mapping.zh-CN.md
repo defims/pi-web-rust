@@ -69,22 +69,24 @@ cargo xtask sync-pi-web
 
 agegr/pi-web 后端分三层,Rust 改写逐层推进:
 
-### 层 1:`app/api/` 路由层(39 个 route.ts → Rust handlers)
+### 层 1:`app/api/` 路由层(40 个 route.ts → Rust handlers)
 
 | 上游路由 | 方法 | 核心逻辑 | Rust 改写状态 |
 |---|---|---|---|
-| `/api/agent/[id]` | POST | rpc-manager 命令分发(25 case) | ❌ 待改写 |
-| `/api/agent/[id]/events` | GET | SSE 事件流 | ❌ 待改写 |
-| `/api/agent/new` | POST | 新建会话 | ❌ 待改写 |
-| `/api/sessions` | GET | listAllSessions | ❌ 待改写 |
-| `/api/sessions/[id]` | GET/PATCH/DELETE | 会话 CRUD | ❌ 待改写 |
-| `/api/sessions/[id]/context` | GET | buildSessionContext | ❌ 待改写 |
-| `/api/models` | GET | 模型列表 + 作用域 | ❌ 待改写 |
-| `/api/models-config` | GET/PUT | models.json 读写 | ❌ 待改写 |
-| `/api/files/[...path]` | GET/POST | 文件读写/上传 | ❌ 待改写 |
-| `/api/git/status` `/api/git/diff` | GET | git 操作 | ❌ 待改写 |
-| `/api/cwd/browse` | GET | 目录浏览 | ❌ 待改写 |
-| ... | | | (共 39 个,完整清单见消费方 moho-mate 的 `docs/port-gaps-audit.md`) |
+| `/api/agent/[id]` | POST | rpc-manager 命令分发(25 case) | ✅ `src/api/session_runtime.rs`(prompt/steer/follow_up/abort/队列/set_*/compact/fork/navigate_tree/reload/扩展面) |
+| `/api/agent/[id]/events` | GET | SSE 事件流 | ✅ **event-sink 绑定**(`src/api/events.rs`;合成 prompt_done/prompt_error/agent_settled/queue_update/compaction_*) |
+| `/api/agent/new` | POST | 新建会话 | ✅ `src/api/session_runtime.rs`(容量 + 关旧建新) |
+| `/api/sessions` | GET | listAllSessions | ✅ `src/api/commands.rs`(lib 链 + runningSessionIds) |
+| `/api/sessions/[id]` | GET/PATCH/DELETE | 会话 CRUD | ✅ get/context:`src/api/sessions.rs`;rename/delete 同文件(文件手术) |
+| `/api/sessions/[id]/context` | GET | buildSessionContext | ✅ `src/api/sessions.rs`(lib 引擎链) |
+| `/api/sessions/[id]/state` | GET | 运行检查 + 状态 | ✅ `agent_get_state` 别名路由(da9b9ea;useAgentSession loadSession 消费) |
+| `/api/sessions/[id]/export` | GET | HTML 导出 | ✅ **上游导出器完整移植**(9749436):vendor 0.84.1 模板资产(`src/api/export_assets/`)+ 服务端逐函数移植(`src/api/export.rs`)+ 深链补丁;与上游真实输出逐字节对拍 |
+| `/api/models` | GET | 模型列表 + 作用域 | ✅ `src/api/models.rs` |
+| `/api/models-config` | GET/PUT | models.json 读写 | ✅ `src/api/models.rs`(lib models_config_store) |
+| `/api/files/[...path]` | GET/POST | 文件读写/上传 | ✅ `src/api/files.rs`(八态含 multipart 上传;25MB/100MB → 413 体积上限) |
+| `/api/git/status` `/api/git/diff` | GET | git 操作 | ✅ `src/api/commands.rs`(lib git::changes) |
+| `/api/cwd/browse` | GET | 目录浏览 | ✅ `src/api/commands.rs`(lib directory_browser) |
+| ... | | | (共 40 个;覆盖由 `routes.rs upstream_route_surface_covered` golden 对账锁定 —— 上游每路由 ∈ ROUTES ∪ 文档化例外:auth login/logout/api-key、skills install/update、worktrees、app-update) |
 
 ### 层 2:`lib/` 服务端逻辑(28 个 Node-only .ts → Rust 模块)
 

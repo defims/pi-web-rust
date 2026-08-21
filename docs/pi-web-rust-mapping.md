@@ -72,7 +72,7 @@ See the consumer moho-mate's `docs/frontend-fork-audit.md`.
 
 The agegr/pi-web backend has three layers; the Rust rewrite advances layer by layer:
 
-### Layer 1: `app/api/` route layer (39 route.ts → Rust handlers)
+### Layer 1: `app/api/` route layer (40 route.ts → Rust handlers)
 
 | upstream route | method | core logic | Rust rewrite status |
 |---|---|---|---|
@@ -82,12 +82,14 @@ The agegr/pi-web backend has three layers; the Rust rewrite advances layer by la
 | `/api/sessions` | GET | listAllSessions | ✅ `src/api/commands.rs` (lib chain + runningSessionIds) |
 | `/api/sessions/[id]` | GET/PATCH/DELETE | session CRUD | ✅ get/context via `src/api/sessions.rs`; rename/delete via host proxy (route-level file ops, moho parity) |
 | `/api/sessions/[id]/context` | GET | buildSessionContext | ✅ `src/api/sessions.rs` (lib engine chain) |
+| `/api/sessions/[id]/state` | GET | running check + state | ✅ `agent_get_state` alias route (da9b9ea; useAgentSession loadSession consumer) |
+| `/api/sessions/[id]/export` | GET | HTML export | ✅ **full port** of upstream export-html (9749436): vendored 0.84.1 template assets under `src/api/export_assets/` + server-side port in `src/api/export.rs` + deep-chain patch; byte-parity test against upstream-generated reference |
 | `/api/models` | GET | model list + scopes | ✅ `src/api/models.rs` |
 | `/api/models-config` | GET/PUT | models.json read/write | ✅ `src/api/models.rs` (lib models_config_store) |
-| `/api/files/[...path]` | GET/POST | file read/write/upload | ✅ `src/api/files.rs` (eight states incl. multipart upload) |
+| `/api/files/[...path]` | GET/POST | file read/write/upload | ✅ `src/api/files.rs` (eight states incl. multipart upload; size limits 25MB/100MB → 413) |
 | `/api/git/status` `/api/git/diff` | GET | git operations | ✅ `src/api/commands.rs` (lib git::changes) |
 | `/api/cwd/browse` | GET | directory browsing | ✅ `src/api/commands.rs` (lib directory_browser) |
-| ... | | | (39 total; full list in the consumer moho-mate's `docs/port-gaps-audit.md`) |
+| ... | | | (40 total; coverage locked by `routes.rs upstream_route_surface_covered` — every upstream route ∈ ROUTES ∪ documented exceptions: auth login/logout/api-key, skills install/update, worktrees, app-update) |
 
 ### Layer 2: `lib/` server logic (28 Node-only .ts → Rust modules)
 
