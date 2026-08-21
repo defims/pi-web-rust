@@ -15,6 +15,37 @@ use super::routes::Dispatch;
 use super::ApiError;
 
 const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
+
+/// 上传体积上限(对齐上游 file-upload.ts):单文件 25MB、单请求总量 100MB。
+/// 第一层(声明长度预检)在 `PiWebApi::handle` 入口;此处为第二层兜底
+/// (无 Content-Length 声明的请求在 multipart 解析后按实值拦截)。
+pub(crate) const MAX_UPLOAD_FILE_BYTES: usize = 25 * 1024 * 1024;
+pub(crate) const MAX_UPLOAD_TOTAL_BYTES: usize = 100 * 1024 * 1024;
+
+/// 上传体积第二层检查:单文件与累计总量超限 → 413(阈值参数化便于小值测试)。
+fn enforce_upload_limits(
+    parts: &[(String, Vec<u8>)],
+    per_file: usize,
+    total: usize,
+) -> Result<(), ApiError> {
+    let mut sum = 0usize;
+    for (name, data) in parts {
+        if data.len() > per_file {
+            return Err(ApiError::new(
+                413,
+                format!("file {} too large ({} > {} bytes)", name, data.len(), per_file),
+            ));
+        }
+        sum += data.len();
+        if sum > total {
+            return Err(ApiError::new(
+                413,
+                format!("total upload too large ({} > {} bytes)", sum, total),
+            ));
+        }
+    }
+    Ok(())
+}
 pub(crate) const IGNORED_NAMES_PUB: &[&str] = &[
     "node_modules", ".git", ".next", "dist", "build", "__pycache__",
 ];
@@ -234,6 +265,8 @@ fn upload(dir: &Path, dispatch: &Dispatch) -> Result<http::Response<Vec<u8>>, Ap
     if parts.is_empty() {
         return Err(ApiError::new(400, "no file parts"));
     }
+    // 体积第二层(实值兜底;声明长度预检在 handle 入口)
+    enforce_upload_limits(&parts, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES)?;
     // 冲突检测(已存在 → 按 conflict 策略;error → 409 带 conflicts 列表)
     let mut conflicts = Vec::new();
     let mut skip_count = 0u32;
@@ -668,6 +701,56 @@ mod tests {
         let resp = call(&api, upload_req(&base, "conflict=skip", &body)).expect("ok");
         assert_eq!(resp.status(), 200);
         assert_eq!(std::fs::read(tmp.path().join("old.txt")).unwrap(), b"sentinel");
+    }
+
+    #[test]
+    fn upload_limits_per_file_and_total() {
+        // 单文件超限
+        let parts = vec![("a.bin".to_string(), vec![0u8; 11])];
+        let e = enforce_upload_limits(&parts, 10, 100).unwrap_err();
+        assert_eq!(e.status, 413);
+        assert!(e.message.contains("a.bin too large"));
+        // 累计超限(单个均不超)
+        let parts = vec![
+            ("a.bin".to_string(), vec![0u8; 6]),
+            ("b.bin".to_string(), vec![0u8; 6]),
+        ];
+        let e = enforce_upload_limits(&parts, 10, 10).unwrap_err();
+        assert_eq!(e.status, 413);
+        assert!(e.message.contains("total upload too large"));
+        // 恰好等于上限 → 通过(边界含)
+        let parts = vec![("a.bin".to_string(), vec![0u8; 10])];
+        assert!(enforce_upload_limits(&parts, 10, 10).is_ok());
+    }
+
+    #[test]
+    fn upload_declared_content_length_rejected_at_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let api = api_for(tmp.path());
+        let base = format!("/api/files{}", url_enc_path(tmp.path()));
+        // 声明 200MB(> 100MB 总量帽)→ 第一层直接 413,body 不进命令层
+        let body = multipart_body("----b42", &[("new.txt", b"tiny")]);
+        let req = http::Request::builder()
+            .method("POST")
+            .uri(format!("{base}?type=upload"))
+            .header(http::header::CONTENT_TYPE, "multipart/form-data; boundary=----b42")
+            .header(http::header::CONTENT_LENGTH, "209715200")
+            .body(body)
+            .unwrap();
+        let e = call(&api, req).unwrap_err();
+        assert_eq!(e.status, 413);
+        assert!(!tmp.path().join("new.txt").exists());
+        // 非 files 路由不受帽(同尺寸声明在 agent RPC 不拦 —— 全局帽误伤回归防线)
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/api/cwd/validate")
+            .header(http::header::CONTENT_LENGTH, "209715200")
+            .body(Vec::new())
+            .unwrap();
+        match call(&api, req) {
+            Ok(resp) => assert_ne!(resp.status(), 413),
+            Err(e) => assert_ne!(e.status, 413),
+        }
     }
 
     fn upload_req(base: &str, query: &str, body: &[u8]) -> http::Request<Vec<u8>> {

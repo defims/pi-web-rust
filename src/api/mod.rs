@@ -223,6 +223,24 @@ impl PiWebApi {
                 return;
             }
         };
+        // 上传体积第一层(对齐上游 bounded-form-data 的声明长度预检;仅 files
+        // 上传路由,其余 POST 不设全局帽 —— agent RPC 带图等合法大体不拦):
+        // Wire B 已将 body 缓冲为 Vec<u8>,按声明值提前拒绝,超大体不进命令层。
+        if req.method() == "POST" && dispatch.command == "files" {
+            let declared = req
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok());
+            if crate::http::bounded_form_data::check_declared_content_length(
+                declared,
+                files::MAX_UPLOAD_TOTAL_BYTES as u64,
+            )
+            .is_err()
+            {
+                responder(Err(ApiError::new(413, "Request body exceeds the allowed size")));
+                return;
+            }
+        }
         let timeout = self.0.cfg.timeouts.for_class(dispatch.timeout_class);
         let ctx = commands::ExecCtx {
             rt: self.0.rt.clone(),
