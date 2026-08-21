@@ -93,8 +93,8 @@ The agegr/pi-web backend has three layers; the Rust rewrite advances layer by la
 
 | upstream file | lines | purpose | Rust rewrite status |
 |---|---|---|---|
-| `lib/rpc-manager.ts` | 1292 | agent session registry + RPC command dispatcher | 🟡 partial (pure logic session::rpc; AgentSessionWrapper engine binding awaits a host) |
-| `lib/session-reader.ts` | 350 | jsonl session reading + cache | 🟡 partial (reader.rs + entries.rs; SDK choices for SessionManager/buildSessionContext await the engine) |
+| `lib/rpc-manager.ts` | 1292 | agent session registry + RPC command dispatcher | ✅ session::rpc(纯逻辑)+ `src/api/session_runtime.rs`(AgentSessionWrapper 等价:注册表/邮箱/turn 循环/idle 清扫/扩展 UI 通道;356 测试) |
+| `lib/session-reader.ts` | 350 | jsonl session reading + cache | ✅ reader.rs + entries.rs + `build_session_context_from_json`(经引擎 pi::sdk::build_session_context);SessionManager 侧 = `list_all_sessions`(引擎 SessionIndex 增量刷新) |
 | `lib/rpc-manager.ts` (pure logic) | — | tool merging / cwd normalization / event types / start counters | ✅ session::rpc |
 | `lib/file-fuzzy.ts` | 189 | @ file autocomplete | ✅ file::fuzzy |
 | `lib/file-dirent.ts` | 17 | Dirent detection falling back to statSync | ✅ fs::file_dirent |
@@ -131,14 +131,16 @@ The agegr/pi-web backend has three layers; the Rust rewrite advances layer by la
 | `lib/normalize.ts` | 29 | toolCall field normalization | ✅ ui::streaming_message |
 | `lib/session-file-references-core.ts` | 87 | file reference check core | ✅ security |
 
-**Estimated rewrite volume**: ~4400 lines TS → ~5000-6000 lines Rust.
+**Estimated rewrite volume**: ~4400 lines TS → ~5000-6000 lines Rust. 
 
-> ✅ 34 lib/ modules ported (4 of them 🟡 partial/stubs awaiting pi_agent_rust engine completion);
-> ❌ remaining: the AgentSessionWrapper engine-binding layer of `lib/rpc-manager.ts` and the
-> SessionManager part of `lib/session-reader.ts` (both engine bindings), plus the whole
-> `app/api/` route layer (host wiring layer); `lib/markdown.ts` and friends are frontend
-> rendering helpers that fall under frontend sync (kept byte-identical with upstream via sync)
-> and are not rewritten.
+> ✅ lib/ modules ported —— 引擎绑定层(AgentSessionWrapper / SessionManager)已于
+> 2026-08 落地(`src/api/session_runtime.rs` + 引擎 SessionIndex);project-trust 仍为
+> 恒信任 stub(无信任门需求即当前语义)。
+> ✅ `app/api/` 路由层 = `src/api/`(50+ 命令全路由:agent RPC 25 case/sessions
+> 含 auto-name LLM 生成/files 八态/models-config discover+test/skills 真实现/
+> plugins 列表+五动作/cwd),由 moho-mate 经 Wire B 直连消费。
+> `lib/markdown.ts` 等前端渲染件走 frontend sync(与上游字节一致),不重写。
+> 测试:cargo(api)356 + 前端(node --test)444。
 
 ### Layer 3: engine references (the parts of lib/ importing @earendil-works/*)
 
