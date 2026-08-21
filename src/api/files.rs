@@ -67,7 +67,7 @@ pub(crate) async fn files_command(
         }
         "upload-check" => {
             super::commands::gate_roots(ctx, &path.to_string_lossy()).await?;
-            upload_check(&dispatch)
+            upload_check(&path, &dispatch).await
         }
         "upload" => {
             super::commands::gate_roots(ctx, &path.to_string_lossy()).await?;
@@ -192,7 +192,10 @@ fn download(path: &Path) -> Result<http::Response<Vec<u8>>, ApiError> {
     ))
 }
 
-fn upload_check(dispatch: &Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
+async fn upload_check(dir: &Path, dispatch: &Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
+    if !dir.is_dir() {
+        return Err(ApiError::new(400, format!("not a directory: {}", dir.display())));
+    }
     let names: Vec<String> = dispatch
         .args
         .get("fileNames")
@@ -203,8 +206,13 @@ fn upload_check(dispatch: &Dispatch) -> Result<http::Response<Vec<u8>>, ApiError
     if let Some(err) = crate::fs::file_upload::validate_upload_file_names(&names) {
         return Err(ApiError::new(400, err));
     }
-    // 恒 200 {conflicts, nonReplaceable}(客户端读 conflicts 弹窗;409 会直炸)
-    Ok(json_ok(json!({ "conflicts": [], "nonReplaceable": [] })))
+    // lib inspectUploadTargets:lstat 语义(NotFound=不冲突;symlink/非普通文件
+    // = 冲突且不可覆盖)。恒 200 —— 客户端读 conflicts 弹冲突对话框(409 会直炸)。
+    let inspection = crate::fs::file_upload::inspect_upload_targets(&dir.to_string_lossy(), names)
+        .await
+        .map_err(|e| ApiError::internal(format!("inspect upload targets: {e}")))?;
+    let body = serde_json::to_value(&inspection).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(json_ok(body))
 }
 
 fn upload(dir: &Path, dispatch: &Dispatch) -> Result<http::Response<Vec<u8>>, ApiError> {
@@ -232,7 +240,9 @@ fn upload(dir: &Path, dispatch: &Dispatch) -> Result<http::Response<Vec<u8>>, Ap
     let mut written = Vec::new();
     for (filename, data) in &parts {
         let target = dir.join(filename);
-        if target.exists() {
+        // lstat 口径(与 upload-check 一致):dangling symlink 也算冲突,
+        // 不能用 exists()(跟随链接,dangling 时误判不存在)
+        if std::fs::symlink_metadata(&target).is_ok() {
             match strategy {
                 Conflict::Error => {
                     conflicts.push(filename.clone());
@@ -667,6 +677,77 @@ mod tests {
             .header(http::header::CONTENT_TYPE, "multipart/form-data; boundary=----b42")
             .body(body.to_vec())
             .unwrap()
+    }
+
+    fn upload_check_req(base: &str, names: &[&str]) -> http::Request<Vec<u8>> {
+        let body = serde_json::json!({ "fileNames": names }).to_string();
+        http::Request::builder()
+            .method("POST")
+            .uri(format!("{base}?type=upload-check"))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(body.into_bytes())
+            .unwrap()
+    }
+
+    #[test]
+    fn files_upload_check_reports_real_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"old").unwrap();
+        let api = api_for(tmp.path());
+        let base = format!("/api/files{}", url_enc_path(tmp.path()));
+
+        // 无冲突 → 200 空集(恒 200 语义)
+        let resp = call(&api, upload_check_req(&base, &["new.txt"])).expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["conflicts"], json!([]));
+        assert_eq!(v["nonReplaceable"], json!([]));
+
+        // 已存在 → conflicts(客户端据此弹冲突对话框)
+        let resp = call(&api, upload_check_req(&base, &["old.txt", "new.txt"])).expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["conflicts"], json!(["old.txt"]));
+        assert_eq!(v["nonReplaceable"], json!([]));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn files_upload_check_symlink_non_replaceable() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"old").unwrap();
+        std::os::unix::fs::symlink("old.txt", tmp.path().join("link.txt")).unwrap();
+        let api = api_for(tmp.path());
+        let base = format!("/api/files{}", url_enc_path(tmp.path()));
+
+        let resp = call(&api, upload_check_req(&base, &["old.txt", "link.txt", "new.txt"]))
+            .expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["conflicts"], json!(["old.txt", "link.txt"]));
+        assert_eq!(v["nonReplaceable"], json!(["link.txt"]));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn files_upload_dangling_symlink_counts_as_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("nowhere.txt", tmp.path().join("dangling.txt")).unwrap();
+        let api = api_for(tmp.path());
+        let base = format!("/api/files{}", url_enc_path(tmp.path()));
+
+        // lstat 口径:dangling symlink 算冲突(error 策略 → 409),upload-check 同
+        let resp =
+            call(&api, upload_check_req(&base, &["dangling.txt"])).expect("ok");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["conflicts"], json!(["dangling.txt"]));
+
+        let body = multipart_body("----b42", &[("dangling.txt", b"content")]);
+        let resp = call(&api, upload_req(&base, "conflict=error", &body)).expect("ok");
+        assert_eq!(resp.status(), 409);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["conflicts"], json!(["dangling.txt"]));
     }
 
     fn multipart_body(boundary: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
