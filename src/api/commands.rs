@@ -545,11 +545,11 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
             body: dispatch.args.clone(),
             reply: reply_tx,
         },
-        "extension_ui_input" => {
-            // 引擎暂无 custom UI 流式输入面(pending_ui 只有应答 oneshot);
-            // 前端自定义 UI 的连续输入暂不可达 —— 明确报错而非静默
-            return Err(ApiError::new(400, "extension_ui_input not supported by engine yet"));
-        }
+        "extension_ui_input" => C::ExtensionUiInput {
+            id: str_arg(&dispatch, "id"),
+            data: str_arg(&dispatch, "data"),
+            reply: reply_tx,
+        },
         "get_session_stats" => C::GetStats { reply: reply_tx },
         "get_last_assistant_text" => C::GetLastText { reply: reply_tx },
         other => {

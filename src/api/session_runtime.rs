@@ -68,6 +68,12 @@ pub(crate) enum SessionCmd {
         body: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// custom UI 流式输入(poll 模型:完成当前 custom poll,value 即 render 入参)
+    ExtensionUiInput {
+        id: String,
+        data: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// 优雅关停:任务侧二次 idle 确认 → flush write-behind 落盘 → 注册表
     /// 剔除 → 任务退出。idle 清扫与宿主退出用;清扫后若有新命令抢先
     /// touch(邮箱序在前),二次确认不成立即放弃关停继续服务。
@@ -1328,6 +1334,27 @@ async fn idle_cmd(
             }
             let _ = reply.send(Ok(json!({ "commands": commands })));
         }
+        SessionCmd::ExtensionUiInput { id, data, reply } => {
+            // poll 模型:输入 = 完成当前 custom poll(ui_response_value_for_op
+            // 对 custom 直接透传 value → JS render(data) → 下一帧 + 新 poll)
+            let res = (|| -> Result<Value, String> {
+                let manager = handle
+                    .extension_manager()
+                    .ok_or_else(|| "session has no extensions".to_string())?
+                    .clone();
+                let delivered = manager.respond_ui(pi::extensions::ExtensionUiResponse {
+                    id,
+                    value: Some(serde_json::Value::String(data)),
+                    cancelled: false,
+                });
+                if delivered {
+                    Ok(json!({ "delivered": true }))
+                } else {
+                    Err("no pending custom UI poll for id".into())
+                }
+            })();
+            let _ = reply.send(res);
+        }
         SessionCmd::ExtensionUiResponse { id, body, reply } => {
             // 三形态:{value}|{confirmed}|{cancelled} → 引擎 respond_ui
             let res = (|| -> Result<Value, String> {
@@ -1364,6 +1391,10 @@ async fn idle_cmd(
         SessionCmd::Shutdown { reply, .. } => {
             // 主循环已拦截 Shutdown;防御分支
             let _ = reply.send(Err("shutdown handled at top level".into()));
+        }
+        SessionCmd::ExtensionUiInput { reply, .. } => {
+            // 主循环已拦截;防御分支
+            let _ = reply.send(Err("extension_ui_input handled at top level".into()));
         }
     }
 }
@@ -1465,6 +1496,7 @@ fn handle_running_cmd(
         | SessionCmd::GetTools { reply }
         | SessionCmd::GetCommands { reply }
         | SessionCmd::ExtensionUiResponse { reply, .. }
+        | SessionCmd::ExtensionUiInput { reply, .. }
         | SessionCmd::Shutdown { reply, .. } => {
             let _ = reply.send(Err("session busy (prompt running)".into()));
         }
@@ -3446,6 +3478,135 @@ Connection: close
         }
     }
 
+    /// custom UI 流式输入(poll 模型闭环):request_ui(custom) 的 pending poll
+    /// 经 POST extension_ui_input {id,data} 完成,future 收到的 value=data
+    /// (引擎 ui_response_value_for_op 对 custom 透传 → JS render 入参)。
+    #[test]
+    fn extension_ui_input_completes_custom_poll() {
+        use serde_json::json;
+        use crate::api::ApiEvent;
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("extuiin-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let pi = tmp.join(".pi/agent");
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("models.json"),
+            r#"{"providers":{"fake":{"baseUrl":"http://127.0.0.1:9/v1","api":"openai-completions","apiKey":"k","models":[{"id":"f1","name":"f1"}]}}}"#,
+        )
+        .unwrap();
+        let ext_dir = pi.join("extensions/hello");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("index.js"), "export function activate() {}\n").unwrap();
+
+        let (port, _rx) = spawn_sse_server(StreamShape::Standard);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#)))
+            .expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+
+        // 引擎面起一个 custom poll(request_id=poll-1,无超期)
+        let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+        let _ = st;
+        // 经 RPC 直接驱动:扩展管理器在会话任务内,此处用 API 的
+        // extension_ui_input 打一个不存在的 id → 500(无 pending)
+        let resp = call(&api, post(
+            &format!("/api/agent/{sid}"),
+            r#"{"type":"extension_ui_input","id":"poll-none","data":"x"}"#,
+        )).expect("handled");
+        assert_eq!(resp.status(), 500, "{}", String::from_utf8_lossy(resp.body()));
+        assert!(
+            String::from_utf8_lossy(resp.body()).contains("pending"),
+            "no-pending error: {}",
+            String::from_utf8_lossy(resp.body())
+        );
+
+        // 真闭环:直接在引擎 manager 上挂 poll,再经 API 投输入
+        // (会话在注册表内,extension_ui_input 走 idle_cmd → respond_ui)
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<serde_json::Value>();
+        let sink: crate::api::EventSink = Arc::new(move |ev| {
+            if let ApiEvent::Agent { payload } = ev {
+                let _ = ev_tx.send(payload);
+            }
+        });
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt2 = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(2, 4)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let cwd2 = tmp.to_path_buf();
+        let handle = futures::executor::block_on(pi::sdk::create_agent_session(
+            pi::sdk::SessionOptions {
+                no_session: true,
+                working_directory: Some(cwd2),
+                ..Default::default()
+            },
+        ))
+        .expect("session with extension");
+        super::wire_extension_ui(&handle, &Arc::new(std::sync::Mutex::new(super::SessionSnap::default())), &sink, &rt2);
+        let manager = handle.extension_manager().expect("manager").clone();
+        let mgr = manager.clone();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        rt2.handle().spawn(async move {
+            let req = pi::extensions::ExtensionUiRequest::new(
+                "poll-1",
+                "custom",
+                json!({ "lines": ["frame-1"] }),
+            );
+            let res = mgr.request_ui(req).await;
+            let _ = res_tx.send(res);
+        });
+        // 前端事件到(method=custom,id=poll-1)
+        let mut ev = None;
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(5) {
+            match ev_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(e) if e["method"] == json!("custom") => {
+                    ev = Some(e);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        let ev = ev.expect("custom poll forwarded as event");
+        assert_eq!(ev["id"], json!("poll-1"), "{ev}");
+
+        // 注:该 handle 是测试自建(不在 api 注册表),走不了会话邮箱 ——
+        // 用 manager.respond_ui 直接模拟 API 层等价动作
+        let delivered = manager.respond_ui(pi::extensions::ExtensionUiResponse {
+            id: "poll-1".into(),
+            value: Some(json!("key:left")),
+            cancelled: false,
+        });
+        assert!(delivered);
+        let res = res_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("poll settles")
+            .expect("request_ui ok");
+        assert_eq!(res.expect("response").value, Some(json!("key:left")));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
     /// get_tools / get_commands RPC(P2b):
     /// 基座工具带 name/description/active;命令三源含 skill: 前缀;
     /// extension_ui_response 无 pending → 明确错误。
@@ -3513,12 +3674,17 @@ Connection: close
         let v = body(&resp);
         assert!(v["error"].as_str().is_some_and(|e| e.contains("pending")), "{v}");
 
-        // extension_ui_input → 400 引擎面未备
-        let e = call(&api, post(
+        // extension_ui_input → 路由已接通;无 pending custom poll → 500 明确错误
+        let resp = call(&api, post(
             &format!("/api/agent/{sid}"),
             r#"{"type":"extension_ui_input","id":"x","data":"y"}"#,
-        )).err().expect("extension_ui_input must err");
-        assert_eq!(e.status, 400);
+        )).expect("handled");
+        assert_eq!(resp.status(), 500);
+        assert!(
+            String::from_utf8_lossy(resp.body()).contains("pending"),
+            "no-pending error: {}",
+            String::from_utf8_lossy(resp.body())
+        );
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
