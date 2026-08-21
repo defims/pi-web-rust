@@ -61,6 +61,9 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("POST", "/api/agent/new", "agent_new", TimeoutClass::Default),
     ("GET", "/api/agent/running", "agent_running", TimeoutClass::Default),
     ("GET", "/api/agent/:id", "agent_get_state", TimeoutClass::Default),
+    // 上游 sessions/[id]/state 的同构别名(useAgentSession.ts loadSession 消费;
+    // 语义与 agent_get_state 完全一致:{running,state} / 404)
+    ("GET", "/api/sessions/:id/state", "agent_get_state", TimeoutClass::Default),
     ("GET", "/api/agent/:id/bash-output", "agent_bash_output", TimeoutClass::Default),
     ("POST", "/api/agent/:id", "agent_rpc", TimeoutClass::Default),
     // ── gated stub 路由(原桥自有常量;Wire B 直连后由 api 层承载)───────
@@ -272,4 +275,82 @@ fn url_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod upstream_parity_tests {
+    use super::*;
+
+    /// 上游 app/api 路由面 vs ROUTES 对账(路径维度):上游每个 route.ts 必须
+    /// ∈ ROUTES ∪ 文档化例外。追上游换版后新增路由自动爆红;例外清单即已知
+    /// 缺口的活跟踪点 —— 例外消失时(路由补上)同步删条目。
+    #[test]
+    fn upstream_route_surface_covered() {
+        let upstream_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("app/api");
+        let mut upstream: Vec<String> = Vec::new();
+        collect_route_patterns(&upstream_root, &upstream_root, &mut upstream);
+        assert!(!upstream.is_empty(), "upstream app/api must be present in the submodule checkout");
+
+        let ours: std::collections::HashSet<String> =
+            ROUTES.iter().map(|r| r.1.to_string()).collect();
+
+        /// 文档化例外(上游有、我们无;每条带原因)
+        const EXCEPTIONS: &[(&str, &str)] = &[
+            ("/api/agent/:id/events", "SSE 经 EventSink + 前端 EventSource shim(架构替代,非缺失)"),
+            ("/api/agent/running/events", "同上"),
+            ("/api/app-update", "宿主自更新机制(moho self_update);前端更新横幅在嵌入版保持惰性"),
+            ("/api/auth/api-key/:provider", "凭证管理面未移植(providers 现为常量 stub)—— 另批"),
+            ("/api/auth/login/:provider", "OAuth 登录流未移植 —— 另批"),
+            ("/api/auth/logout/:provider", "OAuth 登出未移植 —— 另批"),
+            ("/api/skills/install", "缺失路由 —— 另批实施(本清单即跟踪点)"),
+            ("/api/skills/update", "缺失路由 —— 另批实施"),
+            ("/api/worktrees", "lib git::worktree 已移植、路由未接 —— 另批实施"),
+        ];
+        let exceptions: std::collections::HashSet<&str> = EXCEPTIONS.iter().map(|e| e.0).collect();
+
+        let mut missing: Vec<&String> = upstream
+            .iter()
+            .filter(|r| !ours.contains(*r) && !exceptions.contains(r.as_str()))
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "upstream routes missing from ROUTES (implement the route, or add a documented exception):\n{missing:#?}"
+        );
+    }
+
+    /// 递归收集 route.ts → 上游路径模式([x]→:x、[...x]→*x)。
+    /// `root` 恒为 app/api(模式相对它推导);`dir` 为当前遍历层。
+    fn collect_route_patterns(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_route_patterns(root, &p, out);
+            } else if p.file_name().map(|n| n == "route.ts").unwrap_or(false) {
+                let rel = match p.strip_prefix(root) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                }
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_default();
+                let pattern = rel
+                    .components()
+                    .map(|c| {
+                        let s = c.as_os_str().to_string_lossy();
+                        if let Some(rest) = s.strip_prefix("[...") {
+                            format!("*{}", rest.trim_end_matches(']'))
+                        } else if let Some(rest) = s.strip_prefix('[') {
+                            format!(":{}", rest.trim_end_matches(']'))
+                        } else {
+                            s.into_owned()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.push(format!("/api/{}", pattern));
+            }
+        }
+    }
 }
