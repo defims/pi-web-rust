@@ -116,6 +116,10 @@ pub(crate) struct SessionSnap {
     /// 给 on_event 回调(在 SessionSnap 构造前创建)。
     pub streaming_message: Arc<Mutex<Option<serde_json::Value>>>,
     /// 累计 usage tokens(finish_turn 每轮更新;contextUsage 百分比用)
+    /// 空闲 get_session_stats 的最近一次引擎结果(每轮 turn 结束刷新);
+    /// 运行期 GetStats 无法借 handle(prompt future 占用)→ 返回此缓存
+    /// 而非报错(上游允许运行中查统计;缓存是降级近似,见 commands 层增强)。
+    pub last_stats: Option<Value>,
     pub last_usage_total: u64,
     /// 最近一次命令到达时刻(idle 清扫判据;命令线是唯一活动来源 ——
     /// 引擎事件只在 turn 内流动,而 turn 内 is_prompt_running 恒真)
@@ -951,6 +955,10 @@ async fn handle_prompt_turn(
             .queued_prompts
             .pop_front();
         finish_turn(res, snap, sink, next.is_none()).await;
+        // 轮末刷新 stats 缓存:运行期 GetStats 借不到 handle,返回此值
+        if let Ok(stats) = handle.get_session_stats().await {
+            snap.lock().unwrap_or_else(|e| e.into_inner()).last_stats = Some(stats);
+        }
         match next {
             Some((m, imgs)) => {
                 message = m;
@@ -1221,16 +1229,12 @@ async fn idle_cmd(
             let _ = reply.send(Err(format!("{what}: extension wiring pending")));
         }
         SessionCmd::GetStats { reply } => {
-            let mut stats = handle.get_session_stats().await.unwrap_or_else(|_| json!({}));
-            // 合并 snap 会话名(上游 get_session_stats 契约含 sessionName;
-            // 引擎 InProcess 统计不带名字段)
-            if stats.get("sessionName").and_then(|v| v.as_str()).map_or(true, |n| n.is_empty()) {
-                if let Some(name) = snap.lock().unwrap_or_else(|e| e.into_inner()).session_name.clone() {
-                    if let Some(obj) = stats.as_object_mut() {
-                        obj.insert("sessionName".to_string(), serde_json::json!(name));
-                    }
-                }
-            }
+            let stats = handle.get_session_stats().await.unwrap_or_else(|_| json!({}));
+            // 引擎 counts/tokens/cost 之外的字段(sessionName/sessionId/
+            // sessionFile/contextUsage/totalActiveMs)在 commands 层增强
+            // (那里有 ctx/snap/blocking,文件 IO 不占会话任务)。
+            // 同时刷新运行期缓存(busy 臂返回此值)。
+            snap.lock().unwrap_or_else(|e| e.into_inner()).last_stats = Some(stats.clone());
             let _ = reply.send(Ok(stats));
         }
         SessionCmd::GetLastText { reply } => {
@@ -1481,7 +1485,17 @@ fn handle_running_cmd(
             snap.lock().unwrap_or_else(|e| e.into_inner())
                 .queued_prompts.push_back((message, images));
         }
-        // 借 handle 的重命令运行期 busy(沿用 chat_thread 语义)
+        // 借 handle 的重命令运行期 busy(沿用 chat_thread 语义);
+        // GetStats 例外 —— 返回最近缓存(上游允许运行中查统计,见臂上方)
+        SessionCmd::GetStats { reply } => {
+            let cached = snap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_stats
+                .clone()
+                .unwrap_or_else(|| json!({}));
+            let _ = reply.send(Ok(cached));
+        }
         SessionCmd::SetModel { reply, .. }
         | SessionCmd::SetThinking { reply, .. }
         | SessionCmd::SetSessionName { reply, .. }
@@ -1492,7 +1506,6 @@ fn handle_running_cmd(
         | SessionCmd::Reload { reply }
         | SessionCmd::Rebuild { reply, .. }
         | SessionCmd::Deferred { reply, .. }
-        | SessionCmd::GetStats { reply }
         | SessionCmd::GetTools { reply }
         | SessionCmd::GetCommands { reply }
         | SessionCmd::ExtensionUiResponse { reply, .. }
@@ -2849,6 +2862,88 @@ mod success_settle_tests {
         )
         .expect_err("out-of-scope must 400");
         assert_eq!(e.status, 400, "got: {:?}", e.message);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// A1 复核:stats 契约四字段(sessionId/sessionFile/contextUsage/
+    /// totalActiveMs;commands 层增强)+ 运行期查询返回缓存而非 500。
+    #[test]
+    fn get_session_stats_contract_and_busy_path() {
+        let _g = super::super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-homes")
+            .join(format!("stats-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.join(".pi/agent"));
+
+        let (port, _rx) = spawn_sse_server(StreamShape::ChunkedInterleaved);
+        let api = api_with_provider(&tmp, port);
+        let cwd = tmp.to_string_lossy().to_string();
+        let resp = call(&api, post("/api/agent/new", &format!(r#"{{"cwd":"{cwd}"}}"#))).expect("create");
+        let sid = body(&resp)["sessionId"].as_str().expect("sid").to_string();
+        let _ = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"set_session_name","name":"Stats Session"}"#));
+
+        // busy 窗口内查 stats → 200(回归前是 500 session busy)
+        let (tx, rx) = std::sync::mpsc::channel();
+        api.handle(
+            post(&format!("/api/agent/{sid}"), r#"{"type":"prompt","message":"hi"}"#),
+            Box::new(move |r| {
+                let _ = tx.send(r);
+            }),
+        );
+        let mut caught_running = false;
+        for _ in 0..1000 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+            if body(&st)["running"].as_bool().unwrap_or(false) {
+                caught_running = true;
+                let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"get_session_stats"}"#))
+                    .expect("stats during run");
+                assert_eq!(resp.status(), 200, "busy stats must not 500");
+                break;
+            }
+        }
+        assert!(caught_running, "must catch a running window (chunked 20ms frames)");
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(60));
+
+        // 轮询至 idle 后验证契约字段
+        let mut idle = false;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let st = call(&api, get(&format!("/api/agent/{sid}"))).expect("state");
+            if !body(&st)["running"].as_bool().unwrap_or(true) {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle, "session must settle");
+
+        let resp = call(&api, post(&format!("/api/agent/{sid}"), r#"{"type":"get_session_stats"}"#)).expect("stats");
+        assert_eq!(resp.status(), 200);
+        let data = body(&resp)["data"].clone();
+        assert_eq!(data["sessionId"], serde_json::json!(sid), "sessionId: {data}");
+        assert_eq!(data["sessionName"], serde_json::json!("Stats Session"), "sessionName: {data}");
+        assert!(
+            data.get("sessionFile").and_then(|v| v.as_str()).is_some_and(|s| s.ends_with(".jsonl")),
+            "sessionFile after persisted turn: {data}"
+        );
+        assert!(data.get("contextUsage").is_some(), "contextUsage key present: {data}");
+        assert!(
+            data.get("totalActiveMs").and_then(|v| v.as_i64()).is_some_and(|ms| ms >= 0),
+            "totalActiveMs from session log: {data}"
+        );
+        assert!(data["totalMessages"].as_u64().unwrap_or(0) >= 2, "engine counts present: {data}");
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),

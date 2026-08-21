@@ -561,7 +561,16 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
         return reject_session_response(&ty);
     }
     match reply_rx.await {
-        Ok(Ok(data)) => json_response(json!({ "success": true, "data": data })),
+        Ok(Ok(mut data)) => {
+            // get_session_stats 增强(上游 getSessionStats 契约):引擎只产
+            // counts/tokens/cost;sessionName/sessionId/sessionFile 来自会话
+            // 快照,totalActiveMs 从会话文件离线计算,contextUsage 按
+            // models.json 推导。文件 IO 走 blocking(会话任务是纯引擎调用)。
+            if ty == "get_session_stats" {
+                enrich_session_stats(ctx, &h, &mut data).await;
+            }
+            json_response(json!({ "success": true, "data": data }))
+        }
         Ok(Err(e)) => {
             // 上游 route.ts:41-47:prompt 失败(未 accepted)带 prompt_rejected
             let mut body = json!({ "error": e });
@@ -577,6 +586,83 @@ async fn agent_rpc(ctx: &ExecCtx, dispatch: Dispatch) -> Result<http::Response<V
                 .expect("static builder"))
         }
         Err(_) => reject_session_response(&ty),
+    }
+}
+
+/// stats 增强(上游 SessionStatsInfo 契约的 api 层补齐):引擎 get_session_stats
+/// 只产 counts/tokens/cost;sessionName/sessionId/sessionFile 取自会话快照,
+/// totalActiveMs 从会话文件离线计算(lib session::timing,上游 session-timing.ts
+/// 同算法;盘读略滞后于内存态,文档化近似),contextUsage 按 models.json 推导。
+/// 会话文件读取走 blocking(不占会话任务的 async 上下文)。
+async fn enrich_session_stats(
+    ctx: &ExecCtx,
+    h: &super::session_runtime::SessionHandle,
+    stats: &mut Value,
+) {
+    let (session_id, session_file, session_name, usage_total, provider, model_id) = {
+        let s = h.snap.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            s.session_id.clone(),
+            s.session_path.clone(),
+            s.session_name.clone(),
+            s.last_usage_total,
+            s.model_provider.clone().unwrap_or_default(),
+            s.model_id.clone().unwrap_or_default(),
+        )
+    };
+    // 引擎首次落盘不回填 snap.session_path → lib id→path 缓存,再兜底扫描
+    // 会话根(与 sessions::find_session_file 同链路;文件 IO 移入 blocking)
+    let session_file = session_file.or_else(|| {
+        session_id
+            .as_ref()
+            .and_then(|sid| crate::session::resolve_session_path(sid))
+            .map(std::path::PathBuf::from)
+    });
+    let file_for_timing = session_file.clone();
+    let sid_for_lookup = session_id.clone();
+    let root = ctx
+        .hooks
+        .sessions_root()
+        .map(|p| p.to_string_lossy().into_owned());
+    let session_file = match file_for_timing {
+        Some(p) => Some(p),
+        None => blocking(ctx, move || {
+            let root = root.unwrap_or_else(default_sessions_root_pub);
+            sid_for_lookup.and_then(|sid| super::sessions::find_session_file(&root, &sid))
+        })
+        .await
+        .ok()
+        .flatten(),
+    };
+    let session_file_str = session_file.as_ref().map(|p| p.to_string_lossy().into_owned());
+    let total_active_ms = match session_file {
+        Some(path) => blocking(ctx, move || -> Option<i64> {
+            let content = std::fs::read_to_string(&path).ok()?;
+            let entries: Vec<crate::session::timing::TimingEntry> = content
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            Some(crate::session::timing::compute_session_total_active_ms(&entries))
+        })
+        .await
+        .ok()
+        .flatten(),
+        None => None,
+    };
+
+    let Some(obj) = stats.as_object_mut() else { return };
+    if let Some(sid) = session_id {
+        obj.insert("sessionId".to_string(), json!(sid));
+    }
+    if let Some(path) = session_file_str {
+        obj.insert("sessionFile".to_string(), json!(path));
+    }
+    if let Some(name) = session_name {
+        obj.entry("sessionName".to_string()).or_insert(json!(name));
+    }
+    obj.insert("contextUsage".to_string(), compute_context_usage(usage_total, &provider, &model_id));
+    if let Some(ms) = total_active_ms {
+        obj.insert("totalActiveMs".to_string(), json!(ms));
     }
 }
 
