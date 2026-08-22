@@ -88,6 +88,9 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("POST", "/api/cwd/validate", "cwd_validate", TimeoutClass::Default),
     ("POST", "/api/default-cwd", "default_cwd", TimeoutClass::Default),
     ("GET", "/api/file-index", "file_index", TimeoutClass::Default),
+    ("GET", "/api/worktrees", "worktrees_get", TimeoutClass::Default),
+    ("POST", "/api/worktrees", "worktrees_post", TimeoutClass::Default),
+    ("DELETE", "/api/worktrees", "worktrees_delete", TimeoutClass::Default),
     ("GET", "/api/models", "models_list", TimeoutClass::Default),
     ("GET", "/api/models-config", "models_config_get", TimeoutClass::Default),
     ("POST", "/api/models-config/discover", "models_config_discover", TimeoutClass::Default),
@@ -109,8 +112,9 @@ pub(crate) fn resolve(req: &http::Request<Vec<u8>>) -> Option<Dispatch> {
     let path = normalize_path(req.uri().path());
     let query = req.uri().query().unwrap_or("");
     let mut args = query_to_args(query);
-    // POST/PUT/PATCH:JSON body 字段并入 args(body 优先 —— 上游 route.ts 从 body 读参数)
-    if matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
+    // POST/PUT/PATCH/DELETE:JSON body 字段并入 args(body 优先 —— 上游
+    // route.ts 从 body 读参数;DELETE 也带 body,如 worktrees 的 {cwd,path,force})
+    if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
         if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(req.body()) {
             if let Some(args_map) = args.as_object_mut() {
                 for (k, v) in map {

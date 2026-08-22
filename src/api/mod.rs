@@ -26,6 +26,7 @@ mod models;
 mod session_runtime;
 pub mod routes;
 mod sessions;
+mod worktrees;
 
 pub use events::ApiEvent;
 pub use routes::{TimeoutClass, TimeoutConfig};

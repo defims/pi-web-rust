@@ -59,6 +59,127 @@ pub fn build_npx_invocation(args: &[String], exec_path: &str) -> NpxInvocation {
     }
 }
 
+// ── runNpx 执行器 ────────────────────────────────────────────────────────
+
+/// 对齐 `RunNpxOptions`(timeout/cwd/env 覆盖项)。
+pub struct RunNpxOptions {
+    pub timeout: std::time::Duration,
+    pub cwd: Option<String>,
+    /// 在继承的环境上追加/覆盖(上游 `{ ...process.env, ...opts.env }`)。
+    pub env: Vec<(String, String)>,
+}
+
+impl Default for RunNpxOptions {
+    fn default() -> Self {
+        Self { timeout: std::time::Duration::from_secs(60), cwd: None, env: Vec::new() }
+    }
+}
+
+/// 对齐 `RunNpxResult`。
+#[derive(Debug)]
+pub struct RunNpxResult {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// 失败携带部分输出(上游 catch 读 `err.stdout/err.stderr` 拼 error 文案)。
+#[derive(Debug)]
+pub struct RunNpxError {
+    pub stdout: String,
+    pub stderr: String,
+    pub message: String,
+}
+
+/// 对齐 `runNpx`:无 shell 调用(用户参数永不被 shell 解释);超时击杀。
+///
+/// 与上游的差异:上游用 `process.execPath`(服务进程自己的 node)定位
+/// npx-cli.js;Rust 宿主无自带 node → PATH 上的 `node` 定位,找不到则回退
+/// PATH 上的 `npx`(与上游 fallback 相同)。
+pub fn run_npx(args: &[String], opts: &RunNpxOptions) -> Result<RunNpxResult, RunNpxError> {
+    let node_on_path = which_on_path("node");
+    let inv = match &node_on_path {
+        Some(node) => build_npx_invocation(args, node),
+        None => NpxInvocation { command: "npx".to_string(), command_args: args.to_vec() },
+    };
+    let mut cmd = std::process::Command::new(&inv.command);
+    cmd.args(&inv.command_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in &opts.env {
+        cmd.env(k, v);
+    }
+    if let Some(cwd) = &opts.cwd {
+        cmd.current_dir(cwd);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(RunNpxError {
+                stdout: String::new(),
+                stderr: String::new(),
+                message: format!("spawn {} failed: {e}", inv.command),
+            })
+        }
+    };
+    // 双线程收管道:子进程写满 pipe 缓冲而我们不读 → 死锁,必须并发收
+    let mut out_pipe = child.stdout.take().expect("piped stdout");
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let out_t = std::thread::spawn(move || read_all(&mut out_pipe));
+    let err_t = std::thread::spawn(move || read_all(&mut err_pipe));
+
+    let deadline = std::time::Instant::now() + opts.timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(RunNpxError {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    message: format!("wait failed: {e}"),
+                });
+            }
+        }
+    };
+    let stdout = out_t.join().unwrap_or_default();
+    let stderr = err_t.join().unwrap_or_default();
+    match status {
+        Some(s) if s.success() => Ok(RunNpxResult { stdout, stderr }),
+        Some(s) => Err(RunNpxError {
+            stdout,
+            stderr,
+            message: format!("npx exited with {s}"),
+        }),
+        None => Err(RunNpxError { stdout, stderr, message: "npx timed out".to_string() }),
+    }
+}
+
+fn read_all<R: std::io::Read>(r: &mut R) -> String {
+    let mut buf = Vec::new();
+    let _ = std::io::Read::read_to_end(r, &mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn which_on_path(bin: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +194,43 @@ mod tests {
         let inv = build_npx_invocation(&["--version".to_string()], "/nonexistent/bin/node");
         assert_eq!(inv.command, "npx");
         assert_eq!(inv.command_args, vec!["--version".to_string()]);
+    }
+
+
+    #[test]
+    fn run_npx_missing_binary_reports_spawn_failure() {
+        // PATH 里没有的命令 → spawn 失败,message 含 spawn
+        let e = run_npx(
+            &["--version".to_string()],
+            &RunNpxOptions {
+                timeout: std::time::Duration::from_secs(5),
+                cwd: Some("/nonexistent-dir-for-pi-npx-test".to_string()),
+                env: Vec::new(),
+            },
+        )
+        .expect_err("must fail");
+        assert!(e.message.contains("spawn"), "msg: {}", e.message);
+    }
+
+    #[test]
+    fn run_npx_captures_output_and_env() {
+        // 环境里必有 cat/echo 类基础工具;用 sh -c 不行(无 shell),直接调 npx
+        // 可能不存在 —— 此测试验证的是"成功路径捕获输出":若机器无 node/npx
+        // 则跳过(开发机/CI 均有 node)。
+        if which_on_path("node").is_none() && which_on_path("npx").is_none() {
+            eprintln!("node/npx not on PATH; skipping");
+            return;
+        }
+        let r = run_npx(
+            &["--version".to_string()],
+            &RunNpxOptions {
+                timeout: std::time::Duration::from_secs(60),
+                cwd: None,
+                env: vec![("FORCE_COLOR".to_string(), "0".to_string())],
+            },
+        )
+        .expect("npx --version should succeed on a machine with node");
+        assert!(!r.stdout.trim().is_empty() || !r.stderr.trim().is_empty());
     }
 
     #[test]
