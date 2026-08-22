@@ -89,7 +89,11 @@ The agegr/pi-web backend has three layers; the Rust rewrite advances layer by la
 | `/api/files/[...path]` | GET/POST | file read/write/upload | ✅ `src/api/files.rs` (eight states incl. multipart upload; size limits 25MB/100MB → 413) |
 | `/api/git/status` `/api/git/diff` | GET | git operations | ✅ `src/api/commands.rs` (lib git::changes) |
 | `/api/cwd/browse` | GET | directory browsing | ✅ `src/api/commands.rs` (lib directory_browser) |
-| ... | | | (40 total; coverage locked by `routes.rs upstream_route_surface_covered` — every upstream route ∈ ROUTES ∪ documented exceptions: auth login/logout/api-key, skills install/update, worktrees, app-update) |
+| `/api/worktrees` | GET/POST/DELETE | git worktree management | ✅ `src/api/worktrees.rs` (lib git::worktree; roots gate, dirty-worktree 409) |
+| `/api/skills/install` `/api/skills/update` | POST | npx skills.sh flow | ✅ `src/api/models.rs` (run_npx executor, 60s, ANSI strip, success detection) |
+| `/api/auth/all-providers` | GET | api-key capability listing | ✅ `src/api/models.rs` (engine-backed ProviderRuntime → build_api_key_provider_list) |
+| `/api/auth/api-key/[provider]` | GET/POST/DELETE | api-key status/store/remove | ✅ `src/api/models.rs` (engine ApiKey credential shape; 409 type mismatch) |
+| ... | | | (40 total; coverage locked by `routes.rs upstream_route_surface_covered` — remaining exceptions: auth login/logout (no OAuth machinery in engine), app-update (host-owned); SSE x2 are the EventSink architecture) |
 
 ### Layer 2: `lib/` server logic (28 Node-only .ts → Rust modules)
 

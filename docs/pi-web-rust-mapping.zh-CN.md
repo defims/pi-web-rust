@@ -86,7 +86,11 @@ agegr/pi-web 后端分三层,Rust 改写逐层推进:
 | `/api/files/[...path]` | GET/POST | 文件读写/上传 | ✅ `src/api/files.rs`(八态含 multipart 上传;25MB/100MB → 413 体积上限) |
 | `/api/git/status` `/api/git/diff` | GET | git 操作 | ✅ `src/api/commands.rs`(lib git::changes) |
 | `/api/cwd/browse` | GET | 目录浏览 | ✅ `src/api/commands.rs`(lib directory_browser) |
-| ... | | | (共 40 个;覆盖由 `routes.rs upstream_route_surface_covered` golden 对账锁定 —— 上游每路由 ∈ ROUTES ∪ 文档化例外:auth login/logout/api-key、skills install/update、worktrees、app-update) |
+| `/api/worktrees` | GET/POST/DELETE | git worktree 管理 | ✅ `src/api/worktrees.rs`(lib git::worktree;roots 门禁、脏 worktree 409) |
+| `/api/skills/install` `/api/skills/update` | POST | npx skills.sh 流 | ✅ `src/api/models.rs`(run_npx 执行器、60s、ANSI 剥离、成功判定) |
+| `/api/auth/all-providers` | GET | api-key 能力列表 | ✅ `src/api/models.rs`(引擎侧 ProviderRuntime → build_api_key_provider_list) |
+| `/api/auth/api-key/[provider]` | GET/POST/DELETE | api-key 状态/存/删 | ✅ `src/api/models.rs`(引擎 ApiKey 凭证形状;type 不符 409) |
+| ... | | | (共 40 个;覆盖由 `routes.rs upstream_route_surface_covered` golden 对账锁定 —— 剩余例外:auth login/logout(引擎无 OAuth 机制)、app-update(宿主自更新);SSE×2 为 EventSink 架构替代) |
 
 ### 层 2:`lib/` 服务端逻辑(28 个 Node-only .ts → Rust 模块)
 
