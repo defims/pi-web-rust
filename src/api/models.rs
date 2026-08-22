@@ -2018,3 +2018,331 @@ mod skills_route_tests {
         assert_eq!(e.message, "Installed skill not found");
     }
 }
+
+// ============================================================================
+// /api/auth — all-providers 真列表 + api-key GET/POST/DELETE(上游移植)
+// ============================================================================
+//
+// 引擎无 OAuth(AuthCredential 只有 ApiKey/OAuth/Aws/Bearer 的读侧;元数据表
+// 无 oauth 声明,登录机制在 TS pi-ai 未移植)→ /api/auth/providers(OAuth 列表)
+// 维持空列表例外;本节交付 API-key 面:
+// - GET  /api/auth/all-providers:能力列表(models.json 自定义 + 元数据全表)
+// - GET  /api/auth/api-key/:provider:配置状态(不回显 key)
+// - POST /api/auth/api-key/:provider:存 key(auth.json,引擎 AuthCredential::
+//   ApiKey 形状 {"type":"api_key","key":...})
+// - DELETE /api/auth/api-key/:provider:删 key(type 不符 409)
+
+/// 引擎侧 ProviderRuntime 适配(对齐 collectProviderListingInputs 的输入面)。
+struct EngineProviderRuntime {
+    /// models.json 的 (provider, modelId) 全集
+    models: Vec<(String, String)>,
+    /// models.json 出现过的 provider id(自定义 provider 全部按 api-key 面能力)
+    custom_providers: Vec<String>,
+    /// 元数据表全量 canonical id
+    canonical_ids: Vec<String>,
+    auth_path: std::path::PathBuf,
+}
+
+impl EngineProviderRuntime {
+    fn load() -> Self {
+        let models_path = models_path();
+        let cfg = crate::fs::models_config_store::read_models_config(&models_path);
+        let mut models = Vec::new();
+        let mut custom_providers = Vec::new();
+        if let Some(providers) = cfg.get("providers").and_then(|p| p.as_object()) {
+            for (pid, p) in providers {
+                custom_providers.push(pid.clone());
+                if let Some(arr) = p.get("models").and_then(|m| m.as_array()) {
+                    for m in arr {
+                        if let Some(mid) = m.get("id").and_then(|i| i.as_str()) {
+                            models.push((pid.clone(), mid.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        let auth_path = std::path::PathBuf::from(agent_dir_string()).join("auth.json");
+        let canonical_ids = pi::provider_metadata::PROVIDER_METADATA
+            .iter()
+            .map(|m| m.canonical_id.to_string())
+            .collect();
+        Self { models, custom_providers, canonical_ids, auth_path }
+    }
+}
+
+impl crate::models::provider_listing_runtime::ProviderRuntime for EngineProviderRuntime {
+    fn models(&self) -> Vec<(String, String)> {
+        self.models.clone()
+    }
+
+    fn list_credentials(&self) -> Result<Vec<(String, String)>, String> {
+        let content = std::fs::read_to_string(&self.auth_path).map_err(|e| e.to_string())?;
+        let parsed: Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        let Some(map) = parsed.as_object() else {
+            return Ok(Vec::new());
+        };
+        Ok(map
+            .iter()
+            .filter_map(|(provider, cred)| {
+                let ty = cred.get("type").and_then(|t| t.as_str())?.to_string();
+                Some((provider.clone(), ty))
+            })
+            .collect())
+    }
+
+    fn provider_auth(&self, provider_id: &str) -> crate::models::provider_listing_runtime::ProviderAuthDecl {
+        let canonical = pi::provider_metadata::canonical_provider_id(provider_id)
+            .unwrap_or(provider_id)
+            .to_string();
+        // 自定义 provider(models.json)= bearer/openai 兼容端点,api-key 面
+        let custom = self.custom_providers.iter().any(|p| p.eq_ignore_ascii_case(provider_id));
+        // canonical:元数据声明了 auth env keys → api-key 面
+        let env_keys = pi::provider_metadata::provider_auth_env_keys(&canonical);
+        crate::models::provider_listing_runtime::ProviderAuthDecl {
+            api_key_login: custom || !env_keys.is_empty(),
+            has_oauth: false,
+            oauth_name: None,
+        }
+    }
+
+    fn auth_status(&self, provider_id: &str) -> crate::models::provider_listing_runtime::AuthStatus {
+        // 存储判定:auth.json 有该 provider 条目 → configured,source=type
+        let Ok(entries) = self.list_credentials() else {
+            return Default::default();
+        };
+        match entries.into_iter().find(|(p, _)| p.eq_ignore_ascii_case(provider_id)) {
+            Some((_, ty)) => crate::models::provider_listing_runtime::AuthStatus {
+                configured: true,
+                source: Some(ty),
+            },
+            None => Default::default(),
+        }
+    }
+}
+
+/// GET /api/auth/all-providers → {providers}(api-key 能力列表,上游
+/// buildApiKeyProviderList;含 configured 状态)
+pub(crate) async fn auth_all_providers(
+    ctx: &ExecCtx,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let runtime = super::commands::blocking(ctx, EngineProviderRuntime::load).await?;
+    use crate::models::provider_listing_runtime::ProviderRuntime as _;
+    let mut names: Vec<(String, String)> = Vec::new();
+    for id in &runtime.canonical_ids {
+        names.push((id.clone(), id.clone()));
+    }
+    for id in &runtime.custom_providers {
+        if !runtime.canonical_ids.iter().any(|c| c.eq_ignore_ascii_case(id)) {
+            names.push((id.clone(), id.clone()));
+        }
+    }
+    let inputs = crate::models::provider_listing_runtime::collect_provider_listing_inputs(&runtime, &names);
+    let providers = crate::models::provider_listing::build_api_key_provider_list(&inputs);
+    super::commands::json_response(json!({ "providers": providers }))
+}
+
+/// GET /api/auth/api-key/:provider → {provider, displayName, configured, source, models}
+pub(crate) async fn auth_api_key_get(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let provider = dispatch.args.get("provider").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if provider.is_empty() {
+        return Err(ApiError::new(400, "provider required"));
+    }
+    let runtime = super::commands::blocking(ctx, EngineProviderRuntime::load).await?;
+    use crate::models::provider_listing_runtime::ProviderRuntime as _;
+    let status = runtime.auth_status(&provider);
+    let models = runtime
+        .models
+        .iter()
+        .filter(|(p, _)| p.eq_ignore_ascii_case(&provider))
+        .count();
+    super::commands::json_response(json!({
+        "provider": provider,
+        "displayName": provider,
+        "configured": status.configured,
+        "source": status.source,
+        "models": models,
+    }))
+}
+
+/// POST /api/auth/api-key/:provider body {apiKey} → {success:true}
+pub(crate) async fn auth_api_key_post(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let provider = dispatch.args.get("provider").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let key = dispatch.args.get("apiKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if key.is_empty() {
+        return Err(ApiError::new(400, "apiKey is required"));
+    }
+    let runtime = super::commands::blocking(ctx, EngineProviderRuntime::load).await?;
+    use crate::models::provider_listing_runtime::ProviderRuntime as _;
+    let auth = runtime.provider_auth(&provider);
+    if !auth.api_key_login {
+        return Err(ApiError::new(500, format!("{provider} does not support API key login")));
+    }
+    // 引擎 AuthCredential::ApiKey 形状(上游经 apiKeyAuth.login 产出的存储面)
+    let credential = json!({ "type": "api_key", "key": key });
+    let auth_path = runtime.auth_path.clone();
+    super::commands::blocking(ctx, move || {
+        crate::models::credential_store::store_provider_credential(&provider, &credential, &auth_path)
+            .map_err(|e| ApiError::new(500, e.to_string()))
+    })
+    .await??;
+    super::commands::json_response(json!({ "success": true }))
+}
+
+/// DELETE /api/auth/api-key/:provider → {success:true} / 409(OAuth 凭证)
+pub(crate) async fn auth_api_key_delete(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let provider = dispatch.args.get("provider").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if provider.is_empty() {
+        return Err(ApiError::new(400, "provider required"));
+    }
+    let auth_path = std::path::PathBuf::from(agent_dir_string()).join("auth.json");
+    let provider_for_removal = provider.clone();
+    let removal = super::commands::blocking(ctx, move || {
+        crate::models::credential_store::remove_stored_credential_if_type(&provider_for_removal, "api_key", &auth_path)
+            .map_err(|e| ApiError::new(500, e.to_string()))
+    })
+    .await??;
+    use crate::models::credential_store::CredentialRemovalResult as R;
+    match removal {
+        R::Removed => super::commands::json_response(json!({ "success": true })),
+        R::TypeMismatch { .. } => Err(ApiError::new(
+            409,
+            format!("{provider} is authenticated with OAuth, not an API key"),
+        )),
+        // 未存储 → 上游同款幂等成功
+        R::NotFound => super::commands::json_response(json!({ "success": true })),
+    }
+}
+
+#[cfg(test)]
+mod auth_route_tests {
+    use super::*;
+
+    fn req(method: &str, uri: &str, body: Option<&str>) -> http::Request<Vec<u8>> {
+        let mut b = http::Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            b = b.header(http::header::CONTENT_TYPE, "application/json");
+        }
+        b.body(body.map(|s| s.as_bytes().to_vec()).unwrap_or_default()).unwrap()
+    }
+
+    #[test]
+    fn api_key_store_status_delete_roundtrip() {
+        let _g = crate::api::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path().join(".pi/agent"));
+
+        // 一个 models.json 自定义 provider(api-key 面)+ 一个无 key 面的对照
+        let agent = tmp.path().join(".pi/agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("models.json"),
+            r#"{"providers":{"probe":{"models":[{"id":"p1","name":"P1"}],"baseUrl":"http://localhost:9"}}}"#,
+        )
+        .unwrap();
+
+        let sessions = tempfile::tempdir().unwrap();
+        let api = crate::api::export_test_support::api_with_sessions_root(sessions.path());
+
+        // GET 未配置:configured=false, models=1(计数来自 models.json)
+        let resp = crate::api::export_test_support::call(&api, req("GET", "/api/auth/api-key/probe", None)).expect("get");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["configured"], serde_json::json!(false));
+        assert_eq!(v["models"], serde_json::json!(1));
+
+        // POST 存 key(auth.json,引擎 ApiKey 形状)
+        let resp = crate::api::export_test_support::call(&api, req("POST", "/api/auth/api-key/probe", Some(r#"{"apiKey":"sk-test-123"}"#))).expect("post");
+        assert_eq!(resp.status(), 200);
+        let stored: Value =
+            serde_json::from_str(&std::fs::read_to_string(agent.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(stored["probe"]["type"], serde_json::json!("api_key"));
+        assert_eq!(stored["probe"]["key"], serde_json::json!("sk-test-123"));
+
+        // GET 已配置:configured=true source=api_key(不回显 key)
+        let resp = crate::api::export_test_support::call(&api, req("GET", "/api/auth/api-key/probe", None)).expect("get2");
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(v["configured"], serde_json::json!(true));
+        assert_eq!(v["source"], serde_json::json!("api_key"));
+        assert!(v.get("key").is_none() && v.get("apiKey").is_none());
+
+        // DELETE → success;auth.json 条目消失
+        let resp = crate::api::export_test_support::call(&api, req("DELETE", "/api/auth/api-key/probe", None)).expect("delete");
+        assert_eq!(resp.status(), 200);
+        let stored: Value =
+            serde_json::from_str(&std::fs::read_to_string(agent.join("auth.json")).unwrap()).unwrap();
+        assert!(stored.as_object().unwrap().get("probe").is_none());
+
+        // POST 空 key → 400;无 api-key 面的 provider → 500 不支持
+        let e = crate::api::export_test_support::call(&api, req("POST", "/api/auth/api-key/probe", Some(r#"{"apiKey":"  "}"#))).unwrap_err();
+        assert_eq!(e.status, 400);
+        std::fs::remove_file(agent.join("models.json")).unwrap();
+        let e = crate::api::export_test_support::call(&api, req("POST", "/api/auth/api-key/definitely-not-a-provider", Some(r#"{"apiKey":"x"}"#))).unwrap_err();
+        assert_eq!(e.status, 500);
+        assert!(e.message.contains("does not support API key login"));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    #[test]
+    fn all_providers_lists_capability_and_status() {
+        let _g = crate::api::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_agent = std::env::var_os("PI_CODING_AGENT_DIR");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path().join(".pi/agent"));
+        let agent = tmp.path().join(".pi/agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("models.json"),
+            r#"{"providers":{"probe":{"models":[{"id":"p1"}],"baseUrl":"http://localhost:9"}}}"#,
+        )
+        .unwrap();
+
+        let sessions = tempfile::tempdir().unwrap();
+        let api = crate::api::export_test_support::api_with_sessions_root(sessions.path());
+        let resp = crate::api::export_test_support::call(&api, req("GET", "/api/auth/all-providers", None)).expect("all");
+        assert_eq!(resp.status(), 200);
+        let v: Value = serde_json::from_slice(resp.body()).unwrap();
+        let providers = v["providers"].as_array().expect("providers array");
+        assert!(!providers.is_empty(), "canonical table must be listed");
+        // 自定义 provider 在列且 api-key 能力成立
+        let probe = providers
+            .iter()
+            .find(|p| p["id"].as_str() == Some("probe"))
+            .expect("custom provider listed");
+        assert_eq!(probe["modelCount"], serde_json::json!(1));
+        assert_eq!(probe["configured"], serde_json::json!(false));
+        assert_eq!(probe["supportsOAuth"], serde_json::json!(false));
+        // anthropic(canonical,有 env key)也在列
+        assert!(providers.iter().any(|p| p["id"].as_str() == Some("anthropic")));
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agent {
+            Some(a) => std::env::set_var("PI_CODING_AGENT_DIR", a),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+}

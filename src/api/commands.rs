@@ -40,6 +40,10 @@ pub(crate) async fn execute(
         "gated_plugins_get" => super::models::plugins_get(&ctx, dispatch).await,
         "gated_plugins_post" => super::models::plugins_post(&ctx, dispatch).await,
         "gated_auth_providers" => json_response(json!({ "providers": [] })),
+        "auth_all_providers" => super::models::auth_all_providers(&ctx).await,
+        "auth_api_key_get" => super::models::auth_api_key_get(&ctx, dispatch).await,
+        "auth_api_key_post" => super::models::auth_api_key_post(&ctx, dispatch).await,
+        "auth_api_key_delete" => super::models::auth_api_key_delete(&ctx, dispatch).await,
         "home" => home().await,
         "sessions_list" => sessions_list(&ctx).await,
         "sessions_get" => {

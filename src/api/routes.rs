@@ -76,7 +76,10 @@ const ROUTES: &[(&str, &str, &str, TimeoutClass)] = &[
     ("GET", "/api/plugins", "gated_plugins_get", TimeoutClass::Default),
     ("POST", "/api/plugins", "gated_plugins_post", TimeoutClass::Long),
     ("GET", "/api/auth/providers", "gated_auth_providers", TimeoutClass::Default),
-    ("GET", "/api/auth/all-providers", "gated_auth_providers", TimeoutClass::Default),
+    ("GET", "/api/auth/all-providers", "auth_all_providers", TimeoutClass::Default),
+    ("GET", "/api/auth/api-key/:provider", "auth_api_key_get", TimeoutClass::Default),
+    ("POST", "/api/auth/api-key/:provider", "auth_api_key_post", TimeoutClass::Default),
+    ("DELETE", "/api/auth/api-key/:provider", "auth_api_key_delete", TimeoutClass::Default),
     ("GET", "/api/home", "home", TimeoutClass::Default),
     ("GET", "/api/sessions", "sessions_list", TimeoutClass::Default),
     ("GET", "/api/sessions/:id", "sessions_get", TimeoutClass::Default),
@@ -305,12 +308,8 @@ mod upstream_parity_tests {
             ("/api/agent/:id/events", "SSE 经 EventSink + 前端 EventSource shim(架构替代,非缺失)"),
             ("/api/agent/running/events", "同上"),
             ("/api/app-update", "宿主自更新机制(moho self_update);前端更新横幅在嵌入版保持惰性"),
-            ("/api/auth/api-key/:provider", "凭证管理面未移植(providers 现为常量 stub)—— 另批"),
-            ("/api/auth/login/:provider", "OAuth 登录流未移植 —— 另批"),
-            ("/api/auth/logout/:provider", "OAuth 登出未移植 —— 另批"),
-            ("/api/skills/install", "缺失路由 —— 另批实施(本清单即跟踪点)"),
-            ("/api/skills/update", "缺失路由 —— 另批实施"),
-            ("/api/worktrees", "lib git::worktree 已移植、路由未接 —— 另批实施"),
+            ("/api/auth/login/:provider", "OAuth 登录流(SSE)依赖 pi-ai AuthFlow,未移植;API-key 面(POST /api/auth/api-key/:provider)已可用,OAuth 列表(/api/auth/providers)恒空即真实能力"),
+            ("/api/auth/logout/:provider", "OAuth 凭证移除;引擎无 OAuth 登录,无 OAuth 凭证可移除"),
         ];
         let exceptions: std::collections::HashSet<&str> = EXCEPTIONS.iter().map(|e| e.0).collect();
 

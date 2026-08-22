@@ -33,6 +33,9 @@ pub struct ApiKeyProviderListing {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub model_count: u64,
+    /// 上游字段名 `supportsOAuth`(连续大写;serde camelCase 会产出
+    /// `supportsOauth`,前端读的是前者 —— 显式 rename 锁死 wire 契约)。
+    #[serde(rename = "supportsOAuth")]
     pub supports_oauth: bool,
 }
 
