@@ -29,6 +29,8 @@ pub(crate) async fn execute(
 ) -> Result<http::Response<Vec<u8>>, ApiError> {
     match dispatch.command {
         "gated_skills_get" => super::models::skills_get(&ctx, dispatch).await,
+        "skills_install" => super::models::skills_install(&ctx, dispatch).await,
+        "skills_update" => super::models::skills_update(&ctx, dispatch).await,
         "worktrees_get" => super::worktrees::get(&ctx, dispatch).await,
         "worktrees_post" => super::worktrees::post(&ctx, dispatch).await,
         "worktrees_delete" => super::worktrees::delete(&ctx, dispatch).await,

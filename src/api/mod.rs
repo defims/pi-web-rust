@@ -17,6 +17,67 @@
 /// 测试同样拿锁避免并行漂移 —— 跨模块共享)。
 pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 路由级测试支架(export/worktrees/skills 等命令测试共用):注入
+/// sessions_root 的 PiWebApi + 同步 call + JSON POST 构造。持锁 guard 交给
+/// 调用方持有(HOME 环境隔离,HOME_LOCK 同模式)。
+#[cfg(test)]
+pub(crate) mod export_test_support {
+    use super::{ApiConfig, EventSink, HostHooks, PiWebApi};
+    use std::sync::Arc;
+
+    pub(crate) struct SessionsRoot(std::path::PathBuf);
+    impl HostHooks for SessionsRoot {
+        fn sessions_root(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.clone())
+        }
+    }
+
+    pub(crate) fn api_with_sessions_root(root: &std::path::Path) -> PiWebApi {
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let rt = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 2)
+                .with_reactor(reactor)
+                .build()
+                .unwrap(),
+        );
+        let mut cfg = ApiConfig::new(Arc::new(|_: crate::api::ApiEvent| {}) as EventSink);
+        cfg.hooks = Arc::new(SessionsRoot(root.to_path_buf()));
+        PiWebApi::new(rt, cfg)
+    }
+
+    /// HOME 锁 + api(测试里凡会读 HOME/PI_CODING_AGENT_DIR 派生路径的命令都用这个)
+    pub(crate) fn api_with_sessions_root_locked(
+        root: &std::path::Path,
+    ) -> (PiWebApi, std::sync::MutexGuard<'static, ()>) {
+        let guard = super::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        (api_with_sessions_root(root), guard)
+    }
+
+    pub(crate) fn call(
+        api: &PiWebApi,
+        req: http::Request<Vec<u8>>,
+    ) -> Result<http::Response<Vec<u8>>, crate::api::ApiError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        api.handle(
+            req,
+            Box::new(move |r| {
+                let _ = tx.send(r);
+            }),
+        );
+        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("responder called")
+    }
+
+    pub(crate) fn post_json(uri: &str, body: &str) -> http::Request<Vec<u8>> {
+        http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(body.as_bytes().to_vec())
+            .unwrap()
+    }
+}
+
 mod commands;
 pub mod events;
 mod export;

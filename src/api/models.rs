@@ -1001,27 +1001,235 @@ pub(crate) async fn skills_get(
     .await?;
 
     // lib 编排(安装信息标注)
-    let lib_agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
-        .map(|v| v.to_string_lossy().into_owned())
-        .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent").to_string_lossy().into_owned()))
-        .unwrap_or_default();
-    let global_lock = crate::skills::skill_lock::get_global_skills_lock_path(&lib_agent_dir, None);
-    let project_lock = std::path::Path::new(&cwd).join(".pi/skills/skills-lock.json").to_string_lossy().into_owned();
     let _ = hooks;
 
     let mut skills: Vec<crate::skills::skill_lock::SkillInfo> =
         result.skills.iter().map(skill_to_info).collect();
     let diagnostics: Vec<_> = result.diagnostics.iter().map(diag_to_lib).collect();
-    crate::skills::skill_lock::annotate_skills_with_install_info(
-        &mut skills, &cwd, &lib_agent_dir, &global_lock, &project_lock,
-    );
-    let trusted = crate::security::project_trust::get_project_trust_status(&cwd, &lib_agent_dir).trusted;
+    annotate_with_install_info(&mut skills, &cwd);
+    let trusted = crate::security::project_trust::get_project_trust_status(&cwd, &agent_dir_string()).trusted;
 
     super::commands::json_response(json!({
         "skills": skills,
         "diagnostics": diagnostics,
         "projectResourcesLoaded": trusted,
     }))
+}
+
+/// agent 目录(PI_CODING_AGENT_DIR 覆盖;缺省 ~/.pi/agent)。
+pub(crate) fn agent_dir_string() -> String {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(|v| v.to_string_lossy().into_owned())
+        .or_else(|| crate::paths::home_dir().map(|h| h.join(".pi/agent").to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+/// skills_get / skills_update 共用:磁盘技能 → 安装信息标注(lib 链)。
+pub(crate) fn annotate_with_install_info(
+    skills: &mut Vec<crate::skills::skill_lock::SkillInfo>,
+    cwd: &str,
+) {
+    let lib_agent_dir = agent_dir_string();
+    let global_lock = crate::skills::skill_lock::get_global_skills_lock_path(&lib_agent_dir, None);
+    let project_lock = std::path::Path::new(cwd).join(".pi/skills/skills-lock.json").to_string_lossy().into_owned();
+    crate::skills::skill_lock::annotate_skills_with_install_info(
+        skills, cwd, &lib_agent_dir, &global_lock, &project_lock,
+    );
+}
+
+// ============================================================================
+// POST /api/skills/install + /api/skills/update(上游 npx skills.sh 流)
+// ============================================================================
+
+/// POST /api/skills/install body {package, scope: "global"|"project", cwd?}
+/// → {success:true, output} / 400 / 403 / 500(npx 失败,error 取输出尾 300 字)
+pub(crate) async fn skills_install(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let pkg = dispatch.args.get("package").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if pkg.is_empty() {
+        return Err(ApiError::new(400, "package required"));
+    }
+    let is_global = dispatch.args.get("scope").and_then(|v| v.as_str()) != Some("project");
+    let cwd = dispatch.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !is_global {
+        if cwd.is_empty() {
+            return Err(ApiError::new(400, "cwd required for project install"));
+        }
+        super::commands::gate_roots(ctx, &cwd).await?;
+        // 信任门:恒信任 stub(引擎无扩展信任系统,现语义恒过)
+    }
+    let mut args = vec![
+        "skills".to_string(),
+        "add".to_string(),
+        pkg.clone(),
+        "-y".to_string(),
+        "--agent".to_string(),
+        "pi".to_string(),
+    ];
+    if is_global {
+        args.push("-g".to_string());
+    }
+    let opts = crate::skills::npx::RunNpxOptions {
+        timeout: std::time::Duration::from_secs(60),
+        cwd: (!is_global && !cwd.is_empty()).then(|| cwd.clone()),
+        env: vec![("FORCE_COLOR".to_string(), "0".to_string())],
+    };
+    let run = super::commands::blocking(ctx, move || crate::skills::npx::run_npx(&args, &opts)).await?;
+    match run {
+        Ok(out) => {
+            let output = strip_ansi(&format!("{}{}", out.stdout, out.stderr));
+            let success = output.contains("Installation complete") || installed_n_skills(&output);
+            if !success {
+                let tail = tail_chars(&output, 300);
+                let error = if tail.is_empty() { "Install failed".to_string() } else { tail };
+                return Err(ApiError::new(500, error));
+            }
+            super::commands::json_response(json!({ "success": true, "output": output }))
+        }
+        Err(e) => {
+            let output = strip_ansi(&format!("{}{}", e.stdout, e.stderr));
+            let error = if output.is_empty() { e.message } else { tail_chars(&output, 300) };
+            Err(ApiError::new(500, error))
+        }
+    }
+}
+
+/// 上游正则的 "Installed N skill(s)" 臂(`/Installed \d+ skill/`)。
+fn installed_n_skills(output: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(pos) = output[search_from..].find("Installed ") {
+        let rest = &output[search_from + pos + "Installed ".len()..];
+        let digits: usize = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 && rest[digits..].trim_start().starts_with("skill") {
+            return true;
+        }
+        search_from += pos + "Installed ".len();
+    }
+    false
+}
+
+/// 对齐上游 ANSI_RE = /\x1B\[[0-9;]*m/g。
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('\x1b') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        // \[ [0-9;]* m
+        if let Some(bracket) = after.strip_prefix('[') {
+            let seq_len = bracket.chars().take_while(|c| c.is_ascii_digit() || *c == ';').count();
+            let tail = &bracket[seq_len..];
+            if tail.starts_with('m') {
+                rest = &tail[1..];
+                continue;
+            }
+        }
+        // 不构成 ANSI 序列:原样保留 ESC
+        out.push('\x1b');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn tail_chars(s: &str, n: usize) -> String {
+    let total = s.chars().count();
+    s.chars().skip(total.saturating_sub(n)).collect()
+}
+
+/// 已安装技能定位(skills_get 同链:load + 安装标注 + package/scope 过滤)。
+/// None = 未安装(上游 404 "Installed skill not found")。
+async fn find_installed_skill(
+    ctx: &ExecCtx,
+    cwd: &str,
+    pkg: &str,
+    scope: &str,
+) -> Result<Option<crate::skills::skill_lock::SkillInfo>, ApiError> {
+    let cwd = cwd.to_string();
+    let pkg = pkg.to_string();
+    let scope = scope.to_string();
+    super::commands::blocking(ctx, move || {
+        let config = pi::sdk::Config::load().unwrap_or_default();
+        let skill_paths: Vec<std::path::PathBuf> = config
+            .skills
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let result = pi::resources::load_skills(pi::resources::LoadSkillsOptions {
+            cwd: std::path::PathBuf::from(&cwd),
+            agent_dir: std::path::PathBuf::from(agent_dir_string()),
+            skill_paths,
+            include_defaults: true,
+        });
+        let mut skills: Vec<crate::skills::skill_lock::SkillInfo> =
+            result.skills.iter().map(skill_to_info).collect();
+        annotate_with_install_info(&mut skills, &cwd);
+        skills.into_iter().find(|s| {
+            s.install
+                .as_ref()
+                .is_some_and(|i| i.package == pkg && i.scope == scope)
+        })
+    })
+    .await
+}
+
+/// POST /api/skills/update body {cwd, package, scope} → {success, skill, output}
+pub(crate) async fn skills_update(
+    ctx: &ExecCtx,
+    dispatch: Dispatch,
+) -> Result<http::Response<Vec<u8>>, ApiError> {
+    let cwd = dispatch.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let pkg = dispatch.args.get("package").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let scope = match dispatch.args.get("scope").and_then(|v| v.as_str()) {
+        Some(s @ ("global" | "project")) => s,
+        _ => return Err(ApiError::new(400, "cwd, package, and scope are required")),
+    };
+    if cwd.is_empty() || pkg.is_empty() {
+        return Err(ApiError::new(400, "cwd, package, and scope are required"));
+    }
+    super::commands::gate_roots(ctx, &cwd).await?;
+
+    let Some(skill) = find_installed_skill(ctx, &cwd, &pkg, scope).await? else {
+        return Err(ApiError::not_found("Installed skill not found"));
+    };
+    let Some(install) = &skill.install else {
+        return Err(ApiError::not_found("Installed skill not found"));
+    };
+    if !install.can_check_for_updates {
+        return Err(ApiError::new(400, "This skill cannot be updated automatically"));
+    }
+
+    let args = crate::skills::skill_updates::build_skill_update_args(install);
+    let opts = crate::skills::npx::RunNpxOptions {
+        timeout: std::time::Duration::from_secs(60),
+        cwd: (scope == "project").then(|| cwd.clone()),
+        env: vec![("FORCE_COLOR".to_string(), "0".to_string())],
+    };
+    let run = super::commands::blocking(ctx, move || crate::skills::npx::run_npx(&args, &opts)).await?;
+    let (stdout, stderr) = match run {
+        Ok(out) => (out.stdout, out.stderr),
+        Err(e) => {
+            let output = strip_ansi(&format!("{}{}", e.stdout, e.stderr));
+            let error = if output.is_empty() { e.message } else { output };
+            return Err(ApiError::new(500, tail_chars(&error, 500)));
+        }
+    };
+
+    // 刷新标注返回更新后的技能
+    let refreshed = find_installed_skill(ctx, &cwd, &pkg, scope).await?;
+    let output = tail_chars(&format!("{}{}", stdout, stderr), 500);
+    match refreshed {
+        Some(skill) => super::commands::json_response(json!({
+            "success": true,
+            "skill": skill,
+            "output": output,
+        })),
+        None => Err(ApiError::not_found("Installed skill not found")),
+    }
 }
 
 // ============================================================================
@@ -1742,5 +1950,71 @@ fn plugins_action(
         }
         "update" => pm.update_source_blocking(source, scope),
         other => Err(pi::error::Error::config(format!("unknown action: {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod skills_route_tests {
+    use super::*;
+
+    #[test]
+    fn ansi_strip_and_installed_pattern() {
+        assert_eq!(strip_ansi("\x1b[32mok\x1b[0m"), "ok");
+        assert_eq!(strip_ansi("\x1b[1;32;40mcolor\x1b[m end"), "color end");
+        // 非法 ESC 序列原样保留
+        assert_eq!(strip_ansi("a\x1bXb"), "a\x1bXb");
+        assert_eq!(strip_ansi("plain"), "plain");
+
+        assert!(installed_n_skills("Installed 3 skills"));
+        assert!(installed_n_skills("Installed 1 skill"));
+        assert!(!installed_n_skills("Installed skill")); // 无数字
+        assert!(!installed_n_skills("Install failed"));
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        assert_eq!(tail_chars("ab", 300), "ab");
+    }
+
+    #[test]
+    fn skills_install_validation_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (api, _g) = crate::api::export_test_support::api_with_sessions_root_locked(sessions.path());
+
+        // 缺 package → 400
+        let e = crate::api::export_test_support::call(&api, crate::api::export_test_support::post_json(
+            "/api/skills/install", r#"{"scope":"global"}"#)).unwrap_err();
+        assert_eq!(e.status, 400);
+        assert_eq!(e.message, "package required");
+
+        // project 无 cwd → 400
+        let e = crate::api::export_test_support::call(&api, crate::api::export_test_support::post_json(
+            "/api/skills/install", r#"{"package":"foo","scope":"project"}"#)).unwrap_err();
+        assert_eq!(e.status, 400);
+        assert!(e.message.contains("cwd required"));
+
+        // project + roots 外 cwd → 403
+        let e = crate::api::export_test_support::call(&api, crate::api::export_test_support::post_json(
+            "/api/skills/install", r#"{"package":"foo","scope":"project","cwd":"/etc"}"#)).unwrap_err();
+        assert_eq!(e.status, 403);
+
+        // update 缺参 → 400
+        let e = crate::api::export_test_support::call(&api, crate::api::export_test_support::post_json(
+            "/api/skills/update", r#"{"cwd":"/tmp"}"#)).unwrap_err();
+        assert_eq!(e.status, 400);
+
+        let _ = tmp;
+    }
+
+    #[test]
+    fn skills_update_unknown_skill_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        crate::fs::allowed_roots::allow_file_root(&tmp.path().to_string_lossy());
+        let (api, _g) = crate::api::export_test_support::api_with_sessions_root_locked(sessions.path());
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let e = crate::api::export_test_support::call(&api, crate::api::export_test_support::post_json(
+            "/api/skills/update", &format!(r#"{{"cwd":"{cwd}","package":"never-installed","scope":"global"}}"#)))
+            .unwrap_err();
+        assert_eq!(e.status, 404);
+        assert_eq!(e.message, "Installed skill not found");
     }
 }
